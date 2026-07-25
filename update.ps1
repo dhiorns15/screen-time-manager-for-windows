@@ -7,6 +7,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $TaskName = "ScreenTimeManager"
+$WatchdogTaskName = "ScreenTimeManagerWatchdog"
 
 Write-Host "Screen Time Manager - Update" -ForegroundColor Cyan
 Write-Host "============================" -ForegroundColor Cyan
@@ -63,6 +64,15 @@ $updateInPlace = $currentExePath -eq $NewExePath
 if ($updateInPlace) {
     Write-Host "Note: Updating in place (same location)" -ForegroundColor Yellow
     Write-Host ""
+}
+
+# Disable the watchdog first - otherwise it'll notice the app is down for
+# this update within a minute and both relaunch it prematurely and send a
+# false "tampering detected" alert. Re-enabled at the end of this script.
+$watchdogExisted = Get-ScheduledTask -TaskName $WatchdogTaskName -ErrorAction SilentlyContinue
+if ($watchdogExisted) {
+    Write-Host "Pausing watchdog task for the update..." -ForegroundColor White
+    Disable-ScheduledTask -TaskName $WatchdogTaskName -ErrorAction SilentlyContinue | Out-Null
 }
 
 # Stop the scheduled task
@@ -133,6 +143,13 @@ if ($response -eq "" -or $response -match "^[Yy]") {
     Write-Host "Starting Screen Time Manager..." -ForegroundColor White
     Start-ScheduledTask -TaskName $TaskName
     Write-Host "Started!" -ForegroundColor Green
+    if ($watchdogExisted) {
+        Enable-ScheduledTask -TaskName $WatchdogTaskName -ErrorAction SilentlyContinue | Out-Null
+    }
+} elseif ($watchdogExisted) {
+    Write-Host ""
+    Write-Host "Watchdog protection stays paused until Screen Time Manager is started again." -ForegroundColor Yellow
+    Write-Host "Run: Enable-ScheduledTask -TaskName $WatchdogTaskName" -ForegroundColor Yellow
 }
 
 Write-Host ""

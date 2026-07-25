@@ -18,6 +18,7 @@ mod remote_commands;
 mod telegram;
 mod time_request;
 mod tray;
+mod watchdog;
 
 use std::mem::zeroed;
 use windows::{
@@ -42,6 +43,13 @@ use tray::{add_tray_icon, remove_tray_icon, window_proc};
 use std::sync::atomic::Ordering;
 
 fn main() {
+    // A brief, separate invocation from the watchdog Scheduled Task - just
+    // check on the real app and exit, no GUI setup at all.
+    if std::env::args().any(|a| a == watchdog::WATCHDOG_ARG) {
+        watchdog::run_check();
+        return;
+    }
+
     unsafe {
         // Set DPI awareness before creating any windows
         let _ = SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);

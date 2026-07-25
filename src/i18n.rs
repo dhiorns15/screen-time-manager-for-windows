@@ -333,6 +333,12 @@ fn en(key: &str) -> &'static str {
         "request.notify.reply_dc" => "Reply !extend 30 to grant, or !unlock if there's time left.",
         "request.notify.resolved" => "Time request already granted:",
 
+        // ----- Watchdog Tamper Alert -----
+        "watchdog.alert.prefix" => "Screen Time Manager stopped unexpectedly on",
+        "watchdog.alert.restarted" => "and was just restarted.",
+        "watchdog.alert.restart_failed" => "and the automatic restart failed - please check on it.",
+        "watchdog.alert.suffix" => "If you didn't do this yourself (e.g. via Quit), this may be an attempt to bypass the time limit.",
+
         // ----- Telegram Setup Wizard -----
         "wizard.title" => "Telegram Setup Wizard",
         "wizard.step" => "Step",
@@ -668,6 +674,12 @@ fn de(key: &str) -> &'static str {
         "request.notify.reply_tg" => "Antworten Sie mit /extend 30 zum Gewähren, oder /unlock falls noch Zeit übrig ist.",
         "request.notify.reply_dc" => "Antworten Sie mit !extend 30 zum Gewähren, oder !unlock falls noch Zeit übrig ist.",
         "request.notify.resolved" => "Zeitanfrage bereits gewährt:",
+
+        // ----- Watchdog Manipulationswarnung -----
+        "watchdog.alert.prefix" => "Bildschirmzeit Manager wurde unerwartet beendet auf",
+        "watchdog.alert.restarted" => "und wurde soeben neu gestartet.",
+        "watchdog.alert.restart_failed" => "und der automatische Neustart ist fehlgeschlagen - bitte überprüfen.",
+        "watchdog.alert.suffix" => "Wenn Sie das nicht selbst getan haben (z.B. über Beenden), könnte dies ein Versuch sein, das Zeitlimit zu umgehen.",
 
         // ----- Telegram Setup Wizard -----
         "wizard.title" => "Telegram Einrichtungsassistent",

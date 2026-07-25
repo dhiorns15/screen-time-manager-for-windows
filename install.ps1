@@ -8,6 +8,8 @@ param(
 $ErrorActionPreference = "Stop"
 $TaskName = "ScreenTimeManager"
 $Description = "Screen Time Manager - Manages daily computer time limits"
+$WatchdogTaskName = "ScreenTimeManagerWatchdog"
+$WatchdogDescription = "Screen Time Manager - relaunches the app if it's stopped outside of the passcode-protected Quit option"
 
 Write-Host "Screen Time Manager - Installation" -ForegroundColor Cyan
 Write-Host "===================================" -ForegroundColor Cyan
@@ -81,10 +83,42 @@ $task = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principa
 
 Register-ScheduledTask -TaskName $TaskName -InputObject $task | Out-Null
 
+# Watchdog task: fires every minute and relaunches the app if it's not
+# running (see src/watchdog.rs). Registered here while elevated so it's
+# owned by Administrators - by default a standard user can't disable or
+# delete a scheduled task they don't own, which is what keeps this from
+# being trivially turned off the same way the app itself can be killed.
+Write-Host "Creating watchdog task..." -ForegroundColor White
+
+$existingWatchdog = Get-ScheduledTask -TaskName $WatchdogTaskName -ErrorAction SilentlyContinue
+if ($existingWatchdog) {
+    Unregister-ScheduledTask -TaskName $WatchdogTaskName -Confirm:$false
+}
+
+$watchdogAction = New-ScheduledTaskAction -Execute $ExePath -Argument "--watchdog-check"
+$watchdogTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+    -RepetitionInterval (New-TimeSpan -Minutes 1) `
+    -RepetitionDuration (New-TimeSpan -Days 3650)
+$watchdogTrigger2 = New-ScheduledTaskTrigger -AtLogOn
+$watchdogPrincipal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+$watchdogSettings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -MultipleInstances IgnoreNew `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 1)
+
+$watchdogTask = New-ScheduledTask -Action $watchdogAction -Trigger @($watchdogTrigger, $watchdogTrigger2) `
+    -Principal $watchdogPrincipal -Settings $watchdogSettings -Description $WatchdogDescription
+
+Register-ScheduledTask -TaskName $WatchdogTaskName -InputObject $watchdogTask | Out-Null
+
 Write-Host ""
 Write-Host "Installation complete!" -ForegroundColor Green
 Write-Host ""
-Write-Host "Screen Time Manager will now start automatically when you log in." -ForegroundColor White
+Write-Host "Screen Time Manager will now start automatically when you log in," -ForegroundColor White
+Write-Host "and will be relaunched within a minute if it's ever stopped outside" -ForegroundColor White
+Write-Host "of the passcode-protected Quit option." -ForegroundColor White
 Write-Host ""
 
 # Ask if user wants to start it now

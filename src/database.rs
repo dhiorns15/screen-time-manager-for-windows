@@ -203,6 +203,32 @@ pub fn set_shared_setting(key: &str, value: &str) -> bool {
     set_setting(key, value)
 }
 
+/// Record that the app is quitting via the passcode-protected Quit menu item,
+/// so the watchdog task doesn't mistake a sanctioned stop for tampering.
+pub fn mark_intentional_quit() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    set_setting("intentional_quit_at", &now.to_string());
+}
+
+/// Whether the app was intentionally quit within the last few minutes -
+/// gives a grace window for the parent to restart it manually (e.g. after an
+/// update) without the watchdog firing a false "tampering" alert.
+pub fn recent_intentional_quit() -> bool {
+    const GRACE_PERIOD_SECS: u64 = 180;
+
+    let Some(marked) = get_setting("intentional_quit_at").and_then(|s| s.parse::<u64>().ok()) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    now.saturating_sub(marked) < GRACE_PERIOD_SECS
+}
+
 /// Get the passcode from the database
 pub fn get_passcode() -> Option<String> {
     let guard = DB_CONNECTION.lock().ok()?;

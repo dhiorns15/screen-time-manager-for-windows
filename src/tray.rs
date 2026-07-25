@@ -276,6 +276,9 @@ pub unsafe extern "system" fn window_proc(
                 }
                 IDM_QUIT => {
                     if verify_passcode_for_quit(hwnd) {
+                        // Tell the watchdog task this is a sanctioned stop, not
+                        // the app being killed out from under the timer.
+                        crate::database::mark_intentional_quit();
                         DestroyWindow(hwnd).ok();
                     }
                 }
