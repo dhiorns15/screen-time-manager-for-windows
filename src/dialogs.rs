@@ -838,7 +838,7 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                 let discord_admin_user_id = CreateWindowExW(
                     WINDOW_EX_STYLE(0x200), w!("EDIT"), w!(""),
                     WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_NUMBER as u32),
-                    scale(100), y_pos, scale(120), scale(22), hwnd, HMENU::default(), hinstance, None,
+                    scale(100), y_pos, scale(265), scale(22), hwnd, HMENU::default(), hinstance, None,
                 );
                 let mut discord_admin_user_id_hwnd = HWND::default();
                 if let Ok(h) = discord_admin_user_id {
@@ -852,8 +852,9 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                     }
                     discord_admin_user_id_hwnd = h;
                 }
+                y_pos += scale(24);
 
-                // Setup Wizard button (to the right of admin user id)
+                // Setup Wizard button (its own row, right-aligned)
                 let dc_wizard_btn_text = i18n::wide("settings.setup_wizard");
                 let dc_wizard_btn = CreateWindowExW(
                     WINDOW_EX_STYLE(0), w!("BUTTON"), PCWSTR(dc_wizard_btn_text.as_ptr()),
@@ -1256,7 +1257,7 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
     let screen_width = GetSystemMetrics(SM_CXSCREEN);
     let screen_height = GetSystemMetrics(SM_CYSCREEN);
     let dialog_width = scale(400);
-    let dialog_height = scale(920);
+    let dialog_height = scale(944);
 
     let dialog_hwnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
