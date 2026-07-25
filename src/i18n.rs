@@ -213,6 +213,10 @@ fn en(key: &str) -> &'static str {
         "blocking.confirm_shutdown" => "Are you sure you want to shut down the computer?",
         "blocking.confirm_title" => "Confirm Shutdown",
         "blocking.screen_locked" => "Screen Locked",
+        "blocking.request_note_label" => "Reason (optional):",
+        "blocking.request_time_button" => "📨 Request More Time",
+        "blocking.request_sent" => "✅ Sent! Wait",
+        "blocking.request_unavailable" => "Enable Telegram or Discord in Settings to request more time here",
 
         // ----- About Dialog -----
         "about.text" => "Screen Time Manager v1.0.40\n\nA parental control application for managing screen time.\n\n(c) Simon Pamies",
@@ -287,6 +291,10 @@ fn en(key: &str) -> &'static str {
 
         "tg.lock.success" => "Screen locked",
 
+        "tg.unlock.not_locked" => "The screen isn't locked right now.",
+        "tg.unlock.no_time" => "No time left - use /extend or /reset instead.",
+        "tg.unlock.success" => "Screen unlocked",
+
         "tg.error.unknown_cmd" => "Unknown command. Use /help to see available commands.",
         "tg.error.unauthorized" => "Unauthorized. This bot is configured for a specific user.",
         "tg.error.no_admin" => "No admin configured. Please set your chat ID in settings.",
@@ -306,6 +314,7 @@ fn en(key: &str) -> &'static str {
         "dc.cmd.history" => "Show today's pause activity",
         "dc.cmd.msg" => "Show a message on screen (e.g., !msg Do your homework!)",
         "dc.cmd.lock" => "Lock the screen",
+        "dc.cmd.unlock" => "Unlock without changing remaining time (only if time is left)",
         "dc.cmd.reset" => "Reset timer to daily limit",
         "dc.cmd.e30" => "Extend by 30 minutes",
         "dc.cmd.e60" => "Extend by 60 minutes",
@@ -317,6 +326,12 @@ fn en(key: &str) -> &'static str {
         "dc.error.no_admin" => "No admin configured. Please set your Discord user ID in settings.",
         "dc.error.specify_number" => "Please specify a number of minutes, e.g. !extend 30",
         "dc.whoami.your_id" => "Your Discord user ID is:",
+
+        // ----- Time Request Notifications (blocking overlay -> bots) -----
+        "request.notify.header" => "is requesting more time!",
+        "request.notify.reply_tg" => "Reply /extend 30 to grant, or /unlock if there's time left.",
+        "request.notify.reply_dc" => "Reply !extend 30 to grant, or !unlock if there's time left.",
+        "request.notify.resolved" => "Time request already granted:",
 
         // ----- Telegram Setup Wizard -----
         "wizard.title" => "Telegram Setup Wizard",
@@ -534,6 +549,10 @@ fn de(key: &str) -> &'static str {
         "blocking.confirm_shutdown" => "Möchten Sie den Computer wirklich herunterfahren?",
         "blocking.confirm_title" => "Herunterfahren bestätigen",
         "blocking.screen_locked" => "Bildschirm gesperrt",
+        "blocking.request_note_label" => "Grund (optional):",
+        "blocking.request_time_button" => "📨 Mehr Zeit anfragen",
+        "blocking.request_sent" => "✅ Gesendet! Warten",
+        "blocking.request_unavailable" => "Aktivieren Sie Telegram oder Discord in den Einstellungen, um hier mehr Zeit anzufragen",
 
         // ----- About Dialog -----
         "about.text" => "Bildschirmzeit Manager v1.0.40\n\nEine Kindersicherungs-App zur Verwaltung der Bildschirmzeit.\n\n(c) Simon Pamies",
@@ -608,6 +627,10 @@ fn de(key: &str) -> &'static str {
 
         "tg.lock.success" => "Bildschirm gesperrt",
 
+        "tg.unlock.not_locked" => "Der Bildschirm ist momentan nicht gesperrt.",
+        "tg.unlock.no_time" => "Keine Zeit mehr übrig - verwenden Sie /extend oder /reset.",
+        "tg.unlock.success" => "Bildschirm entsperrt",
+
         "tg.error.unknown_cmd" => "Unbekannter Befehl. Verwenden Sie /help für verfügbare Befehle.",
         "tg.error.unauthorized" => "Nicht autorisiert. Dieser Bot ist für einen bestimmten Benutzer konfiguriert.",
         "tg.error.no_admin" => "Kein Admin konfiguriert. Bitte setzen Sie Ihre Chat-ID in den Einstellungen.",
@@ -627,6 +650,7 @@ fn de(key: &str) -> &'static str {
         "dc.cmd.history" => "Heutige Pause-Aktivität anzeigen",
         "dc.cmd.msg" => "Nachricht anzeigen (z.B. !msg Mach deine Hausaufgaben!)",
         "dc.cmd.lock" => "Bildschirm sperren",
+        "dc.cmd.unlock" => "Entsperren ohne verbleibende Zeit zu ändern (nur wenn noch Zeit übrig ist)",
         "dc.cmd.reset" => "Timer auf Tageslimit zurücksetzen",
         "dc.cmd.e30" => "Um 30 Minuten verlängern",
         "dc.cmd.e60" => "Um 60 Minuten verlängern",
@@ -638,6 +662,12 @@ fn de(key: &str) -> &'static str {
         "dc.error.no_admin" => "Kein Admin konfiguriert. Bitte setzen Sie Ihre Discord-Benutzer-ID in den Einstellungen.",
         "dc.error.specify_number" => "Bitte geben Sie eine Anzahl Minuten an, z.B. !extend 30",
         "dc.whoami.your_id" => "Ihre Discord-Benutzer-ID ist:",
+
+        // ----- Time Request Notifications (Sperrbildschirm -> Bots) -----
+        "request.notify.header" => "fordert mehr Zeit an!",
+        "request.notify.reply_tg" => "Antworten Sie mit /extend 30 zum Gewähren, oder /unlock falls noch Zeit übrig ist.",
+        "request.notify.reply_dc" => "Antworten Sie mit !extend 30 zum Gewähren, oder !unlock falls noch Zeit übrig ist.",
+        "request.notify.resolved" => "Zeitanfrage bereits gewährt:",
 
         // ----- Telegram Setup Wizard -----
         "wizard.title" => "Telegram Einrichtungsassistent",

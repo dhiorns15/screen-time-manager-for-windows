@@ -11,7 +11,7 @@ use crate::overlay;
 
 /// Windows account currently running the app - useful when the bot config is
 /// shared across multiple accounts/children, so replies say whose data it is.
-fn current_windows_username() -> String {
+pub fn current_windows_username() -> String {
     std::env::var("USERNAME").unwrap_or_else(|_| "?".to_string())
 }
 
@@ -250,6 +250,27 @@ pub fn cmd_lock() -> String {
     }
 
     format!("🔒 {}", i18n::t("tg.lock.success"))
+}
+
+/// Dismiss the blocking overlay without granting or resetting any time -
+/// for undoing a manual lock while time is still left. Refuses when time has
+/// actually run out, since dismissing with 0 remaining would leave the
+/// countdown timer stopped with nothing left to re-trigger the lock screen.
+pub fn cmd_unlock() -> String {
+    if !blocking::is_blocking_overlay_visible() {
+        return i18n::t("tg.unlock.not_locked").to_string();
+    }
+
+    let remaining = blocking::get_remaining_seconds();
+    if remaining <= 0 {
+        return i18n::t("tg.unlock.no_time").to_string();
+    }
+
+    unsafe {
+        blocking::hide_blocking_overlay();
+    }
+
+    format!("🔓 {}", i18n::t("tg.unlock.success"))
 }
 
 /// Format pause blocked reason for display

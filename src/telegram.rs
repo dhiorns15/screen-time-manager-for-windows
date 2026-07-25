@@ -11,8 +11,9 @@ use crate::database;
 use crate::i18n;
 use crate::remote_commands::{
     cmd_extend, cmd_history, cmd_lock, cmd_msg, cmd_pause, cmd_reduce, cmd_reset, cmd_resume,
-    cmd_status, cmd_time,
+    cmd_status, cmd_time, cmd_unlock,
 };
+use crate::time_request;
 
 /// Shutdown signal for graceful termination
 pub static BOT_SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -48,6 +49,8 @@ enum Command {
     Lock,
     #[command(description = "Lock the screen (alias)")]
     Stop,
+    #[command(description = "Unlock without changing remaining time (only if time is left)")]
+    Unlock,
     #[command(description = "Reset timer to daily limit")]
     Reset,
     #[command(description = "Extend by 30 minutes")]
@@ -94,6 +97,24 @@ pub fn start_bot_thread() {
             run_bot(token, admin_chat_id).await;
         });
     });
+}
+
+/// Proactively push a message to the configured admin chat, outside of any
+/// incoming command (e.g. a "requesting more time" notification triggered
+/// from the blocking overlay). No-op if the bot isn't connected/configured.
+pub fn notify_admin(text: &str) {
+    if let (Some(bot), Some(&chat_id)) = (BOT_INSTANCE.get(), ADMIN_CHAT_ID.get()) {
+        let bot = bot.clone();
+        let text = text.to_string();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().ok();
+            if let Some(rt) = rt {
+                rt.block_on(async {
+                    let _ = bot.send_message(ChatId(chat_id), text).await;
+                });
+            }
+        });
+    }
 }
 
 /// Signal the bot to shut down gracefully
@@ -231,6 +252,20 @@ async fn handle_command(
         return Ok(());
     }
 
+    // Commands that dismiss/grant time on the lock screen resolve any
+    // pending "request more time" from the blocking overlay - figure out
+    // beforehand (while `cmd` is still borrowable) whether this one qualifies.
+    let grant_detail: Option<String> = match &cmd {
+        Command::Extend(mins) if *mins > 0 && *mins <= 120 => Some(format!("+{mins} min")),
+        Command::E30 => Some("+30 min".to_string()),
+        Command::E60 => Some("+60 min".to_string()),
+        Command::E120 => Some("+120 min".to_string()),
+        Command::Reset => Some("reset to daily limit".to_string()),
+        Command::Unlock if crate::blocking::is_blocking_overlay_visible()
+            && crate::blocking::get_remaining_seconds() > 0 => Some("unlocked".to_string()),
+        _ => None,
+    };
+
     let response = match cmd {
         Command::Start => unreachable!(), // Handled above
         Command::Status => cmd_status(),
@@ -243,6 +278,7 @@ async fn handle_command(
         Command::Msg(text) => cmd_msg(&text),
         Command::Lock => cmd_lock(),
         Command::Stop => cmd_lock(),
+        Command::Unlock => cmd_unlock(),
         Command::Reset => cmd_reset(),
         Command::E30 => cmd_extend(30),
         Command::E60 => cmd_extend(60),
@@ -250,6 +286,10 @@ async fn handle_command(
         Command::Chatid => unreachable!(), // Handled above
         Command::Help => Command::descriptions().to_string(),
     };
+
+    if let Some(detail) = grant_detail {
+        time_request::resolve_if_pending("Telegram", &detail);
+    }
 
     bot.send_message(msg.chat.id, response).await?;
     Ok(())

@@ -13,8 +13,9 @@ use crate::database;
 use crate::i18n;
 use crate::remote_commands::{
     cmd_extend, cmd_history, cmd_lock, cmd_msg, cmd_pause, cmd_reduce, cmd_reset, cmd_resume,
-    cmd_status, cmd_time,
+    cmd_status, cmd_time, cmd_unlock,
 };
+use crate::time_request;
 
 /// Shutdown signal for graceful termination
 pub static BOT_SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -77,6 +78,24 @@ impl EventHandler for Handler {
             Some(_) => {}
         }
 
+        // Commands that dismiss/grant time on the lock screen resolve any
+        // pending "request more time" from the blocking overlay - figure out
+        // beforehand whether this one actually qualifies (mirrors the
+        // success conditions the command itself checks internally).
+        let parsed_extend_mins = if cmd == "extend" { args.parse::<i32>().ok() } else { None };
+        let grant_detail: Option<String> = match cmd.as_str() {
+            "extend" => parsed_extend_mins
+                .filter(|m| *m > 0 && *m <= 120)
+                .map(|m| format!("+{m} min")),
+            "e30" => Some("+30 min".to_string()),
+            "e60" => Some("+60 min".to_string()),
+            "e120" => Some("+120 min".to_string()),
+            "reset" => Some("reset to daily limit".to_string()),
+            "unlock" if crate::blocking::is_blocking_overlay_visible()
+                && crate::blocking::get_remaining_seconds() > 0 => Some("unlocked".to_string()),
+            _ => None,
+        };
+
         let response = match cmd.as_str() {
             "status" => cmd_status(),
             "time" => cmd_time(),
@@ -87,6 +106,7 @@ impl EventHandler for Handler {
             "history" => cmd_history(),
             "msg" => cmd_msg(args),
             "lock" | "stop" => cmd_lock(),
+            "unlock" => cmd_unlock(),
             "reset" => cmd_reset(),
             "e30" => cmd_extend(30),
             "e60" => cmd_extend(60),
@@ -94,6 +114,10 @@ impl EventHandler for Handler {
             "help" => help_text(),
             _ => i18n::t("dc.error.unknown_cmd").to_string(),
         };
+
+        if let Some(detail) = grant_detail {
+            time_request::resolve_if_pending("Discord", &detail);
+        }
 
         let _ = msg.channel_id.say(&ctx.http, response).await;
     }
@@ -117,6 +141,7 @@ fn help_text() -> String {
         ("!history", i18n::t("dc.cmd.history")),
         ("!msg <text>", i18n::t("dc.cmd.msg")),
         ("!lock", i18n::t("dc.cmd.lock")),
+        ("!unlock", i18n::t("dc.cmd.unlock")),
         ("!reset", i18n::t("dc.cmd.reset")),
         ("!e30", i18n::t("dc.cmd.e30")),
         ("!e60", i18n::t("dc.cmd.e60")),
@@ -163,6 +188,24 @@ pub fn start_bot_thread() {
             run_bot(token, channel_id, admin_user_id).await;
         });
     });
+}
+
+/// Proactively push a message to the configured channel, outside of any
+/// incoming command (e.g. a "requesting more time" notification triggered
+/// from the blocking overlay). No-op if the bot isn't connected/configured.
+pub fn notify_admin(text: &str) {
+    if let (Some(http), Some(&channel_id)) = (BOT_HTTP.get(), NOTIFY_CHANNEL_ID.get()) {
+        let http = http.clone();
+        let text = text.to_string();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().ok();
+            if let Some(rt) = rt {
+                rt.block_on(async {
+                    let _ = ChannelId::new(channel_id).say(&http, text).await;
+                });
+            }
+        });
+    }
 }
 
 /// Signal the bot to shut down gracefully

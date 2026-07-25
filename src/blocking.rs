@@ -12,8 +12,8 @@ use windows::{
             BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
             CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint,
             EnumDisplayMonitors, FillRect, InvalidateRect, RoundRect, SelectObject, SetBkMode,
-            SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL, HDC,
-            HMONITOR, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
+            SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, FW_BOLD, FW_NORMAL,
+            HDC, HMONITOR, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
         },
         Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC},
         System::LibraryLoader::GetModuleHandleW,
@@ -25,7 +25,7 @@ use windows::{
         },
         UI::{
             Controls::*,
-            Input::KeyboardAndMouse::{SetFocus, VK_RETURN},
+            Input::KeyboardAndMouse::{EnableWindow, SetFocus, VK_RETURN},
             WindowsAndMessaging::*,
         },
     },
@@ -34,7 +34,7 @@ use windows::{
 use windows::core::PCWSTR;
 
 use crate::constants::*;
-use crate::database::get_passcode;
+use crate::database::{get_discord_config, get_passcode, get_telegram_config};
 use crate::dpi::scale;
 use crate::i18n;
 
@@ -92,6 +92,13 @@ pub static BLOCKING_TEXT: Mutex<Option<String>> = Mutex::new(None);
 pub static BLOCKING_EDIT_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 pub static PASSCODE_ERROR: AtomicBool = AtomicBool::new(false);
 
+/// "Request more time" button/edit, and how many cooldown seconds remain
+/// before it can be used again (0 = ready)
+static REQUEST_TIME_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+static REQUEST_NOTE_EDIT_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+static REQUEST_COOLDOWN_REMAINING: AtomicI32 = AtomicI32::new(0);
+const REQUEST_COOLDOWN_SECONDS: i32 = 300;
+
 /// Remaining time in seconds (negative means no limit/extension active)
 pub static REMAINING_SECONDS: AtomicI32 = AtomicI32::new(-1);
 
@@ -106,6 +113,7 @@ pub fn get_remaining_seconds() -> i32 {
 /// Timer IDs
 pub const TIMER_REASSERT_TOPMOST: usize = 2;
 pub const TIMER_COUNTDOWN: usize = 3;
+pub const TIMER_REQUEST_COOLDOWN: usize = 4;
 
 /// Control IDs
 const ID_PASSCODE_EDIT: i32 = 101;
@@ -114,6 +122,8 @@ const ID_EXTEND_15: i32 = 103;
 const ID_EXTEND_30: i32 = 104;
 const ID_EXTEND_60: i32 = 105;
 const ID_SHUTDOWN_BUTTON: i32 = 106;
+const ID_REQUEST_NOTE_EDIT: i32 = 107;
+const ID_REQUEST_TIME_BUTTON: i32 = 108;
 
 pub unsafe fn create_blocking_overlay(hinstance: windows::Win32::Foundation::HMODULE) {
     let class_name = w!("ScreenTimeBlockingClass");
@@ -171,6 +181,11 @@ pub unsafe fn show_blocking_overlay_with_time(text: &str, remaining_seconds: i32
     let edit_ptr = BLOCKING_EDIT_HWND.load(Ordering::SeqCst);
     if !edit_ptr.is_null() {
         SetWindowTextW(HWND(edit_ptr), w!("")).ok();
+    }
+
+    let note_ptr = REQUEST_NOTE_EDIT_HWND.load(Ordering::SeqCst);
+    if !note_ptr.is_null() {
+        SetWindowTextW(HWND(note_ptr), w!("")).ok();
     }
 
     let _ = InvalidateRect(hwnd, None, false);
@@ -270,6 +285,11 @@ pub unsafe fn hide_blocking_overlay() {
     }
 }
 
+/// Whether the blocking overlay is currently shown
+pub fn is_blocking_overlay_visible() -> bool {
+    BLOCKING_TEXT.lock().unwrap().is_some()
+}
+
 /// Verify passcode entered in blocking overlay
 unsafe fn check_blocking_passcode() -> bool {
     let edit_ptr = BLOCKING_EDIT_HWND.load(Ordering::SeqCst);
@@ -302,7 +322,7 @@ pub unsafe extern "system" fn blocking_overlay_proc(
 
             // Panel dimensions - must match WM_PAINT
             let _panel_width = scale(480);
-            let panel_height = scale(520);
+            let panel_height = scale(660);
             let panel_y = (screen_height - panel_height) / 2;
 
             // Shared button font
@@ -464,6 +484,58 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                 SendMessageW(h, WM_SETFONT, WPARAM(btn_font.0 as usize), LPARAM(1));
             }
 
+            // "Request more time" section - no passcode needed, only shown
+            // when a bot is actually configured to receive the notification.
+            // Layout: separator (WM_PAINT) -> reason label (WM_PAINT) ->
+            // note edit -> request button. Must match WM_PAINT.
+            if get_telegram_config().enabled || get_discord_config().enabled {
+                let request_width = scale(300);
+                let request_x = (screen_width - request_width) / 2;
+
+                let note_edit = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("EDIT"),
+                    w!(""),
+                    WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+                    request_x,
+                    panel_y + scale(508),
+                    request_width,
+                    scale(30),
+                    hwnd,
+                    HMENU(ID_REQUEST_NOTE_EDIT as _),
+                    hinstance,
+                    None,
+                ).ok();
+                if let Some(e) = note_edit {
+                    REQUEST_NOTE_EDIT_HWND.store(e.0, Ordering::SeqCst);
+                    SendMessageW(e, EM_SETLIMITTEXT, WPARAM(100), LPARAM(0));
+                    let note_font = CreateFontW(
+                        scale(14), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"),
+                    );
+                    SendMessageW(e, WM_SETFONT, WPARAM(note_font.0 as usize), LPARAM(1));
+                }
+
+                let request_btn_text = i18n::wide("blocking.request_time_button");
+                let request_btn = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("BUTTON"),
+                    PCWSTR(request_btn_text.as_ptr()),
+                    WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+                    request_x,
+                    panel_y + scale(548),
+                    request_width,
+                    scale(38),
+                    hwnd,
+                    HMENU(ID_REQUEST_TIME_BUTTON as _),
+                    hinstance,
+                    None,
+                );
+                if let Ok(h) = request_btn {
+                    REQUEST_TIME_HWND.store(h.0, Ordering::SeqCst);
+                    SendMessageW(h, WM_SETFONT, WPARAM(btn_font.0 as usize), LPARAM(1));
+                }
+            }
+
             LRESULT(0)
         }
         WM_PAINT => {
@@ -489,7 +561,7 @@ pub unsafe extern "system" fn blocking_overlay_proc(
 
             // Panel dimensions
             let panel_width = scale(480);
-            let panel_height = scale(520);
+            let panel_height = scale(660);
             let panel_x = (screen_width - panel_width) / 2;
             let panel_y = (screen_height - panel_height) / 2;
 
@@ -643,6 +715,44 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                 DT_CENTER | DT_SINGLELINE,
             );
 
+            // Separator + "request more time" section (no passcode needed)
+            let sep2_pen = CreatePen(PS_SOLID, 1, COLORREF(0x00444444));
+            SelectObject(hdc, sep2_pen);
+            let _ = windows::Win32::Graphics::Gdi::MoveToEx(hdc, panel_x + scale(40), panel_y + scale(476), None);
+            let _ = windows::Win32::Graphics::Gdi::LineTo(hdc, panel_x + panel_width - scale(40), panel_y + scale(476));
+            let _ = DeleteObject(sep2_pen);
+
+            SelectObject(hdc, label_font);
+            SetTextColor(hdc, COLORREF(0x00AAAAAA));
+
+            if get_telegram_config().enabled || get_discord_config().enabled {
+                let mut note_label_rect = RECT {
+                    left: panel_x,
+                    top: panel_y + scale(486),
+                    right: panel_x + panel_width,
+                    bottom: panel_y + scale(504),
+                };
+                DrawTextW(
+                    hdc,
+                    &mut i18n::t("blocking.request_note_label").encode_utf16().collect::<Vec<_>>(),
+                    &mut note_label_rect,
+                    DT_CENTER | DT_SINGLELINE,
+                );
+            } else {
+                let mut hint_rect = RECT {
+                    left: panel_x + scale(50),
+                    top: panel_y + scale(486),
+                    right: panel_x + panel_width - scale(50),
+                    bottom: panel_y + scale(586),
+                };
+                DrawTextW(
+                    hdc,
+                    &mut i18n::t("blocking.request_unavailable").encode_utf16().collect::<Vec<_>>(),
+                    &mut hint_rect,
+                    DT_CENTER | DT_WORDBREAK,
+                );
+            }
+
             // Error message at the bottom
             if PASSCODE_ERROR.load(Ordering::SeqCst) {
                 SetTextColor(hdc, COLORREF(COLOR_ERROR));
@@ -757,6 +867,37 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                             initiate_shutdown();
                         }
                     }
+                    ID_REQUEST_TIME_BUTTON => {
+                        if REQUEST_COOLDOWN_REMAINING.load(Ordering::SeqCst) <= 0 {
+                            let note_ptr = REQUEST_NOTE_EDIT_HWND.load(Ordering::SeqCst);
+                            let mut note = String::new();
+                            if !note_ptr.is_null() {
+                                let mut buffer = [0u16; 128];
+                                let len = GetWindowTextW(HWND(note_ptr), &mut buffer);
+                                note = String::from_utf16_lossy(&buffer[..len as usize]);
+                            }
+                            let note = note.trim();
+                            let remaining = REMAINING_SECONDS.load(Ordering::SeqCst).max(0);
+
+                            crate::time_request::request_more_time(
+                                if note.is_empty() { None } else { Some(note.to_string()) },
+                                remaining,
+                            );
+
+                            REQUEST_COOLDOWN_REMAINING.store(REQUEST_COOLDOWN_SECONDS, Ordering::SeqCst);
+                            let btn_ptr = REQUEST_TIME_HWND.load(Ordering::SeqCst);
+                            if !btn_ptr.is_null() {
+                                let btn = HWND(btn_ptr);
+                                let _ = EnableWindow(btn, false);
+                                let text = i18n::wide("blocking.request_sent");
+                                SetWindowTextW(btn, PCWSTR(text.as_ptr())).ok();
+                            }
+                            if !note_ptr.is_null() {
+                                let _ = EnableWindow(HWND(note_ptr), false);
+                            }
+                            SetTimer(hwnd, TIMER_REQUEST_COOLDOWN, 1000, None);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -789,7 +930,7 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                     let screen_width = client_rect.right;
                     let screen_height = client_rect.bottom;
                     let panel_width = scale(480);
-                    let panel_height = scale(520);
+                    let panel_height = scale(660);
                     let panel_x = (screen_width - panel_width) / 2;
                     let panel_y = (screen_height - panel_height) / 2;
 
@@ -801,6 +942,32 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                         bottom: panel_y + scale(200),
                     };
                     let _ = InvalidateRect(hwnd, Some(&countdown_rect), false);
+                }
+                TIMER_REQUEST_COOLDOWN => {
+                    let remaining = REQUEST_COOLDOWN_REMAINING.fetch_sub(1, Ordering::SeqCst) - 1;
+                    let btn_ptr = REQUEST_TIME_HWND.load(Ordering::SeqCst);
+                    if remaining <= 0 {
+                        REQUEST_COOLDOWN_REMAINING.store(0, Ordering::SeqCst);
+                        let _ = KillTimer(hwnd, TIMER_REQUEST_COOLDOWN);
+                        if !btn_ptr.is_null() {
+                            let btn = HWND(btn_ptr);
+                            let _ = EnableWindow(btn, true);
+                            let text = i18n::wide("blocking.request_time_button");
+                            SetWindowTextW(btn, PCWSTR(text.as_ptr())).ok();
+                        }
+                        let note_ptr = REQUEST_NOTE_EDIT_HWND.load(Ordering::SeqCst);
+                        if !note_ptr.is_null() {
+                            let _ = EnableWindow(HWND(note_ptr), true);
+                        }
+                    } else if !btn_ptr.is_null() {
+                        let text = format!(
+                            "{} ({}:{:02})",
+                            i18n::t("blocking.request_sent"),
+                            remaining / 60, remaining % 60
+                        );
+                        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+                        SetWindowTextW(HWND(btn_ptr), PCWSTR(wide.as_ptr())).ok();
+                    }
                 }
                 _ => {}
             }

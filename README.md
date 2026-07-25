@@ -88,6 +88,7 @@ You can monitor and control screen time from your phone using Telegram. This is 
 - `/status` - Check remaining time and pause status
 - `/time` - Quick time check
 - `/extend 30` - Add extra time (e.g., 30 minutes)
+- `/unlock` - Dismiss the lock screen without changing remaining time (only works if there's still time left)
 - `/pause` - Pause the timer
 - `/resume` - Resume the timer
 - `/history` - See today's pause activity
@@ -116,6 +117,7 @@ You can also monitor and control screen time from a Discord channel, using a Dis
 - `!status` - Check remaining time and pause status
 - `!time` - Quick time check
 - `!extend 30` - Add extra time (e.g., 30 minutes)
+- `!unlock` - Dismiss the lock screen without changing remaining time (only works if there's still time left)
 - `!pause` - Pause the timer
 - `!resume` - Resume the timer
 - `!history` - See today's pause activity
@@ -132,6 +134,14 @@ You can also monitor and control screen time from a Discord channel, using a Dis
 Once configured, only you can control the bot in that channel - it ignores commands from anyone else.
 
 **Note:** the bot token/channel/user ID are stored machine-wide (shared across every Windows account on the PC, unlike time limits/passcode which are per-account) - set it up once and it works no matter which child's account is running the app. If you have multiple children on separate standard (non-admin) Windows accounts, run `install.ps1` as Administrator at least once so those accounts get permission to read/write the shared config; otherwise it silently falls back to per-account storage. Since the config is shared, `!status`/`!history` (and their Telegram equivalents) show which Windows account is currently logged in, so you can tell whose stats you're looking at.
+
+---
+
+## Requesting More Time From the Lock Screen
+
+If Telegram and/or Discord is enabled, the lock screen shows a **"Request More Time"** button that doesn't need the passcode. Your child can optionally type a short reason (e.g. "saving my game"), then click it to ping you directly - the message includes their Windows account, remaining time, and the reason if given. Reply `!extend 30` (Discord) or `/extend 30` (Telegram) to grant time, or `!unlock`/`/unlock` to dismiss the screen without changing the timer if there's still time left - either one closes the lock screen automatically. The button has a 5-minute cooldown to prevent spamming.
+
+If both Telegram and Discord are enabled, the request goes to both, but only one reply is needed - whichever one you respond from first, the other gets a short "already handled" notice so you don't have to reply twice.
 
 ---
 

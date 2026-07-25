@@ -16,6 +16,7 @@ mod mini_overlay;
 mod overlay;
 mod remote_commands;
 mod telegram;
+mod time_request;
 mod tray;
 
 use std::mem::zeroed;
