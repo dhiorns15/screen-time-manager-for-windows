@@ -43,6 +43,19 @@ $ExePath = (Resolve-Path $ExePath).Path
 Write-Host "Found executable: $ExePath" -ForegroundColor Green
 Write-Host ""
 
+# Create the shared config folder (used for Telegram/Discord bot settings so
+# they're the same no matter which Windows account runs the app) and grant
+# standard users write access - %ProgramData% isn't writable by non-admin
+# accounts by default.
+$SharedConfigDir = Join-Path $env:ProgramData "ScreenTimeManager"
+Write-Host "Setting up shared config folder..." -ForegroundColor White
+if (-not (Test-Path $SharedConfigDir)) {
+    New-Item -ItemType Directory -Path $SharedConfigDir -Force | Out-Null
+}
+icacls $SharedConfigDir /grant "*S-1-5-32-545:(OI)(CI)M" | Out-Null
+Write-Host "Shared config folder ready: $SharedConfigDir" -ForegroundColor Green
+Write-Host ""
+
 # Check if task already exists
 $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($existingTask) {

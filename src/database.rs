@@ -9,6 +9,13 @@ use windows::core::PCWSTR;
 /// Global database connection (thread-safe)
 pub static DB_CONNECTION: Mutex<Option<Connection>> = Mutex::new(None);
 
+/// Shared machine-wide database connection, used for settings that should be
+/// the same no matter which Windows account is running the app (currently
+/// just the Telegram/Discord bot config). `None` if the shared location
+/// couldn't be created/opened (e.g. missing permissions) - callers fall back
+/// to the per-user database in that case.
+pub static SHARED_DB_CONNECTION: Mutex<Option<Connection>> = Mutex::new(None);
+
 /// Weekday keys for database
 pub const WEEKDAY_KEYS: [&str; 7] = [
     "limit_monday", "limit_tuesday", "limit_wednesday", "limit_thursday",
@@ -102,6 +109,98 @@ pub fn init_database() -> Result<(), Box<dyn std::error::Error>> {
 
     *DB_CONNECTION.lock().unwrap() = Some(conn);
     Ok(())
+}
+
+/// Get the path to the shared machine-wide database, under %ProgramData%.
+/// Not tied to any Windows account, unlike `get_database_path()`.
+fn get_shared_database_path() -> Option<PathBuf> {
+    let program_data = std::env::var_os("ProgramData")?;
+    Some(PathBuf::from(program_data).join("ScreenTimeManager").join("bot_config.db"))
+}
+
+/// Initialize the shared machine-wide database used for bot configuration.
+/// Safe to fail (e.g. the current account lacks permission to create the
+/// folder/file) - callers of `get_shared_setting`/`set_shared_setting` fall
+/// back to the per-user database when this hasn't succeeded.
+pub fn init_shared_database() {
+    let Some(db_path) = get_shared_database_path() else { return };
+
+    if let Some(dir) = db_path.parent() {
+        if !dir.exists() {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                eprintln!("[Database] Could not create shared config directory: {e}");
+                return;
+            }
+        }
+    }
+
+    let conn = match Connection::open(&db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[Database] Could not open shared config database: {e}");
+            return;
+        }
+    };
+
+    if let Err(e) = conn.execute(
+        "CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+        [],
+    ) {
+        eprintln!("[Database] Could not initialize shared config database: {e}");
+        return;
+    }
+
+    *SHARED_DB_CONNECTION.lock().unwrap() = Some(conn);
+
+    // One-time migration: carry over bot settings from the old per-user
+    // storage so existing setups (Telegram/Discord already configured
+    // before this became shared) don't have to be redone.
+    const MIGRATED_KEYS: [&str; 7] = [
+        TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_CHAT_ID, TELEGRAM_ENABLED,
+        DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID, DISCORD_ADMIN_USER_ID, DISCORD_ENABLED,
+    ];
+    for key in MIGRATED_KEYS {
+        if get_shared_setting(key).is_none() {
+            if let Some(legacy_value) = get_setting(key) {
+                set_shared_setting(key, &legacy_value);
+            }
+        }
+    }
+}
+
+/// Get a setting from the shared machine-wide database, falling back to the
+/// per-user database if the shared one isn't available.
+pub fn get_shared_setting(key: &str) -> Option<String> {
+    if let Ok(guard) = SHARED_DB_CONNECTION.lock() {
+        if let Some(conn) = guard.as_ref() {
+            if let Ok(value) = conn.query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            ) {
+                return Some(value);
+            }
+            return None;
+        }
+    }
+    get_setting(key)
+}
+
+/// Set a setting in the shared machine-wide database, falling back to the
+/// per-user database if the shared one isn't available.
+pub fn set_shared_setting(key: &str, value: &str) -> bool {
+    if let Ok(guard) = SHARED_DB_CONNECTION.lock() {
+        if let Some(conn) = guard.as_ref() {
+            return conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            ).is_ok();
+        }
+    }
+    set_setting(key, value)
 }
 
 /// Get the passcode from the database
@@ -407,23 +506,23 @@ pub struct TelegramConfig {
     pub enabled: bool,
 }
 
-/// Get Telegram bot configuration
+/// Get Telegram bot configuration (shared machine-wide, not per-account)
 pub fn get_telegram_config() -> TelegramConfig {
     TelegramConfig {
-        bot_token: get_setting(TELEGRAM_BOT_TOKEN),
-        admin_chat_id: get_setting(TELEGRAM_ADMIN_CHAT_ID)
+        bot_token: get_shared_setting(TELEGRAM_BOT_TOKEN),
+        admin_chat_id: get_shared_setting(TELEGRAM_ADMIN_CHAT_ID)
             .and_then(|s| s.parse::<i64>().ok()),
-        enabled: get_setting(TELEGRAM_ENABLED)
+        enabled: get_shared_setting(TELEGRAM_ENABLED)
             .map(|s| s == "true")
             .unwrap_or(false),
     }
 }
 
-/// Save Telegram bot configuration
+/// Save Telegram bot configuration (shared machine-wide, not per-account)
 pub fn set_telegram_config(token: &str, chat_id: &str, enabled: bool) {
-    set_setting(TELEGRAM_BOT_TOKEN, token);
-    set_setting(TELEGRAM_ADMIN_CHAT_ID, chat_id);
-    set_setting(TELEGRAM_ENABLED, if enabled { "true" } else { "false" });
+    set_shared_setting(TELEGRAM_BOT_TOKEN, token);
+    set_shared_setting(TELEGRAM_ADMIN_CHAT_ID, chat_id);
+    set_shared_setting(TELEGRAM_ENABLED, if enabled { "true" } else { "false" });
 }
 
 // ============================================================================
@@ -444,24 +543,24 @@ pub struct DiscordConfig {
     pub enabled: bool,
 }
 
-/// Get Discord bot configuration
+/// Get Discord bot configuration (shared machine-wide, not per-account)
 pub fn get_discord_config() -> DiscordConfig {
     DiscordConfig {
-        bot_token: get_setting(DISCORD_BOT_TOKEN),
-        channel_id: get_setting(DISCORD_CHANNEL_ID)
+        bot_token: get_shared_setting(DISCORD_BOT_TOKEN),
+        channel_id: get_shared_setting(DISCORD_CHANNEL_ID)
             .and_then(|s| s.parse::<u64>().ok()),
-        admin_user_id: get_setting(DISCORD_ADMIN_USER_ID)
+        admin_user_id: get_shared_setting(DISCORD_ADMIN_USER_ID)
             .and_then(|s| s.parse::<u64>().ok()),
-        enabled: get_setting(DISCORD_ENABLED)
+        enabled: get_shared_setting(DISCORD_ENABLED)
             .map(|s| s == "true")
             .unwrap_or(false),
     }
 }
 
-/// Save Discord bot configuration
+/// Save Discord bot configuration (shared machine-wide, not per-account)
 pub fn set_discord_config(token: &str, channel_id: &str, admin_user_id: &str, enabled: bool) {
-    set_setting(DISCORD_BOT_TOKEN, token);
-    set_setting(DISCORD_CHANNEL_ID, channel_id);
-    set_setting(DISCORD_ADMIN_USER_ID, admin_user_id);
-    set_setting(DISCORD_ENABLED, if enabled { "true" } else { "false" });
+    set_shared_setting(DISCORD_BOT_TOKEN, token);
+    set_shared_setting(DISCORD_CHANNEL_ID, channel_id);
+    set_shared_setting(DISCORD_ADMIN_USER_ID, admin_user_id);
+    set_shared_setting(DISCORD_ENABLED, if enabled { "true" } else { "false" });
 }

@@ -9,6 +9,12 @@ use crate::i18n;
 use crate::mini_overlay;
 use crate::overlay;
 
+/// Windows account currently running the app - useful when the bot config is
+/// shared across multiple accounts/children, so replies say whose data it is.
+fn current_windows_username() -> String {
+    std::env::var("USERNAME").unwrap_or_else(|_| "?".to_string())
+}
+
 pub fn cmd_status() -> String {
     let remaining = blocking::get_remaining_seconds();
     let paused = mini_overlay::is_paused();
@@ -37,10 +43,13 @@ pub fn cmd_status() -> String {
     format!(
         "{}\n\
          ━━━━━━━━━━━━━━━━━━\n\
+         👤 {}: {}\n\
          {} {}: {}:{:02}\n\
          ⏸ {}: {}\n\
          🔋 {}: {} min",
         i18n::t("tg.status.header"),
+        i18n::t("tg.status.user"),
+        current_windows_username(),
         status_emoji,
         i18n::t("tg.status.remaining"),
         mins, secs,
@@ -161,7 +170,12 @@ pub fn cmd_history() -> String {
     let pause_config = database::get_pause_config();
     let session_active = mini_overlay::SESSION_ACTIVE_SECONDS.load(Ordering::SeqCst);
 
-    let mut response = format!("📊 {}\n━━━━━━━━━━━━━━━━━━\n", i18n::t("tg.history.header"));
+    let mut response = format!(
+        "📊 {}\n━━━━━━━━━━━━━━━━━━\n👤 {}: {}\n",
+        i18n::t("tg.history.header"),
+        i18n::t("tg.status.user"),
+        current_windows_username(),
+    );
 
     // Format uptime
     let hours = session_active / 3600;

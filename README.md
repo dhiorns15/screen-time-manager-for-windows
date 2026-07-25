@@ -104,6 +104,8 @@ You can monitor and control screen time from your phone using Telegram. This is 
 
 Once configured, only you can control the bot - it ignores messages from anyone else.
 
+**Note:** the bot token/chat ID are stored machine-wide (shared across every Windows account on the PC, unlike time limits/passcode which are per-account) - set it up once and it works no matter which child's account is running the app. If you have multiple children on separate standard (non-admin) Windows accounts, run `install.ps1` as Administrator at least once so those accounts get permission to read/write the shared config; otherwise it silently falls back to per-account storage.
+
 ---
 
 ## Remote Control via Discord (Optional)
@@ -128,6 +130,8 @@ You can also monitor and control screen time from a Discord channel, using a Dis
 5. In Screen Time Manager settings, scroll to the "Discord Bot" section (or use the **Setup Wizard**) and paste your bot token, channel ID, and user ID, then enable the bot
 
 Once configured, only you can control the bot in that channel - it ignores commands from anyone else.
+
+**Note:** the bot token/channel/user ID are stored machine-wide (shared across every Windows account on the PC, unlike time limits/passcode which are per-account) - set it up once and it works no matter which child's account is running the app. If you have multiple children on separate standard (non-admin) Windows accounts, run `install.ps1` as Administrator at least once so those accounts get permission to read/write the shared config; otherwise it silently falls back to per-account storage. Since the config is shared, `!status`/`!history` (and their Telegram equivalents) show which Windows account is currently logged in, so you can tell whose stats you're looking at.
 
 ---
 

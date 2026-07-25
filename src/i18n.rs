@@ -245,6 +245,7 @@ fn en(key: &str) -> &'static str {
 
         // ----- Telegram Bot - Responses -----
         "tg.status.header" => "Screen Time Status",
+        "tg.status.user" => "User",
         "tg.status.remaining" => "Remaining:",
         "tg.status.paused" => "Paused:",
         "tg.status.pause_budget" => "Pause budget:",
@@ -565,6 +566,7 @@ fn de(key: &str) -> &'static str {
 
         // ----- Telegram Bot - Responses -----
         "tg.status.header" => "Bildschirmzeit Status",
+        "tg.status.user" => "Benutzer",
         "tg.status.remaining" => "Verbleibend:",
         "tg.status.paused" => "Pausiert:",
         "tg.status.pause_budget" => "Pause-Budget:",

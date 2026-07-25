@@ -71,6 +71,10 @@ fn main() {
             return;
         }
 
+        // Initialize the shared machine-wide database (bot config); safe to
+        // fail (e.g. missing permissions), falls back to per-account storage
+        database::init_shared_database();
+
         // Get the module handle
         let hinstance = GetModuleHandleW(None).expect("Failed to get module handle");
 
