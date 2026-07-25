@@ -50,6 +50,7 @@ fn main() {
          BEGIN\n\
          VALUE \"Translation\", 0x409, 1200\n\
          END\n\
+         END\n\
          END\n",
     );
 
