@@ -287,6 +287,9 @@ pub unsafe extern "system" fn window_proc(
             // Signal Telegram bot to shut down (sends shutdown notification)
             telegram::signal_shutdown();
 
+            // Signal Discord bot to shut down (sends shutdown notification)
+            crate::discord::signal_shutdown();
+
             let overlay_hwnd = HWND(OVERLAY_HWND.load(Ordering::SeqCst));
             if !overlay_hwnd.0.is_null() {
                 DestroyWindow(overlay_hwnd).ok();

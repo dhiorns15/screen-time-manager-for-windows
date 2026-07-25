@@ -123,6 +123,7 @@ fn en(key: &str) -> &'static str {
         "settings.blocking_message" => "Blocking Screen Message",
         "settings.passcode" => "Change Passcode (leave blank to keep)",
         "settings.telegram" => "Telegram Bot",
+        "settings.discord" => "Discord Bot",
         "settings.lock_screen" => "Lock Screen",
         "settings.idle" => "Idle Detection",
         "settings.language" => "Language",
@@ -137,6 +138,9 @@ fn en(key: &str) -> &'static str {
         "settings.bot_token" => "Bot Token:",
         "settings.chat_id" => "Chat ID:",
         "settings.setup_wizard" => "Setup Wizard...",
+        "settings.enable_discord" => "Enable Discord Bot",
+        "settings.channel_id" => "Channel ID:",
+        "settings.discord_user_id" => "Your User ID:",
         "settings.shutdown_timeout" => "Shutdown timeout:",
         "settings.auto_pause_idle" => "Auto-pause when idle",
         "settings.idle_timeout" => "Idle timeout (min):",
@@ -290,6 +294,29 @@ fn en(key: &str) -> &'static str {
         "tg.notify.started" => "Screen Time Manager started",
         "tg.notify.shutdown" => "Screen Time Manager is shutting down",
 
+        // ----- Discord Bot - Command Descriptions -----
+        "dc.help.header" => "Screen Time Manager Discord Bot commands:",
+        "dc.cmd.status" => "Show remaining time and status",
+        "dc.cmd.time" => "Quick time check",
+        "dc.cmd.extend" => "Extend time by minutes (e.g., !extend 30)",
+        "dc.cmd.reduce" => "Reduce time by minutes (e.g., !reduce 30)",
+        "dc.cmd.pause" => "Pause the timer",
+        "dc.cmd.resume" => "Resume the timer",
+        "dc.cmd.history" => "Show today's pause activity",
+        "dc.cmd.msg" => "Show a message on screen (e.g., !msg Do your homework!)",
+        "dc.cmd.lock" => "Lock the screen",
+        "dc.cmd.reset" => "Reset timer to daily limit",
+        "dc.cmd.e30" => "Extend by 30 minutes",
+        "dc.cmd.e60" => "Extend by 60 minutes",
+        "dc.cmd.e120" => "Extend by 120 minutes",
+        "dc.cmd.whoami" => "Get your Discord user ID for setup",
+        "dc.cmd.help" => "Show this help message",
+
+        "dc.error.unknown_cmd" => "Unknown command. Use !help to see available commands.",
+        "dc.error.no_admin" => "No admin configured. Please set your Discord user ID in settings.",
+        "dc.error.specify_number" => "Please specify a number of minutes, e.g. !extend 30",
+        "dc.whoami.your_id" => "Your Discord user ID is:",
+
         // ----- Telegram Setup Wizard -----
         "wizard.title" => "Telegram Setup Wizard",
         "wizard.step" => "Step",
@@ -346,6 +373,51 @@ fn en(key: &str) -> &'static str {
         "wizard.success.cmd3" => "/lock - Lock the screen",
         "wizard.success.cmd4" => "/help - See all commands",
 
+        // ----- Discord Setup Wizard -----
+        "wizard.dc.title" => "Discord Setup Wizard",
+
+        // Step 1: Welcome
+        "wizard.dc.welcome.title" => "Remote Control via Discord",
+        "wizard.dc.welcome.desc1" => "Control Screen Time Manager from Discord!",
+        "wizard.dc.welcome.desc2" => "With Discord you can:",
+        "wizard.dc.welcome.ready" => "Let's set it up in a few steps!",
+
+        // Step 2: Create Bot
+        "wizard.dc.bot.title" => "Create Your Bot",
+        "wizard.dc.bot.step1" => "1. Go to discord.com/developers/applications",
+        "wizard.dc.bot.step2" => "2. Click \"New Application\" and give it a name",
+        "wizard.dc.bot.step3" => "3. Open the \"Bot\" tab",
+        "wizard.dc.bot.step4" => "4. Enable \"Message Content Intent\"",
+        "wizard.dc.bot.step5" => "5. Click \"Reset Token\" and copy it",
+        "wizard.dc.bot.step6" => "6. Go to \"OAuth2 > URL Generator\"",
+        "wizard.dc.bot.step7" => "7. Check \"bot\" + Send Messages/View Channels/Read History, open the URL",
+        "wizard.dc.bot.hint" => "Keep this token secret - anyone with it can control the bot",
+
+        // Step 3: Enter Token
+        "wizard.dc.token.title" => "Enter Your Bot Token",
+        "wizard.dc.token.label" => "Paste the token from the Developer Portal:",
+        "wizard.dc.token.invalid" => "This doesn't look like a valid token",
+        "wizard.dc.token.valid" => "Token looks good!",
+
+        // Step 4: Channel & User ID
+        "wizard.dc.ids.title" => "Channel & User ID",
+        "wizard.dc.ids.step1" => "1. In Discord, enable Developer Mode (User Settings > Advanced)",
+        "wizard.dc.ids.step2" => "2. Right-click the channel to use, then \"Copy Channel ID\"",
+        "wizard.dc.ids.step3" => "3. Right-click your own username, then \"Copy User ID\"",
+        "wizard.dc.ids.channel_label" => "Channel ID:",
+        "wizard.dc.ids.user_label" => "Your User ID:",
+        "wizard.dc.ids.invalid" => "Please enter both IDs (numbers only)",
+
+        // Step 5: Success
+        "wizard.dc.success.title" => "Setup Complete!",
+        "wizard.dc.success.desc" => "Your Discord bot is ready to use.",
+        "wizard.dc.success.test" => "A test message was sent to your channel.",
+        "wizard.dc.success.commands" => "Try these commands in Discord:",
+        "wizard.dc.success.cmd1" => "!status - Check remaining time",
+        "wizard.dc.success.cmd2" => "!extend 30 - Add 30 minutes",
+        "wizard.dc.success.cmd3" => "!lock - Lock the screen",
+        "wizard.dc.success.cmd4" => "!help - See all commands",
+
         // Fallback - return empty string for unknown keys (should not happen in practice)
         _ => "",
     }
@@ -371,6 +443,7 @@ fn de(key: &str) -> &'static str {
         "settings.blocking_message" => "Sperrbildschirm-Nachricht",
         "settings.passcode" => "Code ändern (leer lassen zum Behalten)",
         "settings.telegram" => "Telegram Bot",
+        "settings.discord" => "Discord Bot",
         "settings.lock_screen" => "Bildschirmsperre",
         "settings.idle" => "Leerlauferkennung",
         "settings.language" => "Sprache",
@@ -385,6 +458,9 @@ fn de(key: &str) -> &'static str {
         "settings.bot_token" => "Bot Token:",
         "settings.chat_id" => "Chat ID:",
         "settings.setup_wizard" => "Einrichtungsassistent...",
+        "settings.enable_discord" => "Discord Bot aktivieren",
+        "settings.channel_id" => "Kanal-ID:",
+        "settings.discord_user_id" => "Deine Benutzer-ID:",
         "settings.shutdown_timeout" => "Abschaltzeit:",
         "settings.auto_pause_idle" => "Auto-Pause bei Leerlauf",
         "settings.idle_timeout" => "Leerlaufzeit (Min):",
@@ -538,6 +614,29 @@ fn de(key: &str) -> &'static str {
         "tg.notify.started" => "Bildschirmzeit Manager gestartet",
         "tg.notify.shutdown" => "Bildschirmzeit Manager wird heruntergefahren",
 
+        // ----- Discord Bot - Befehlsbeschreibungen -----
+        "dc.help.header" => "Bildschirmzeit Manager Discord Bot Befehle:",
+        "dc.cmd.status" => "Verbleibende Zeit und Status anzeigen",
+        "dc.cmd.time" => "Schnelle Zeitabfrage",
+        "dc.cmd.extend" => "Zeit verlängern (z.B. !extend 30)",
+        "dc.cmd.reduce" => "Zeit verringern (z.B. !reduce 30)",
+        "dc.cmd.pause" => "Timer pausieren",
+        "dc.cmd.resume" => "Timer fortsetzen",
+        "dc.cmd.history" => "Heutige Pause-Aktivität anzeigen",
+        "dc.cmd.msg" => "Nachricht anzeigen (z.B. !msg Mach deine Hausaufgaben!)",
+        "dc.cmd.lock" => "Bildschirm sperren",
+        "dc.cmd.reset" => "Timer auf Tageslimit zurücksetzen",
+        "dc.cmd.e30" => "Um 30 Minuten verlängern",
+        "dc.cmd.e60" => "Um 60 Minuten verlängern",
+        "dc.cmd.e120" => "Um 120 Minuten verlängern",
+        "dc.cmd.whoami" => "Ihre Discord-Benutzer-ID zur Einrichtung abrufen",
+        "dc.cmd.help" => "Diese Hilfemeldung anzeigen",
+
+        "dc.error.unknown_cmd" => "Unbekannter Befehl. Verwenden Sie !help für verfügbare Befehle.",
+        "dc.error.no_admin" => "Kein Admin konfiguriert. Bitte setzen Sie Ihre Discord-Benutzer-ID in den Einstellungen.",
+        "dc.error.specify_number" => "Bitte geben Sie eine Anzahl Minuten an, z.B. !extend 30",
+        "dc.whoami.your_id" => "Ihre Discord-Benutzer-ID ist:",
+
         // ----- Telegram Setup Wizard -----
         "wizard.title" => "Telegram Einrichtungsassistent",
         "wizard.step" => "Schritt",
@@ -593,6 +692,51 @@ fn de(key: &str) -> &'static str {
         "wizard.success.cmd2" => "/extend 30 - 30 Minuten hinzufügen",
         "wizard.success.cmd3" => "/lock - Bildschirm sperren",
         "wizard.success.cmd4" => "/help - Alle Befehle anzeigen",
+
+        // ----- Discord Einrichtungsassistent -----
+        "wizard.dc.title" => "Discord Einrichtungsassistent",
+
+        // Schritt 1: Willkommen
+        "wizard.dc.welcome.title" => "Fernsteuerung via Discord",
+        "wizard.dc.welcome.desc1" => "Steuern Sie den Bildschirmzeit Manager über Discord!",
+        "wizard.dc.welcome.desc2" => "Mit Discord können Sie:",
+        "wizard.dc.welcome.ready" => "Richten wir es in wenigen Schritten ein!",
+
+        // Schritt 2: Bot erstellen
+        "wizard.dc.bot.title" => "Erstellen Sie Ihren Bot",
+        "wizard.dc.bot.step1" => "1. Gehen Sie zu discord.com/developers/applications",
+        "wizard.dc.bot.step2" => "2. Klicken Sie auf \"New Application\" und vergeben Sie einen Namen",
+        "wizard.dc.bot.step3" => "3. Öffnen Sie den Tab \"Bot\"",
+        "wizard.dc.bot.step4" => "4. Aktivieren Sie \"Message Content Intent\"",
+        "wizard.dc.bot.step5" => "5. Klicken Sie auf \"Reset Token\" und kopieren Sie ihn",
+        "wizard.dc.bot.step6" => "6. Gehen Sie zu \"OAuth2 > URL Generator\"",
+        "wizard.dc.bot.step7" => "7. Wählen Sie \"bot\" + Send Messages/View Channels/Read History, öffnen Sie die URL",
+        "wizard.dc.bot.hint" => "Halten Sie diesen Token geheim - damit kann jeder den Bot steuern",
+
+        // Schritt 3: Token eingeben
+        "wizard.dc.token.title" => "Bot-Token eingeben",
+        "wizard.dc.token.label" => "Fügen Sie den Token aus dem Developer Portal ein:",
+        "wizard.dc.token.invalid" => "Das sieht nicht wie ein gültiger Token aus",
+        "wizard.dc.token.valid" => "Token sieht gut aus!",
+
+        // Schritt 4: Kanal- & Benutzer-ID
+        "wizard.dc.ids.title" => "Kanal- & Benutzer-ID",
+        "wizard.dc.ids.step1" => "1. Aktivieren Sie den Entwicklermodus in Discord (Benutzereinstellungen > Erweitert)",
+        "wizard.dc.ids.step2" => "2. Rechtsklick auf den gewünschten Kanal, dann \"ID kopieren\"",
+        "wizard.dc.ids.step3" => "3. Rechtsklick auf Ihren eigenen Benutzernamen, dann \"ID kopieren\"",
+        "wizard.dc.ids.channel_label" => "Kanal-ID:",
+        "wizard.dc.ids.user_label" => "Ihre Benutzer-ID:",
+        "wizard.dc.ids.invalid" => "Bitte geben Sie beide IDs ein (nur Zahlen)",
+
+        // Schritt 5: Erfolg
+        "wizard.dc.success.title" => "Einrichtung abgeschlossen!",
+        "wizard.dc.success.desc" => "Ihr Discord-Bot ist einsatzbereit.",
+        "wizard.dc.success.test" => "Eine Testnachricht wurde an Ihren Kanal gesendet.",
+        "wizard.dc.success.commands" => "Probieren Sie diese Befehle in Discord:",
+        "wizard.dc.success.cmd1" => "!status - Verbleibende Zeit prüfen",
+        "wizard.dc.success.cmd2" => "!extend 30 - 30 Minuten hinzufügen",
+        "wizard.dc.success.cmd3" => "!lock - Bildschirm sperren",
+        "wizard.dc.success.cmd4" => "!help - Alle Befehle anzeigen",
 
         // Fallback to English
         _ => en(key),

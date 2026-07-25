@@ -37,7 +37,7 @@ Confirmed to be effectively blocking Fortnite, Roblox and Minecraft.
 
    ![Passcode entry](images/passcode-entry.png)
 
-5. **Configure your limits** - Set daily time limits, warning messages, and optionally set up Telegram remote control.
+5. **Configure your limits** - Set daily time limits, warning messages, and optionally set up Telegram or Discord remote control.
 
    ![Settings dialog](images/settings.png)
 
@@ -103,6 +103,31 @@ You can monitor and control screen time from your phone using Telegram. This is 
 7. Paste your bot token and chat ID, then enable the bot
 
 Once configured, only you can control the bot - it ignores messages from anyone else.
+
+---
+
+## Remote Control via Discord (Optional)
+
+You can also monitor and control screen time from a Discord channel, using a Discord bot instead of Telegram.
+
+**What you can do from Discord:**
+- `!status` - Check remaining time and pause status
+- `!time` - Quick time check
+- `!extend 30` - Add extra time (e.g., 30 minutes)
+- `!pause` - Pause the timer
+- `!resume` - Resume the timer
+- `!history` - See today's pause activity
+- `!help` - See all commands
+
+**Setup (one-time):**
+
+1. Go to [discord.com/developers/applications](https://discord.com/developers/applications) and click **New Application**
+2. Open the **Bot** tab, enable **Message Content Intent**, click **Reset Token**, and copy it
+3. Under **OAuth2 > URL Generator**, check the **bot** scope plus the **Send Messages**, **View Channels**, and **Read Message History** permissions, then open the generated URL to invite the bot to your server
+4. In Discord, enable **Developer Mode** (User Settings > Advanced), then right-click the channel you want to use and choose **Copy Channel ID**, and right-click your own username and choose **Copy User ID**
+5. In Screen Time Manager settings, scroll to the "Discord Bot" section (or use the **Setup Wizard**) and paste your bot token, channel ID, and user ID, then enable the bot
+
+Once configured, only you can control the bot in that channel - it ignores commands from anyone else.
 
 ---
 

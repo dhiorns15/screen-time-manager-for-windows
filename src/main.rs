@@ -9,10 +9,12 @@ mod blocking;
 mod constants;
 mod database;
 mod dialogs;
+mod discord;
 mod dpi;
 mod i18n;
 mod mini_overlay;
 mod overlay;
+mod remote_commands;
 mod telegram;
 mod tray;
 
@@ -140,6 +142,9 @@ fn main() {
 
         // Start Telegram bot in background thread (if configured)
         telegram::start_bot_thread();
+
+        // Start Discord bot in background thread (if configured)
+        discord::start_bot_thread();
 
         // Message loop
         let mut msg: MSG = zeroed();

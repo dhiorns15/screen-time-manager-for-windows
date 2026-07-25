@@ -36,6 +36,9 @@ dirs = "5.0"
 teloxide = { version = "0.13", features = ["macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 
+# Discord bot
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "rustls_backend", "model"] }
+
 # HTTP client for wizard
 ureq = "2.9"
 urlencoding = "2.1"

@@ -425,3 +425,43 @@ pub fn set_telegram_config(token: &str, chat_id: &str, enabled: bool) {
     set_setting(TELEGRAM_ADMIN_CHAT_ID, chat_id);
     set_setting(TELEGRAM_ENABLED, if enabled { "true" } else { "false" });
 }
+
+// ============================================================================
+// Discord Bot Configuration
+// ============================================================================
+
+/// Settings keys for Discord bot
+const DISCORD_BOT_TOKEN: &str = "discord_bot_token";
+const DISCORD_CHANNEL_ID: &str = "discord_channel_id";
+const DISCORD_ADMIN_USER_ID: &str = "discord_admin_user_id";
+const DISCORD_ENABLED: &str = "discord_enabled";
+
+/// Discord bot configuration
+pub struct DiscordConfig {
+    pub bot_token: Option<String>,
+    pub channel_id: Option<u64>,
+    pub admin_user_id: Option<u64>,
+    pub enabled: bool,
+}
+
+/// Get Discord bot configuration
+pub fn get_discord_config() -> DiscordConfig {
+    DiscordConfig {
+        bot_token: get_setting(DISCORD_BOT_TOKEN),
+        channel_id: get_setting(DISCORD_CHANNEL_ID)
+            .and_then(|s| s.parse::<u64>().ok()),
+        admin_user_id: get_setting(DISCORD_ADMIN_USER_ID)
+            .and_then(|s| s.parse::<u64>().ok()),
+        enabled: get_setting(DISCORD_ENABLED)
+            .map(|s| s == "true")
+            .unwrap_or(false),
+    }
+}
+
+/// Save Discord bot configuration
+pub fn set_discord_config(token: &str, channel_id: &str, admin_user_id: &str, enabled: bool) {
+    set_setting(DISCORD_BOT_TOKEN, token);
+    set_setting(DISCORD_CHANNEL_ID, channel_id);
+    set_setting(DISCORD_ADMIN_USER_ID, admin_user_id);
+    set_setting(DISCORD_ENABLED, if enabled { "true" } else { "false" });
+}

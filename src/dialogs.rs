@@ -9,8 +9,8 @@ use windows::{
         Graphics::Gdi::{
             BeginPaint, CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteObject,
             DrawTextW, Ellipse, EndPaint, FillRect, InvalidateRect, LineTo, MoveToEx, SelectObject,
-            SetBkMode, SetTextColor, SetWindowRgn, DT_CENTER, DT_SINGLELINE, DT_VCENTER, FW_BOLD,
-            FW_NORMAL, HDC, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
+            SetBkMode, SetTextColor, SetWindowRgn, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK,
+            FW_BOLD, FW_NORMAL, HDC, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
@@ -22,7 +22,7 @@ use windows::{
 };
 
 use crate::constants::*;
-use crate::database::{get_passcode, get_setting, set_setting, set_telegram_config, get_telegram_config, WEEKDAY_KEYS, get_pause_used_today, get_pause_config, get_pause_log_today, is_pause_enabled, is_idle_enabled, get_idle_timeout_minutes};
+use crate::database::{get_passcode, get_setting, set_setting, set_telegram_config, get_telegram_config, set_discord_config, get_discord_config, WEEKDAY_KEYS, get_pause_used_today, get_pause_config, get_pause_log_today, is_pause_enabled, is_idle_enabled, get_idle_timeout_minutes};
 use crate::dpi::scale;
 use crate::i18n::{self, Language};
 
@@ -35,6 +35,7 @@ const ID_NEW_PASSCODE: i32 = 2111;
 const ID_CONFIRM_PASSCODE: i32 = 2112;
 const ID_LANGUAGE_COMBO: i32 = 2120;
 const ID_TELEGRAM_WIZARD: i32 = 2130;
+const ID_DISCORD_WIZARD: i32 = 2140;
 
 // Settings dialog state
 static mut SETTINGS_EDIT_HANDLES: Option<SettingsEditHandles> = None;
@@ -53,6 +54,11 @@ struct SettingsEditHandles {
     telegram_token: HWND,
     telegram_chat_id: HWND,
     telegram_enabled: HWND,
+    // Discord settings
+    discord_token: HWND,
+    discord_channel_id: HWND,
+    discord_admin_user_id: HWND,
+    discord_enabled: HWND,
     // Lock screen timeout
     lock_screen_timeout: HWND,
     // Idle detection settings
@@ -742,6 +748,121 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                 if let Ok(h) = wizard_btn { SendMessageW(h, WM_SETFONT, WPARAM(label_font.0 as usize), LPARAM(1)); }
                 y_pos += scale(24);
 
+                // ===== Discord Bot Section =====
+                y_pos += scale(10);
+                let title_dc_text = i18n::wide("settings.discord");
+                let title_dc = CreateWindowExW(
+                    WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR(title_dc_text.as_ptr()),
+                    WS_CHILD | WS_VISIBLE, scale(15), y_pos, scale(360), scale(20), hwnd, HMENU::default(), hinstance, None,
+                );
+                if let Ok(h) = title_dc { SendMessageW(h, WM_SETFONT, WPARAM(title_font.0 as usize), LPARAM(1)); }
+                y_pos += scale(20);
+
+                // Enable checkbox
+                let discord_chk_text = i18n::wide("settings.enable_discord");
+                let discord_enabled_chk = CreateWindowExW(
+                    WINDOW_EX_STYLE(0), w!("BUTTON"), PCWSTR(discord_chk_text.as_ptr()),
+                    WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
+                    scale(25), y_pos, scale(200), scale(20), hwnd, HMENU::default(), hinstance, None,
+                );
+                let mut discord_enabled_hwnd = HWND::default();
+                if let Ok(h) = discord_enabled_chk {
+                    SendMessageW(h, WM_SETFONT, WPARAM(label_font.0 as usize), LPARAM(1));
+                    let config = get_discord_config();
+                    if config.enabled {
+                        SendMessageW(h, BM_SETCHECK, WPARAM(1), LPARAM(0));
+                    }
+                    discord_enabled_hwnd = h;
+                }
+                y_pos += scale(22);
+
+                // Bot Token
+                let dc_token_label_text = i18n::wide("settings.bot_token");
+                let dc_token_label = CreateWindowExW(
+                    WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR(dc_token_label_text.as_ptr()),
+                    WS_CHILD | WS_VISIBLE, scale(25), y_pos + scale(2), scale(70), scale(20), hwnd, HMENU::default(), hinstance, None,
+                );
+                if let Ok(h) = dc_token_label { SendMessageW(h, WM_SETFONT, WPARAM(label_font.0 as usize), LPARAM(1)); }
+                let discord_token = CreateWindowExW(
+                    WINDOW_EX_STYLE(0x200), w!("EDIT"), w!(""),
+                    WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32),
+                    scale(100), y_pos, scale(265), scale(22), hwnd, HMENU::default(), hinstance, None,
+                );
+                let mut discord_token_hwnd = HWND::default();
+                if let Ok(h) = discord_token {
+                    SendMessageW(h, WM_SETFONT, WPARAM(edit_font.0 as usize), LPARAM(1));
+                    // Allow long bot tokens
+                    SendMessageW(h, EM_SETLIMITTEXT, WPARAM(200), LPARAM(0));
+                    let config = get_discord_config();
+                    if let Some(token) = config.bot_token {
+                        let wide: Vec<u16> = token.encode_utf16().chain(std::iter::once(0)).collect();
+                        SetWindowTextW(h, PCWSTR(wide.as_ptr())).ok();
+                    }
+                    discord_token_hwnd = h;
+                }
+                y_pos += scale(24);
+
+                // Channel ID
+                let dc_channel_label_text = i18n::wide("settings.channel_id");
+                let dc_channel_label = CreateWindowExW(
+                    WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR(dc_channel_label_text.as_ptr()),
+                    WS_CHILD | WS_VISIBLE, scale(25), y_pos + scale(2), scale(70), scale(20), hwnd, HMENU::default(), hinstance, None,
+                );
+                if let Ok(h) = dc_channel_label { SendMessageW(h, WM_SETFONT, WPARAM(label_font.0 as usize), LPARAM(1)); }
+                let discord_channel_id = CreateWindowExW(
+                    WINDOW_EX_STYLE(0x200), w!("EDIT"), w!(""),
+                    WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_NUMBER as u32),
+                    scale(100), y_pos, scale(265), scale(22), hwnd, HMENU::default(), hinstance, None,
+                );
+                let mut discord_channel_id_hwnd = HWND::default();
+                if let Ok(h) = discord_channel_id {
+                    SendMessageW(h, WM_SETFONT, WPARAM(edit_font.0 as usize), LPARAM(1));
+                    SendMessageW(h, EM_SETLIMITTEXT, WPARAM(32), LPARAM(0));
+                    let config = get_discord_config();
+                    if let Some(channel_id) = config.channel_id {
+                        let value = channel_id.to_string();
+                        let wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+                        SetWindowTextW(h, PCWSTR(wide.as_ptr())).ok();
+                    }
+                    discord_channel_id_hwnd = h;
+                }
+                y_pos += scale(24);
+
+                // Admin User ID
+                let dc_user_label_text = i18n::wide("settings.discord_user_id");
+                let dc_user_label = CreateWindowExW(
+                    WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR(dc_user_label_text.as_ptr()),
+                    WS_CHILD | WS_VISIBLE, scale(25), y_pos + scale(2), scale(70), scale(20), hwnd, HMENU::default(), hinstance, None,
+                );
+                if let Ok(h) = dc_user_label { SendMessageW(h, WM_SETFONT, WPARAM(label_font.0 as usize), LPARAM(1)); }
+                let discord_admin_user_id = CreateWindowExW(
+                    WINDOW_EX_STYLE(0x200), w!("EDIT"), w!(""),
+                    WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_NUMBER as u32),
+                    scale(100), y_pos, scale(120), scale(22), hwnd, HMENU::default(), hinstance, None,
+                );
+                let mut discord_admin_user_id_hwnd = HWND::default();
+                if let Ok(h) = discord_admin_user_id {
+                    SendMessageW(h, WM_SETFONT, WPARAM(edit_font.0 as usize), LPARAM(1));
+                    SendMessageW(h, EM_SETLIMITTEXT, WPARAM(32), LPARAM(0));
+                    let config = get_discord_config();
+                    if let Some(user_id) = config.admin_user_id {
+                        let value = user_id.to_string();
+                        let wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+                        SetWindowTextW(h, PCWSTR(wide.as_ptr())).ok();
+                    }
+                    discord_admin_user_id_hwnd = h;
+                }
+
+                // Setup Wizard button (to the right of admin user id)
+                let dc_wizard_btn_text = i18n::wide("settings.setup_wizard");
+                let dc_wizard_btn = CreateWindowExW(
+                    WINDOW_EX_STYLE(0), w!("BUTTON"), PCWSTR(dc_wizard_btn_text.as_ptr()),
+                    WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+                    scale(230), y_pos, scale(135), scale(22), hwnd, HMENU(ID_DISCORD_WIZARD as _), hinstance, None,
+                );
+                if let Ok(h) = dc_wizard_btn { SendMessageW(h, WM_SETFONT, WPARAM(label_font.0 as usize), LPARAM(1)); }
+                y_pos += scale(24);
+
                 // ===== Lock Screen Timeout =====
                 y_pos += scale(10);
                 let title7_text = i18n::wide("settings.lock_screen");
@@ -861,6 +982,10 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                     telegram_token: telegram_token_hwnd,
                     telegram_chat_id: telegram_chat_id_hwnd,
                     telegram_enabled: telegram_enabled_hwnd,
+                    discord_token: discord_token_hwnd,
+                    discord_channel_id: discord_channel_id_hwnd,
+                    discord_admin_user_id: discord_admin_user_id_hwnd,
+                    discord_enabled: discord_enabled_hwnd,
                     lock_screen_timeout: lock_timeout_hwnd,
                     idle_enabled: idle_enabled_hwnd,
                     idle_timeout_minutes: idle_timeout_hwnd,
@@ -1013,6 +1138,39 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
 
                         set_telegram_config(&telegram_token, &telegram_chat_id, telegram_enabled);
 
+                        // Save Discord settings
+                        let mut discord_token = String::new();
+                        let mut discord_channel_id = String::new();
+                        let mut discord_admin_user_id = String::new();
+                        let discord_enabled;
+
+                        if !handles.discord_token.0.is_null() {
+                            let mut buffer = [0u16; 512];
+                            let len = GetWindowTextW(handles.discord_token, &mut buffer);
+                            discord_token = String::from_utf16_lossy(&buffer[..len as usize]);
+                        }
+
+                        if !handles.discord_channel_id.0.is_null() {
+                            let mut buffer = [0u16; 64];
+                            let len = GetWindowTextW(handles.discord_channel_id, &mut buffer);
+                            discord_channel_id = String::from_utf16_lossy(&buffer[..len as usize]);
+                        }
+
+                        if !handles.discord_admin_user_id.0.is_null() {
+                            let mut buffer = [0u16; 64];
+                            let len = GetWindowTextW(handles.discord_admin_user_id, &mut buffer);
+                            discord_admin_user_id = String::from_utf16_lossy(&buffer[..len as usize]);
+                        }
+
+                        if !handles.discord_enabled.0.is_null() {
+                            let checked = SendMessageW(handles.discord_enabled, BM_GETCHECK, WPARAM(0), LPARAM(0));
+                            discord_enabled = checked.0 == 1;
+                        } else {
+                            discord_enabled = false;
+                        }
+
+                        set_discord_config(&discord_token, &discord_channel_id, &discord_admin_user_id, discord_enabled);
+
                         // Save lock screen timeout (convert minutes to seconds)
                         if !handles.lock_screen_timeout.0.is_null() {
                             let mut buffer = [0u16; 16];
@@ -1061,6 +1219,11 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                     show_telegram_wizard(hwnd);
                     // Refresh dialog to show new values if wizard completed
                     let _ = InvalidateRect(hwnd, None, true);
+                } else if id == ID_DISCORD_WIZARD {
+                    // Open Discord setup wizard
+                    show_discord_wizard(hwnd);
+                    // Refresh dialog to show new values if wizard completed
+                    let _ = InvalidateRect(hwnd, None, true);
                 }
 
                 LRESULT(0)
@@ -1093,7 +1256,7 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
     let screen_width = GetSystemMetrics(SM_CXSCREEN);
     let screen_height = GetSystemMetrics(SM_CYSCREEN);
     let dialog_width = scale(400);
-    let dialog_height = scale(770);
+    let dialog_height = scale(920);
 
     let dialog_hwnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
@@ -2368,4 +2531,806 @@ fn send_test_message(token: &str, chat_id: i64) -> Result<(), ()> {
 
     let _ = ureq::get(&url).timeout(std::time::Duration::from_secs(5)).call();
     Ok(())
+}
+
+// ============================================================================
+// Discord Setup Wizard
+// ============================================================================
+
+// Wizard control IDs
+const ID_DC_WIZARD_NEXT: i32 = 3101;
+const ID_DC_WIZARD_BACK: i32 = 3102;
+const ID_DC_WIZARD_CANCEL: i32 = 3103;
+const ID_DC_WIZARD_TOKEN_EDIT: i32 = 3104;
+const ID_DC_WIZARD_CHANNEL_EDIT: i32 = 3105;
+const ID_DC_WIZARD_USER_EDIT: i32 = 3106;
+
+// Wizard state
+static mut DC_WIZARD_STEP: i32 = 1;
+static mut DC_WIZARD_TOKEN: Option<String> = None;
+static mut DC_WIZARD_CHANNEL_ID: Option<String> = None;
+static mut DC_WIZARD_USER_ID: Option<String> = None;
+const DC_WIZARD_TOTAL_STEPS: i32 = 5;
+
+/// Show the Discord setup wizard
+pub unsafe fn show_discord_wizard(parent_hwnd: HWND) {
+    // Reset wizard state
+    DC_WIZARD_STEP = 1;
+    DC_WIZARD_TOKEN = None;
+    DC_WIZARD_CHANNEL_ID = None;
+    DC_WIZARD_USER_ID = None;
+
+    let hinstance = GetModuleHandleW(None).unwrap();
+    let wizard_class = w!("ScreenTimeDiscordWizard");
+
+    // Register wizard window class
+    let wc = WNDCLASSW {
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc: Some(dc_wizard_proc),
+        hInstance: hinstance.into(),
+        lpszClassName: wizard_class,
+        hbrBackground: CreateSolidBrush(COLORREF(0x00FFFFFF)),
+        hCursor: LoadCursorW(None, IDC_ARROW).ok().unwrap_or_default(),
+        ..zeroed()
+    };
+    RegisterClassW(&wc);
+
+    let screen_width = GetSystemMetrics(SM_CXSCREEN);
+    let screen_height = GetSystemMetrics(SM_CYSCREEN);
+    let dialog_width = scale(480);
+    let dialog_height = scale(580);
+
+    let window_title = i18n::wide("wizard.dc.title");
+    let wizard_hwnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
+        wizard_class,
+        PCWSTR(window_title.as_ptr()),
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        (screen_width - dialog_width) / 2,
+        (screen_height - dialog_height) / 2,
+        dialog_width,
+        dialog_height,
+        parent_hwnd,
+        HMENU::default(),
+        hinstance,
+        None,
+    );
+
+    if let Ok(hwnd) = wizard_hwnd {
+        let rgn = CreateRoundRectRgn(0, 0, dialog_width, dialog_height, scale(12), scale(12));
+        SetWindowRgn(hwnd, rgn, true);
+
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = SetForegroundWindow(hwnd);
+
+        let mut msg: MSG = zeroed();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
+/// Discord wizard window procedure
+unsafe extern "system" fn dc_wizard_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_CREATE => {
+            create_dc_wizard_buttons(hwnd);
+            LRESULT(0)
+        }
+        WM_PAINT => {
+            paint_dc_wizard(hwnd);
+            LRESULT(0)
+        }
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xFFFF) as i32;
+            handle_dc_wizard_command(hwnd, id);
+            LRESULT(0)
+        }
+        WM_CLOSE | WM_DESTROY => {
+            PostQuitMessage(0);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Create wizard navigation buttons
+unsafe fn create_dc_wizard_buttons(hwnd: HWND) {
+    let hinstance = GetModuleHandleW(None).unwrap();
+
+    let mut rect: RECT = zeroed();
+    GetClientRect(hwnd, &mut rect).ok();
+    let width = rect.right;
+    let height = rect.bottom;
+
+    let btn_width = scale(100);
+    let btn_height = scale(36);
+    let btn_y = height - scale(60);
+    let margin = scale(20);
+
+    let btn_font = CreateFontW(
+        scale(15), 0, 0, 0,
+        FW_NORMAL.0 as i32,
+        0, 0, 0, 0, 0, 0, 5, 0,
+        w!("Segoe UI"),
+    );
+
+    // Cancel button (left)
+    let cancel_text = i18n::wide("wizard.cancel");
+    let cancel_btn = CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        w!("BUTTON"),
+        PCWSTR(cancel_text.as_ptr()),
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        margin,
+        btn_y,
+        btn_width,
+        btn_height,
+        hwnd,
+        HMENU(ID_DC_WIZARD_CANCEL as _),
+        hinstance,
+        None,
+    );
+    if let Ok(h) = cancel_btn {
+        SendMessageW(h, WM_SETFONT, WPARAM(btn_font.0 as usize), LPARAM(1));
+    }
+
+    // Back button
+    let back_text = i18n::wide("wizard.back");
+    let back_btn = CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        w!("BUTTON"),
+        PCWSTR(back_text.as_ptr()),
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        width - margin - btn_width * 2 - scale(10),
+        btn_y,
+        btn_width,
+        btn_height,
+        hwnd,
+        HMENU(ID_DC_WIZARD_BACK as _),
+        hinstance,
+        None,
+    );
+    if let Ok(h) = back_btn {
+        SendMessageW(h, WM_SETFONT, WPARAM(btn_font.0 as usize), LPARAM(1));
+    }
+
+    // Next/Finish button
+    let next_text = i18n::wide("wizard.next");
+    let next_btn = CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        w!("BUTTON"),
+        PCWSTR(next_text.as_ptr()),
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        width - margin - btn_width,
+        btn_y,
+        btn_width,
+        btn_height,
+        hwnd,
+        HMENU(ID_DC_WIZARD_NEXT as _),
+        hinstance,
+        None,
+    );
+    if let Ok(h) = next_btn {
+        SendMessageW(h, WM_SETFONT, WPARAM(btn_font.0 as usize), LPARAM(1));
+    }
+}
+
+/// Paint the wizard content based on current step
+unsafe fn paint_dc_wizard(hwnd: HWND) {
+    let mut ps: PAINTSTRUCT = zeroed();
+    let hdc = BeginPaint(hwnd, &mut ps);
+
+    let mut rect: RECT = zeroed();
+    GetClientRect(hwnd, &mut rect).ok();
+    let width = rect.right;
+
+    // Background
+    let bg_brush = CreateSolidBrush(COLORREF(0x00FFFFFF));
+    FillRect(hdc, &rect, bg_brush);
+    let _ = DeleteObject(bg_brush);
+
+    // Header area
+    let header_rect = RECT { left: 0, top: 0, right: width, bottom: scale(100) };
+    let header_brush = CreateSolidBrush(COLORREF(0x00E3E6FD)); // Light Discord blurple tint
+    FillRect(hdc, &header_rect, header_brush);
+    let _ = DeleteObject(header_brush);
+
+    SetBkMode(hdc, TRANSPARENT);
+
+    // Draw step indicator circles (shared with the Telegram wizard)
+    draw_step_indicators(hdc, width, DC_WIZARD_STEP);
+
+    // Content area
+    let content_top = scale(110);
+    let content_rect = RECT {
+        left: scale(30),
+        top: content_top,
+        right: width - scale(30),
+        bottom: rect.bottom - scale(80),
+    };
+
+    match DC_WIZARD_STEP {
+        1 => paint_dc_step_welcome(hdc, &content_rect),
+        2 => paint_dc_step_create_bot(hdc, &content_rect),
+        3 => paint_dc_step_token(hdc, hwnd, &content_rect),
+        4 => paint_dc_step_ids(hdc, hwnd, &content_rect),
+        5 => paint_dc_step_success(hdc, &content_rect),
+        _ => {}
+    }
+
+    update_dc_wizard_buttons(hwnd);
+
+    let _ = EndPaint(hwnd, &ps);
+}
+
+/// Step 1: Welcome screen
+unsafe fn paint_dc_step_welcome(hdc: HDC, rect: &RECT) {
+    let title_font = CreateFontW(scale(28), 0, 0, 0, FW_BOLD.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"));
+    let desc_font = CreateFontW(scale(16), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"));
+    let icon_font = CreateFontW(scale(48), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI Emoji"));
+
+    let mut y = rect.top;
+
+    // Chat icon
+    SelectObject(hdc, icon_font);
+    SetTextColor(hdc, COLORREF(0x00F25865)); // Discord blurple (BGR)
+    let mut icon_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(60) };
+    DrawTextW(hdc, &mut "💬".encode_utf16().collect::<Vec<_>>(), &mut icon_rect, DT_CENTER | DT_SINGLELINE);
+    y += scale(70);
+
+    // Title
+    SelectObject(hdc, title_font);
+    SetTextColor(hdc, COLORREF(0x00333333));
+    let mut title_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(35) };
+    DrawTextW(hdc, &mut i18n::t("wizard.dc.welcome.title").encode_utf16().collect::<Vec<_>>(), &mut title_rect, DT_CENTER | DT_SINGLELINE);
+    y += scale(45);
+
+    // Description
+    SelectObject(hdc, desc_font);
+    SetTextColor(hdc, COLORREF(0x00666666));
+    let mut desc_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(25) };
+    DrawTextW(hdc, &mut i18n::t("wizard.dc.welcome.desc1").encode_utf16().collect::<Vec<_>>(), &mut desc_rect, DT_CENTER | DT_SINGLELINE);
+    y += scale(40);
+
+    // Features with icons (shared wording with the Telegram wizard)
+    let features = [
+        ("✓", i18n::t("wizard.welcome.feature1")),
+        ("✓", i18n::t("wizard.welcome.feature2")),
+        ("✓", i18n::t("wizard.welcome.feature3")),
+        ("✓", i18n::t("wizard.welcome.feature4")),
+    ];
+
+    SetTextColor(hdc, COLORREF(0x004CAF50));
+    for (icon, text) in features.iter() {
+        let feature_text = format!("  {}  {}", icon, text);
+        let mut feature_rect = RECT { left: rect.left + scale(40), top: y, right: rect.right, bottom: y + scale(28) };
+        DrawTextW(hdc, &mut feature_text.encode_utf16().collect::<Vec<_>>(), &mut feature_rect, DT_SINGLELINE);
+        y += scale(30);
+    }
+
+    y += scale(20);
+
+    // Ready message
+    SetTextColor(hdc, COLORREF(0x00333333));
+    let mut ready_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(25) };
+    DrawTextW(hdc, &mut i18n::t("wizard.dc.welcome.ready").encode_utf16().collect::<Vec<_>>(), &mut ready_rect, DT_CENTER | DT_SINGLELINE);
+
+    let _ = DeleteObject(title_font);
+    let _ = DeleteObject(desc_font);
+    let _ = DeleteObject(icon_font);
+}
+
+/// Step 2: Create bot instructions
+unsafe fn paint_dc_step_create_bot(hdc: HDC, rect: &RECT) {
+    let title_font = CreateFontW(scale(22), 0, 0, 0, FW_BOLD.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"));
+    let step_font = CreateFontW(scale(14), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"));
+    let icon_font = CreateFontW(scale(40), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI Emoji"));
+    let hint_font = CreateFontW(scale(12), 0, 0, 0, FW_NORMAL.0 as i32, 1, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"));
+
+    let mut y = rect.top;
+
+    // Robot icon
+    SelectObject(hdc, icon_font);
+    SetTextColor(hdc, COLORREF(0x00F25865));
+    let mut icon_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(46) };
+    DrawTextW(hdc, &mut "🤖".encode_utf16().collect::<Vec<_>>(), &mut icon_rect, DT_CENTER | DT_SINGLELINE);
+    y += scale(50);
+
+    // Title
+    SelectObject(hdc, title_font);
+    SetTextColor(hdc, COLORREF(0x00333333));
+    let mut title_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(28) };
+    DrawTextW(hdc, &mut i18n::t("wizard.dc.bot.title").encode_utf16().collect::<Vec<_>>(), &mut title_rect, DT_CENTER | DT_SINGLELINE);
+    y += scale(34);
+
+    // Steps
+    SelectObject(hdc, step_font);
+    let steps = [
+        i18n::t("wizard.dc.bot.step1"),
+        i18n::t("wizard.dc.bot.step2"),
+        i18n::t("wizard.dc.bot.step3"),
+        i18n::t("wizard.dc.bot.step4"),
+        i18n::t("wizard.dc.bot.step5"),
+        i18n::t("wizard.dc.bot.step6"),
+        i18n::t("wizard.dc.bot.step7"),
+    ];
+
+    for step in steps.iter() {
+        SetTextColor(hdc, COLORREF(0x00444444));
+        let mut step_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(30) };
+        DrawTextW(hdc, &mut step.encode_utf16().collect::<Vec<_>>(), &mut step_rect, DT_WORDBREAK);
+        y += scale(30);
+    }
+
+    y += scale(6);
+
+    // Hint box
+    let hint_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(34) };
+    let hint_brush = CreateSolidBrush(COLORREF(0x00FFF3E0)); // Light orange
+    FillRect(hdc, &hint_rect, hint_brush);
+    let _ = DeleteObject(hint_brush);
+
+    SelectObject(hdc, hint_font);
+    SetTextColor(hdc, COLORREF(0x00E65100));
+    let mut hint_text_rect = RECT { left: rect.left + scale(10), top: y + scale(8), right: rect.right - scale(10), bottom: y + scale(30) };
+    DrawTextW(hdc, &mut i18n::t("wizard.dc.bot.hint").encode_utf16().collect::<Vec<_>>(), &mut hint_text_rect, DT_CENTER | DT_WORDBREAK);
+
+    let _ = DeleteObject(title_font);
+    let _ = DeleteObject(step_font);
+    let _ = DeleteObject(icon_font);
+    let _ = DeleteObject(hint_font);
+}
+
+/// Step 3: Token entry
+unsafe fn paint_dc_step_token(hdc: HDC, hwnd: HWND, rect: &RECT) {
+    let title_font = CreateFontW(scale(24), 0, 0, 0, FW_BOLD.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"));
+    let label_font = CreateFontW(scale(15), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"));
+    let icon_font = CreateFontW(scale(40), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI Emoji"));
+
+    let mut y = rect.top;
+
+    // Key icon
+    SelectObject(hdc, icon_font);
+    SetTextColor(hdc, COLORREF(0x00FF9800));
+    let mut icon_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(50) };
+    DrawTextW(hdc, &mut "🔑".encode_utf16().collect::<Vec<_>>(), &mut icon_rect, DT_CENTER | DT_SINGLELINE);
+    y += scale(55);
+
+    // Title
+    SelectObject(hdc, title_font);
+    SetTextColor(hdc, COLORREF(0x00333333));
+    let mut title_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(30) };
+    DrawTextW(hdc, &mut i18n::t("wizard.dc.token.title").encode_utf16().collect::<Vec<_>>(), &mut title_rect, DT_CENTER | DT_SINGLELINE);
+    y += scale(50);
+
+    // Label
+    SelectObject(hdc, label_font);
+    SetTextColor(hdc, COLORREF(0x00666666));
+    let mut label_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(22) };
+    DrawTextW(hdc, &mut i18n::t("wizard.dc.token.label").encode_utf16().collect::<Vec<_>>(), &mut label_rect, DT_CENTER | DT_SINGLELINE);
+    y += scale(30);
+
+    // Create/update edit control for token
+    let edit_hwnd = GetDlgItem(hwnd, ID_DC_WIZARD_TOKEN_EDIT).unwrap_or_default();
+    if edit_hwnd.0.is_null() {
+        let hinstance = GetModuleHandleW(None).unwrap();
+        let edit_width = scale(380);
+        let edit_x = (rect.right - rect.left - edit_width) / 2 + rect.left;
+
+        let _ = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            w!("EDIT"),
+            w!(""),
+            WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_CENTER as u32 | ES_AUTOHSCROLL as u32),
+            edit_x,
+            y,
+            edit_width,
+            scale(35),
+            hwnd,
+            HMENU(ID_DC_WIZARD_TOKEN_EDIT as _),
+            hinstance,
+            None,
+        );
+
+        let edit_font = CreateFontW(scale(13), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Consolas"));
+        let new_edit = GetDlgItem(hwnd, ID_DC_WIZARD_TOKEN_EDIT).unwrap_or_default();
+        if !new_edit.0.is_null() {
+            SendMessageW(new_edit, WM_SETFONT, WPARAM(edit_font.0 as usize), LPARAM(1));
+            SendMessageW(new_edit, EM_SETLIMITTEXT, WPARAM(256), LPARAM(0));
+
+            let dc_wizard_token_ref = std::ptr::addr_of!(DC_WIZARD_TOKEN);
+            if let Some(ref token) = *dc_wizard_token_ref {
+                let wide: Vec<u16> = token.encode_utf16().chain(std::iter::once(0)).collect();
+                SetWindowTextW(new_edit, PCWSTR(wide.as_ptr())).ok();
+            }
+        }
+    }
+
+    y += scale(55);
+
+    // Validation status
+    let dc_wizard_token_ref = std::ptr::addr_of!(DC_WIZARD_TOKEN);
+    let token_valid = (*dc_wizard_token_ref).as_ref().map(|t| is_valid_discord_token_format(t)).unwrap_or(false);
+    if (*dc_wizard_token_ref).is_some() {
+        let (status_text, status_color) = if token_valid {
+            (format!("✓ {}", i18n::t("wizard.dc.token.valid")), COLORREF(0x004CAF50))
+        } else {
+            (format!("✗ {}", i18n::t("wizard.dc.token.invalid")), COLORREF(0x00F44336))
+        };
+        SetTextColor(hdc, status_color);
+        let mut status_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(22) };
+        DrawTextW(hdc, &mut status_text.encode_utf16().collect::<Vec<_>>(), &mut status_rect, DT_CENTER | DT_SINGLELINE);
+    }
+
+    let _ = DeleteObject(title_font);
+    let _ = DeleteObject(label_font);
+    let _ = DeleteObject(icon_font);
+}
+
+/// Step 4: Channel & User ID entry
+unsafe fn paint_dc_step_ids(hdc: HDC, hwnd: HWND, rect: &RECT) {
+    let title_font = CreateFontW(scale(22), 0, 0, 0, FW_BOLD.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"));
+    let step_font = CreateFontW(scale(14), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"));
+    let icon_font = CreateFontW(scale(40), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI Emoji"));
+    let label_font = CreateFontW(scale(14), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"));
+
+    let mut y = rect.top;
+
+    // Link icon
+    SelectObject(hdc, icon_font);
+    SetTextColor(hdc, COLORREF(0x009C27B0));
+    let mut icon_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(46) };
+    DrawTextW(hdc, &mut "🔗".encode_utf16().collect::<Vec<_>>(), &mut icon_rect, DT_CENTER | DT_SINGLELINE);
+    y += scale(50);
+
+    // Title
+    SelectObject(hdc, title_font);
+    SetTextColor(hdc, COLORREF(0x00333333));
+    let mut title_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(28) };
+    DrawTextW(hdc, &mut i18n::t("wizard.dc.ids.title").encode_utf16().collect::<Vec<_>>(), &mut title_rect, DT_CENTER | DT_SINGLELINE);
+    y += scale(36);
+
+    // Steps
+    SelectObject(hdc, step_font);
+    let steps = [
+        i18n::t("wizard.dc.ids.step1"),
+        i18n::t("wizard.dc.ids.step2"),
+        i18n::t("wizard.dc.ids.step3"),
+    ];
+    for step in steps.iter() {
+        SetTextColor(hdc, COLORREF(0x00444444));
+        let mut step_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(30) };
+        DrawTextW(hdc, &mut step.encode_utf16().collect::<Vec<_>>(), &mut step_rect, DT_WORDBREAK);
+        y += scale(32);
+    }
+
+    y += scale(16);
+
+    // Channel ID label + edit
+    SelectObject(hdc, label_font);
+    SetTextColor(hdc, COLORREF(0x00666666));
+    let mut chan_label_rect = RECT { left: rect.left, top: y + scale(4), right: rect.left + scale(110), bottom: y + scale(28) };
+    DrawTextW(hdc, &mut i18n::t("wizard.dc.ids.channel_label").encode_utf16().collect::<Vec<_>>(), &mut chan_label_rect, DT_SINGLELINE | DT_VCENTER);
+
+    let channel_edit_hwnd = GetDlgItem(hwnd, ID_DC_WIZARD_CHANNEL_EDIT).unwrap_or_default();
+    if channel_edit_hwnd.0.is_null() {
+        let hinstance = GetModuleHandleW(None).unwrap();
+        let edit_width = scale(200);
+        let _ = CreateWindowExW(
+            WS_EX_CLIENTEDGE, w!("EDIT"), w!(""),
+            WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32 | ES_NUMBER as u32),
+            rect.left + scale(120), y, edit_width, scale(28),
+            hwnd, HMENU(ID_DC_WIZARD_CHANNEL_EDIT as _), hinstance, None,
+        );
+        let edit_font = CreateFontW(scale(14), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Consolas"));
+        let new_edit = GetDlgItem(hwnd, ID_DC_WIZARD_CHANNEL_EDIT).unwrap_or_default();
+        if !new_edit.0.is_null() {
+            SendMessageW(new_edit, WM_SETFONT, WPARAM(edit_font.0 as usize), LPARAM(1));
+            SendMessageW(new_edit, EM_SETLIMITTEXT, WPARAM(20), LPARAM(0));
+            let dc_wizard_channel_ref = std::ptr::addr_of!(DC_WIZARD_CHANNEL_ID);
+            if let Some(ref value) = *dc_wizard_channel_ref {
+                let wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+                SetWindowTextW(new_edit, PCWSTR(wide.as_ptr())).ok();
+            }
+        }
+    }
+    y += scale(36);
+
+    // User ID label + edit
+    SelectObject(hdc, label_font);
+    SetTextColor(hdc, COLORREF(0x00666666));
+    let mut user_label_rect = RECT { left: rect.left, top: y + scale(4), right: rect.left + scale(110), bottom: y + scale(28) };
+    DrawTextW(hdc, &mut i18n::t("wizard.dc.ids.user_label").encode_utf16().collect::<Vec<_>>(), &mut user_label_rect, DT_SINGLELINE | DT_VCENTER);
+
+    let user_edit_hwnd = GetDlgItem(hwnd, ID_DC_WIZARD_USER_EDIT).unwrap_or_default();
+    if user_edit_hwnd.0.is_null() {
+        let hinstance = GetModuleHandleW(None).unwrap();
+        let edit_width = scale(200);
+        let _ = CreateWindowExW(
+            WS_EX_CLIENTEDGE, w!("EDIT"), w!(""),
+            WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32 | ES_NUMBER as u32),
+            rect.left + scale(120), y, edit_width, scale(28),
+            hwnd, HMENU(ID_DC_WIZARD_USER_EDIT as _), hinstance, None,
+        );
+        let edit_font = CreateFontW(scale(14), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Consolas"));
+        let new_edit = GetDlgItem(hwnd, ID_DC_WIZARD_USER_EDIT).unwrap_or_default();
+        if !new_edit.0.is_null() {
+            SendMessageW(new_edit, WM_SETFONT, WPARAM(edit_font.0 as usize), LPARAM(1));
+            SendMessageW(new_edit, EM_SETLIMITTEXT, WPARAM(20), LPARAM(0));
+            let dc_wizard_user_ref = std::ptr::addr_of!(DC_WIZARD_USER_ID);
+            if let Some(ref value) = *dc_wizard_user_ref {
+                let wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+                SetWindowTextW(new_edit, PCWSTR(wide.as_ptr())).ok();
+            }
+        }
+    }
+
+    let _ = DeleteObject(title_font);
+    let _ = DeleteObject(step_font);
+    let _ = DeleteObject(icon_font);
+    let _ = DeleteObject(label_font);
+}
+
+/// Step 5: Success
+unsafe fn paint_dc_step_success(hdc: HDC, rect: &RECT) {
+    let title_font = CreateFontW(scale(28), 0, 0, 0, FW_BOLD.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"));
+    let desc_font = CreateFontW(scale(15), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"));
+    let cmd_font = CreateFontW(scale(13), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Consolas"));
+    let icon_font = CreateFontW(scale(56), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI Emoji"));
+
+    let mut y = rect.top;
+
+    // Checkmark icon
+    SelectObject(hdc, icon_font);
+    SetTextColor(hdc, COLORREF(0x004CAF50));
+    let mut icon_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(65) };
+    DrawTextW(hdc, &mut "✅".encode_utf16().collect::<Vec<_>>(), &mut icon_rect, DT_CENTER | DT_SINGLELINE);
+    y += scale(75);
+
+    // Title
+    SelectObject(hdc, title_font);
+    SetTextColor(hdc, COLORREF(0x004CAF50));
+    let mut title_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(35) };
+    DrawTextW(hdc, &mut i18n::t("wizard.dc.success.title").encode_utf16().collect::<Vec<_>>(), &mut title_rect, DT_CENTER | DT_SINGLELINE);
+    y += scale(45);
+
+    // Description
+    SelectObject(hdc, desc_font);
+    SetTextColor(hdc, COLORREF(0x00666666));
+    let mut desc_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(22) };
+    DrawTextW(hdc, &mut i18n::t("wizard.dc.success.desc").encode_utf16().collect::<Vec<_>>(), &mut desc_rect, DT_CENTER | DT_SINGLELINE);
+    y += scale(25);
+
+    let mut test_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(22) };
+    DrawTextW(hdc, &mut i18n::t("wizard.dc.success.test").encode_utf16().collect::<Vec<_>>(), &mut test_rect, DT_CENTER | DT_SINGLELINE);
+    y += scale(40);
+
+    // Commands section
+    SetTextColor(hdc, COLORREF(0x00333333));
+    let mut cmd_title_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(22) };
+    DrawTextW(hdc, &mut i18n::t("wizard.dc.success.commands").encode_utf16().collect::<Vec<_>>(), &mut cmd_title_rect, DT_CENTER | DT_SINGLELINE);
+    y += scale(30);
+
+    // Command examples with background
+    SelectObject(hdc, cmd_font);
+    let commands = [
+        i18n::t("wizard.dc.success.cmd1"),
+        i18n::t("wizard.dc.success.cmd2"),
+        i18n::t("wizard.dc.success.cmd3"),
+        i18n::t("wizard.dc.success.cmd4"),
+    ];
+
+    let cmd_bg = CreateSolidBrush(COLORREF(0x00F5F5F5));
+    for cmd in commands.iter() {
+        let cmd_rect = RECT { left: rect.left + scale(20), top: y, right: rect.right - scale(20), bottom: y + scale(22) };
+        FillRect(hdc, &cmd_rect, cmd_bg);
+        SetTextColor(hdc, COLORREF(0x00333333));
+        let mut text_rect = RECT { left: rect.left + scale(30), top: y + scale(2), right: rect.right - scale(30), bottom: y + scale(20) };
+        DrawTextW(hdc, &mut cmd.encode_utf16().collect::<Vec<_>>(), &mut text_rect, DT_SINGLELINE);
+        y += scale(26);
+    }
+    let _ = DeleteObject(cmd_bg);
+
+    let _ = DeleteObject(title_font);
+    let _ = DeleteObject(desc_font);
+    let _ = DeleteObject(cmd_font);
+    let _ = DeleteObject(icon_font);
+}
+
+/// Check if token format is plausible (basic check)
+fn is_valid_discord_token_format(token: &str) -> bool {
+    // Discord bot tokens are three dot-separated segments (id.timestamp.signature)
+    let parts: Vec<&str> = token.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|p| p.len() >= 6)
+}
+
+/// Update wizard button states based on current step
+unsafe fn update_dc_wizard_buttons(hwnd: HWND) {
+    let back_btn = GetDlgItem(hwnd, ID_DC_WIZARD_BACK).unwrap_or_default();
+    let next_btn = GetDlgItem(hwnd, ID_DC_WIZARD_NEXT).unwrap_or_default();
+
+    // Back button: disabled on step 1
+    if !back_btn.0.is_null() {
+        let _ = EnableWindow(back_btn, DC_WIZARD_STEP > 1);
+    }
+
+    // Next button text and state
+    if !next_btn.0.is_null() {
+        let next_text = if DC_WIZARD_STEP == DC_WIZARD_TOTAL_STEPS {
+            i18n::wide("wizard.finish")
+        } else {
+            i18n::wide("wizard.next")
+        };
+        SetWindowTextW(next_btn, PCWSTR(next_text.as_ptr())).ok();
+
+        // Disable next on step 3 if token invalid, step 4 if IDs not valid numbers
+        let dc_wizard_token_ref = std::ptr::addr_of!(DC_WIZARD_TOKEN);
+        let dc_wizard_channel_ref = std::ptr::addr_of!(DC_WIZARD_CHANNEL_ID);
+        let dc_wizard_user_ref = std::ptr::addr_of!(DC_WIZARD_USER_ID);
+        let can_proceed = match DC_WIZARD_STEP {
+            3 => (*dc_wizard_token_ref).as_ref().map(|t| is_valid_discord_token_format(t)).unwrap_or(false),
+            4 => {
+                let channel_ok = (*dc_wizard_channel_ref).as_ref().map(|c| c.parse::<u64>().is_ok()).unwrap_or(false);
+                let user_ok = (*dc_wizard_user_ref).as_ref().map(|u| u.parse::<u64>().is_ok()).unwrap_or(false);
+                channel_ok && user_ok
+            }
+            _ => true,
+        };
+        let _ = EnableWindow(next_btn, can_proceed);
+    }
+}
+
+/// Handle wizard command (button clicks)
+unsafe fn handle_dc_wizard_command(hwnd: HWND, id: i32) {
+    match id {
+        ID_DC_WIZARD_CANCEL => {
+            DestroyWindow(hwnd).ok();
+        }
+        ID_DC_WIZARD_BACK => {
+            if DC_WIZARD_STEP > 1 {
+                if DC_WIZARD_STEP == 3 {
+                    let edit = GetDlgItem(hwnd, ID_DC_WIZARD_TOKEN_EDIT).unwrap_or_default();
+                    if !edit.0.is_null() {
+                        DestroyWindow(edit).ok();
+                    }
+                }
+                if DC_WIZARD_STEP == 4 {
+                    let ch_edit = GetDlgItem(hwnd, ID_DC_WIZARD_CHANNEL_EDIT).unwrap_or_default();
+                    if !ch_edit.0.is_null() {
+                        DestroyWindow(ch_edit).ok();
+                    }
+                    let us_edit = GetDlgItem(hwnd, ID_DC_WIZARD_USER_EDIT).unwrap_or_default();
+                    if !us_edit.0.is_null() {
+                        DestroyWindow(us_edit).ok();
+                    }
+                }
+                DC_WIZARD_STEP -= 1;
+                let _ = InvalidateRect(hwnd, None, true);
+            }
+        }
+        ID_DC_WIZARD_NEXT => {
+            // Save token from edit control on step 3
+            if DC_WIZARD_STEP == 3 {
+                let edit = GetDlgItem(hwnd, ID_DC_WIZARD_TOKEN_EDIT).unwrap_or_default();
+                if !edit.0.is_null() {
+                    let mut buffer = [0u16; 256];
+                    let len = GetWindowTextW(edit, &mut buffer);
+                    let token = String::from_utf16_lossy(&buffer[..len as usize]);
+                    DC_WIZARD_TOKEN = Some(token.trim().to_string());
+                }
+            }
+
+            // Save IDs from edit controls on step 4
+            if DC_WIZARD_STEP == 4 {
+                let ch_edit = GetDlgItem(hwnd, ID_DC_WIZARD_CHANNEL_EDIT).unwrap_or_default();
+                if !ch_edit.0.is_null() {
+                    let mut buffer = [0u16; 32];
+                    let len = GetWindowTextW(ch_edit, &mut buffer);
+                    DC_WIZARD_CHANNEL_ID = Some(String::from_utf16_lossy(&buffer[..len as usize]).trim().to_string());
+                }
+                let us_edit = GetDlgItem(hwnd, ID_DC_WIZARD_USER_EDIT).unwrap_or_default();
+                if !us_edit.0.is_null() {
+                    let mut buffer = [0u16; 32];
+                    let len = GetWindowTextW(us_edit, &mut buffer);
+                    DC_WIZARD_USER_ID = Some(String::from_utf16_lossy(&buffer[..len as usize]).trim().to_string());
+                }
+            }
+
+            if DC_WIZARD_STEP < DC_WIZARD_TOTAL_STEPS {
+                DC_WIZARD_STEP += 1;
+
+                // Destroy token edit when leaving step 3
+                if DC_WIZARD_STEP == 4 {
+                    let edit = GetDlgItem(hwnd, ID_DC_WIZARD_TOKEN_EDIT).unwrap_or_default();
+                    if !edit.0.is_null() {
+                        DestroyWindow(edit).ok();
+                    }
+                }
+
+                // On step 5, destroy ID edits, save config and send test message
+                if DC_WIZARD_STEP == 5 {
+                    let ch_edit = GetDlgItem(hwnd, ID_DC_WIZARD_CHANNEL_EDIT).unwrap_or_default();
+                    if !ch_edit.0.is_null() {
+                        DestroyWindow(ch_edit).ok();
+                    }
+                    let us_edit = GetDlgItem(hwnd, ID_DC_WIZARD_USER_EDIT).unwrap_or_default();
+                    if !us_edit.0.is_null() {
+                        DestroyWindow(us_edit).ok();
+                    }
+                    save_dc_wizard_config();
+                }
+
+                let _ = InvalidateRect(hwnd, None, true);
+            } else {
+                // Finish
+                DestroyWindow(hwnd).ok();
+            }
+        }
+        ID_DC_WIZARD_TOKEN_EDIT => {
+            let edit = GetDlgItem(hwnd, ID_DC_WIZARD_TOKEN_EDIT).unwrap_or_default();
+            if !edit.0.is_null() {
+                let mut buffer = [0u16; 256];
+                let len = GetWindowTextW(edit, &mut buffer);
+                let token = String::from_utf16_lossy(&buffer[..len as usize]);
+                DC_WIZARD_TOKEN = Some(token.trim().to_string());
+                let _ = InvalidateRect(hwnd, None, true);
+            }
+        }
+        ID_DC_WIZARD_CHANNEL_EDIT | ID_DC_WIZARD_USER_EDIT => {
+            let ch_edit = GetDlgItem(hwnd, ID_DC_WIZARD_CHANNEL_EDIT).unwrap_or_default();
+            if !ch_edit.0.is_null() {
+                let mut buffer = [0u16; 32];
+                let len = GetWindowTextW(ch_edit, &mut buffer);
+                DC_WIZARD_CHANNEL_ID = Some(String::from_utf16_lossy(&buffer[..len as usize]).trim().to_string());
+            }
+            let us_edit = GetDlgItem(hwnd, ID_DC_WIZARD_USER_EDIT).unwrap_or_default();
+            if !us_edit.0.is_null() {
+                let mut buffer = [0u16; 32];
+                let len = GetWindowTextW(us_edit, &mut buffer);
+                DC_WIZARD_USER_ID = Some(String::from_utf16_lossy(&buffer[..len as usize]).trim().to_string());
+            }
+            let _ = InvalidateRect(hwnd, None, true);
+        }
+        _ => {}
+    }
+}
+
+/// Save wizard configuration to database
+unsafe fn save_dc_wizard_config() {
+    let dc_wizard_token_ref = std::ptr::addr_of!(DC_WIZARD_TOKEN);
+    let dc_wizard_channel_ref = std::ptr::addr_of!(DC_WIZARD_CHANNEL_ID);
+    let dc_wizard_user_ref = std::ptr::addr_of!(DC_WIZARD_USER_ID);
+
+    if let (Some(ref token), Some(ref channel_id), Some(ref user_id)) =
+        (&*dc_wizard_token_ref, &*dc_wizard_channel_ref, &*dc_wizard_user_ref)
+    {
+        crate::database::set_discord_config(token, channel_id, user_id, true);
+
+        if let Ok(channel_id_num) = channel_id.parse::<u64>() {
+            let token = token.clone();
+            std::thread::spawn(move || {
+                send_discord_test_message(&token, channel_id_num);
+            });
+        }
+    }
+}
+
+/// Send a test message to confirm setup
+fn send_discord_test_message(token: &str, channel_id: u64) {
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(_) => return,
+    };
+    rt.block_on(async {
+        let http = serenity::http::Http::new(token);
+        let message = format!("✅ {} - Screen Time Manager", crate::i18n::t("wizard.dc.success.title"));
+        let _ = serenity::model::id::ChannelId::new(channel_id).say(&http, message).await;
+    });
 }
