@@ -66,6 +66,11 @@ fn main() {
             return;
         }
 
+        // A real start of the app - clear any leftover intentional-quit
+        // marker so the watchdog task's suppression only ever covers the gap
+        // between a sanctioned Quit and this moment (see database.rs).
+        database::clear_intentional_quit_marker();
+
         // Initialize database
         if let Err(e) = init_database() {
             let msg: Vec<u16> = format!("Failed to initialize database: {}\0", e)

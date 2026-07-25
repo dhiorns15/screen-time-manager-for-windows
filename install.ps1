@@ -100,6 +100,13 @@ $watchdogTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
     -RepetitionInterval (New-TimeSpan -Minutes 1) `
     -RepetitionDuration (New-TimeSpan -Days 3650)
 $watchdogTrigger2 = New-ScheduledTaskTrigger -AtLogOn
+# Delay this trigger's first check so it doesn't race the main app task's own
+# -AtLogOn trigger: both fire at logon with no ordering guarantee, and the
+# watchdog's mutex check is fast enough to easily run before the main app has
+# finished launching and grabbed the mutex - causing a false "process was
+# killed" tamper alert on every ordinary restart/login. The main app task has
+# no such delay, so this gives it a head start.
+$watchdogTrigger2.Delay = "PT2M"
 $watchdogPrincipal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 $watchdogSettings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `

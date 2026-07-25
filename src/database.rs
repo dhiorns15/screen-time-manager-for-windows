@@ -224,19 +224,24 @@ pub fn mark_intentional_quit() {
     let _ = std::fs::write(&path, b"");
 }
 
-/// Whether the app was intentionally quit within the last few minutes -
-/// gives a grace window for the parent to restart it manually (e.g. after an
-/// update) without the watchdog firing a false "tampering" alert.
-pub fn recent_intentional_quit() -> bool {
-    const GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(180);
+/// Clear the intentional-quit marker - called once at the start of every
+/// normal (non-watchdog) launch, so the marker only ever covers the single
+/// gap between a sanctioned Quit and the app's next real start. Without this,
+/// a time-based grace window would need to guess how long the parent might
+/// want the app to stay closed; clearing it on start means "closed via Quit"
+/// suppresses the watchdog indefinitely, while any kill *after* this point
+/// still has no marker and is caught normally.
+pub fn clear_intentional_quit_marker() {
+    let _ = std::fs::remove_file(intentional_quit_marker_path());
+}
 
-    let Ok(metadata) = std::fs::metadata(intentional_quit_marker_path()) else {
-        return false;
-    };
-    let Ok(modified) = metadata.modified() else {
-        return false;
-    };
-    modified.elapsed().map(|age| age < GRACE_PERIOD).unwrap_or(false)
+/// Whether the app's most recent stop was the passcode-protected Quit menu
+/// item, rather than being killed out from under the timer. The marker is
+/// cleared on every real app start (see `clear_intentional_quit_marker`), so
+/// its mere presence - no time window needed - means nothing has run since
+/// that sanctioned quit.
+pub fn quit_was_intentional() -> bool {
+    intentional_quit_marker_path().exists()
 }
 
 /// Get the passcode from the database

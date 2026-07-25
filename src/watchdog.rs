@@ -31,8 +31,8 @@ pub fn run_check() {
         return;
     }
 
-    if database::recent_intentional_quit() {
-        log("app not running - recent intentional quit, not alerting");
+    if database::quit_was_intentional() {
+        log("app not running - last stop was an intentional quit, not alerting");
         return;
     }
 
@@ -55,13 +55,45 @@ fn log(msg: &str) {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    trim_old_entries(&path, now);
+
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
         let _ = writeln!(f, "[{now}] {msg}");
     }
+}
+
+/// Drop log entries older than ~30 days, so the file doesn't grow forever.
+/// This only logs on notable events (an intentional quit or a detected kill),
+/// not every per-minute tick, so it stays small under normal use regardless -
+/// this just bounds it in the crash-loop/repeated-tampering case too. Runs on
+/// every log() call rather than needing separate "last cleaned up" state,
+/// since re-scanning a file this size is cheap.
+fn trim_old_entries(path: &std::path::Path, now: u64) {
+    const MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
+
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let cutoff = now.saturating_sub(MAX_AGE_SECS);
+    let kept: String = contents
+        .lines()
+        .filter(|line| entry_timestamp(line).is_none_or(|t| t >= cutoff))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    if kept.len() != contents.len() {
+        let _ = std::fs::write(path, kept);
+    }
+}
+
+/// Parses the `[1234567890]` unix-timestamp prefix each log line starts with.
+fn entry_timestamp(line: &str) -> Option<u64> {
+    line.strip_prefix('[')?.split(']').next()?.parse().ok()
 }
 
 unsafe fn app_is_running() -> bool {
