@@ -1,4 +1,5 @@
-//! Cross-platform "requesting more time" state
+//! Cross-platform "requesting more time" state, and other lock-screen /
+//! passcode notifications pushed out to the configured bots.
 //!
 //! Tracks a single pending request so that whichever bot (Telegram or
 //! Discord) the parent replies from first resolves it, and the other one
@@ -67,6 +68,36 @@ pub fn resolve_if_pending(granted_via: &str, detail: &str) {
         telegram::notify_admin(&text);
     }
     if granted_via != "Discord" && dc.enabled {
+        discord::notify_admin(&text);
+    }
+}
+
+/// Called whenever the passcode is used locally (lock screen or tray menu)
+/// to add time, so the parent finds out even if they weren't the one who
+/// entered it - the passcode being used is worth knowing about either way.
+pub fn notify_passcode_extend(source_key: &str, minutes: i32, remaining_seconds: i32) {
+    let username = current_windows_username();
+    let mins = remaining_seconds / 60;
+    let secs = remaining_seconds % 60;
+
+    let text = format!(
+        "🔓 {} {} {} {} ({})\n⏳ {}: {}:{:02}",
+        username,
+        i18n::t("passcode_extend.notify.header"),
+        minutes,
+        i18n::t("passcode_extend.notify.minutes"),
+        i18n::t(source_key),
+        i18n::t("tg.status.remaining"),
+        mins, secs,
+    );
+
+    let tg = database::get_telegram_config();
+    let dc = database::get_discord_config();
+
+    if tg.enabled {
+        telegram::notify_admin(&text);
+    }
+    if dc.enabled {
         discord::notify_admin(&text);
     }
 }

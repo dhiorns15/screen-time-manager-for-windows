@@ -17,7 +17,7 @@ use windows::{
     },
 };
 
-use crate::blocking::{extend_time, hide_blocking_overlay, show_blocking_overlay, BLOCKING_HWND};
+use crate::blocking::{extend_time, get_remaining_seconds, hide_blocking_overlay, show_blocking_overlay, BLOCKING_HWND};
 use crate::constants::*;
 use crate::database::{get_blocking_message, get_warning_config, is_pause_enabled};
 use crate::dialogs::{show_settings_dialog, show_stats_dialog, verify_passcode_for_quit};
@@ -257,11 +257,21 @@ pub unsafe extern "system" fn window_proc(
                 IDM_EXTEND_15 => {
                     if verify_passcode_for_quit(hwnd) {
                         extend_time(15);
+                        crate::time_request::notify_passcode_extend(
+                            "passcode_extend.source.tray_menu",
+                            15,
+                            get_remaining_seconds(),
+                        );
                     }
                 }
                 IDM_EXTEND_45 => {
                     if verify_passcode_for_quit(hwnd) {
                         extend_time(45);
+                        crate::time_request::notify_passcode_extend(
+                            "passcode_extend.source.tray_menu",
+                            45,
+                            get_remaining_seconds(),
+                        );
                     }
                 }
                 IDM_ABOUT => {

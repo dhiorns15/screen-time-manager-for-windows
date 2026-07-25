@@ -203,30 +203,40 @@ pub fn set_shared_setting(key: &str, value: &str) -> bool {
     set_setting(key, value)
 }
 
+/// Path to the marker written when the app quits via the passcode-protected
+/// Quit menu item. A plain file rather than a DB row deliberately - the
+/// watchdog's check (a brand-new, short-lived process) shouldn't depend on
+/// successfully opening a SQLite connection just to read one flag.
+fn intentional_quit_marker_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".screen-time-manager")
+        .join("intentional_quit")
+}
+
 /// Record that the app is quitting via the passcode-protected Quit menu item,
 /// so the watchdog task doesn't mistake a sanctioned stop for tampering.
 pub fn mark_intentional_quit() {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    set_setting("intentional_quit_at", &now.to_string());
+    let path = intentional_quit_marker_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&path, b"");
 }
 
 /// Whether the app was intentionally quit within the last few minutes -
 /// gives a grace window for the parent to restart it manually (e.g. after an
 /// update) without the watchdog firing a false "tampering" alert.
 pub fn recent_intentional_quit() -> bool {
-    const GRACE_PERIOD_SECS: u64 = 180;
+    const GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(180);
 
-    let Some(marked) = get_setting("intentional_quit_at").and_then(|s| s.parse::<u64>().ok()) else {
+    let Ok(metadata) = std::fs::metadata(intentional_quit_marker_path()) else {
         return false;
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    now.saturating_sub(marked) < GRACE_PERIOD_SECS
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    modified.elapsed().map(|age| age < GRACE_PERIOD).unwrap_or(false)
 }
 
 /// Get the passcode from the database
@@ -240,7 +250,6 @@ pub fn get_passcode() -> Option<String> {
 }
 
 /// Set the passcode in the database
-#[allow(dead_code)]
 pub fn set_passcode(code: &str) -> bool {
     if let Ok(guard) = DB_CONNECTION.lock() {
         if let Some(conn) = guard.as_ref() {
@@ -251,6 +260,64 @@ pub fn set_passcode(code: &str) -> bool {
         }
     }
     false
+}
+
+/// Settings keys for the optional rotating daily PIN
+const ROTATING_PIN_ENABLED: &str = "rotating_pin_enabled";
+const ROTATING_PIN_SECRET: &str = "rotating_pin_secret";
+
+/// Whether the rotating daily PIN is enabled (off by default) - when on, it
+/// works everywhere the regular passcode does, as an additional valid code
+/// alongside it (the regular passcode always keeps working too, so there's
+/// no lockout risk if the rotating code isn't at hand).
+pub fn is_rotating_pin_enabled() -> bool {
+    get_setting(ROTATING_PIN_ENABLED).map(|s| s == "true").unwrap_or(false)
+}
+
+/// Enable/disable the rotating daily PIN
+pub fn set_rotating_pin_enabled(enabled: bool) {
+    set_setting(ROTATING_PIN_ENABLED, if enabled { "true" } else { "false" });
+}
+
+/// Get (creating if needed) the secret used to derive the daily rotating PIN
+fn get_or_create_rotating_secret() -> String {
+    if let Some(secret) = get_setting(ROTATING_PIN_SECRET) {
+        return secret;
+    }
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let seed = RandomState::new().build_hasher().finish();
+    let secret = seed.to_string();
+    set_setting(ROTATING_PIN_SECRET, &secret);
+    secret
+}
+
+/// Today's rotating 4-digit PIN - deterministic for the day (so it can be
+/// verified without storing it anywhere), changes at the next date rollover.
+/// Not cryptographically secure - it just needs to be different day to day,
+/// not withstand a determined attacker, so a simple FNV hash is enough here.
+pub fn get_rotating_pin() -> String {
+    let secret = get_or_create_rotating_secret();
+    let date = get_today_date();
+
+    let mut hash: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
+    for byte in secret.bytes().chain(date.bytes()) {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3); // FNV prime
+    }
+    format!("{:04}", hash % 10000)
+}
+
+/// Check an entered code against the passcode and (if enabled) today's
+/// rotating PIN. Use this instead of comparing to `get_passcode()` directly
+/// anywhere a passcode is checked.
+pub fn verify_passcode(entered: &str) -> bool {
+    if let Some(stored) = get_passcode() {
+        if entered == stored {
+            return true;
+        }
+    }
+    is_rotating_pin_enabled() && entered == get_rotating_pin()
 }
 
 /// Get a setting value from the database
@@ -277,7 +344,6 @@ pub fn set_setting(key: &str, value: &str) -> bool {
 }
 
 /// Get daily limit for a specific weekday (0 = Monday, 6 = Sunday)
-#[allow(dead_code)]
 pub fn get_daily_limit(weekday: u32) -> u32 {
     let key = match weekday {
         0 => "limit_monday",
@@ -292,6 +358,21 @@ pub fn get_daily_limit(weekday: u32) -> u32 {
     get_setting(key)
         .and_then(|s| s.parse().ok())
         .unwrap_or(120)
+}
+
+/// Set daily limit for a specific weekday (0 = Monday, 6 = Sunday)
+pub fn set_daily_limit(weekday: u32, minutes: u32) -> bool {
+    let key = match weekday {
+        0 => "limit_monday",
+        1 => "limit_tuesday",
+        2 => "limit_wednesday",
+        3 => "limit_thursday",
+        4 => "limit_friday",
+        5 => "limit_saturday",
+        6 => "limit_sunday",
+        _ => return false,
+    };
+    set_setting(key, &minutes.to_string())
 }
 
 /// Get warning configuration

@@ -50,6 +50,7 @@ struct SettingsEditHandles {
     current_passcode: HWND,
     new_passcode: HWND,
     confirm_passcode: HWND,
+    rotating_pin_enabled: HWND,
     // Telegram settings
     telegram_token: HWND,
     telegram_chat_id: HWND,
@@ -70,21 +71,18 @@ struct SettingsEditHandles {
 
 /// Verify passcode before allowing sensitive operations
 pub unsafe fn verify_passcode_for_quit(parent_hwnd: HWND) -> bool {
-    let stored_passcode = match get_passcode() {
-        Some(p) => p,
-        None => return true,
-    };
+    if get_passcode().is_none() {
+        return true;
+    }
 
     let dialog_class = w!("ScreenTimePasscodeDialogNice");
     let hinstance = GetModuleHandleW(None).expect("Failed to get module handle");
 
     static mut DIALOG_RESULT: Option<bool> = None;
     static mut DIALOG_EDIT_HWND: Option<HWND> = None;
-    static mut DIALOG_STORED_CODE: Option<String> = None;
     static mut DIALOG_ERROR: bool = false;
 
     DIALOG_RESULT = None;
-    DIALOG_STORED_CODE = Some(stored_passcode);
     DIALOG_ERROR = false;
 
     unsafe extern "system" fn dialog_proc(
@@ -240,16 +238,14 @@ pub unsafe fn verify_passcode_for_quit(parent_hwnd: HWND) -> bool {
                             let len = GetWindowTextW(edit_hwnd, &mut buffer);
                             let entered: String = String::from_utf16_lossy(&buffer[..len as usize]);
 
-                            if let Some(ref stored) = DIALOG_STORED_CODE {
-                                if entered == *stored {
-                                    DIALOG_RESULT = Some(true);
-                                    DestroyWindow(hwnd).ok();
-                                } else {
-                                    DIALOG_ERROR = true;
-                                    let _ = InvalidateRect(hwnd, None, true);
-                                    SetWindowTextW(edit_hwnd, w!("")).ok();
-                                    let _ = SetFocus(edit_hwnd);
-                                }
+                            if crate::database::verify_passcode(&entered) {
+                                DIALOG_RESULT = Some(true);
+                                DestroyWindow(hwnd).ok();
+                            } else {
+                                DIALOG_ERROR = true;
+                                let _ = InvalidateRect(hwnd, None, true);
+                                SetWindowTextW(edit_hwnd, w!("")).ok();
+                                let _ = SetFocus(edit_hwnd);
                             }
                         }
                     }
@@ -658,6 +654,25 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                     SendMessageW(h, EM_SETLIMITTEXT, WPARAM(4), LPARAM(0));
                     confirm_pass_hwnd = h;
                 }
+                y_pos += scale(26);
+
+                // Rotating daily PIN - an additional code (alongside the
+                // passcode above, not a replacement) that changes every day;
+                // works everywhere the passcode does. Off by default.
+                let rotating_pin_chk_text = i18n::wide("settings.enable_rotating_pin");
+                let rotating_pin_chk = CreateWindowExW(
+                    WINDOW_EX_STYLE(0), w!("BUTTON"), PCWSTR(rotating_pin_chk_text.as_ptr()),
+                    WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
+                    scale(25), y_pos, scale(340), scale(20), hwnd, HMENU::default(), hinstance, None,
+                );
+                let mut rotating_pin_enabled_hwnd = HWND::default();
+                if let Ok(h) = rotating_pin_chk {
+                    SendMessageW(h, WM_SETFONT, WPARAM(label_font.0 as usize), LPARAM(1));
+                    if crate::database::is_rotating_pin_enabled() {
+                        SendMessageW(h, BM_SETCHECK, WPARAM(1), LPARAM(0));
+                    }
+                    rotating_pin_enabled_hwnd = h;
+                }
                 y_pos += scale(24);
 
                 // ===== Telegram Bot Section =====
@@ -980,6 +995,7 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                     current_passcode: curr_pass_hwnd,
                     new_passcode: new_pass_hwnd,
                     confirm_passcode: confirm_pass_hwnd,
+                    rotating_pin_enabled: rotating_pin_enabled_hwnd,
                     telegram_token: telegram_token_hwnd,
                     telegram_chat_id: telegram_chat_id_hwnd,
                     telegram_enabled: telegram_enabled_hwnd,
@@ -1050,6 +1066,12 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
 
                             // Save new passcode
                             set_setting("passcode", &new_pass);
+                        }
+
+                        // Save rotating PIN toggle
+                        if !handles.rotating_pin_enabled.0.is_null() {
+                            let checked = SendMessageW(handles.rotating_pin_enabled, BM_GETCHECK, WPARAM(0), LPARAM(0));
+                            crate::database::set_rotating_pin_enabled(checked.0 == 1);
                         }
 
                         // Save other settings
@@ -1257,7 +1279,7 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
     let screen_width = GetSystemMetrics(SM_CXSCREEN);
     let screen_height = GetSystemMetrics(SM_CYSCREEN);
     let dialog_width = scale(400);
-    let dialog_height = scale(944);
+    let dialog_height = scale(970);
 
     let dialog_hwnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,

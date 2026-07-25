@@ -34,7 +34,7 @@ use windows::{
 use windows::core::PCWSTR;
 
 use crate::constants::*;
-use crate::database::{get_discord_config, get_passcode, get_telegram_config};
+use crate::database::{get_discord_config, get_telegram_config};
 use crate::dpi::scale;
 use crate::i18n;
 
@@ -299,10 +299,8 @@ unsafe fn check_blocking_passcode() -> bool {
         let len = GetWindowTextW(edit, &mut buffer);
         let entered: String = String::from_utf16_lossy(&buffer[..len as usize]);
 
-        if let Some(stored) = get_passcode() {
-            if entered == stored {
-                return true;
-            }
+        if crate::database::verify_passcode(&entered) {
+            return true;
         }
     }
     false
@@ -805,8 +803,17 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                 match id {
                     ID_UNLOCK_BUTTON => {
                         if check_blocking_passcode() {
-                            // Add 15 minutes when unlocking (otherwise timer at 0 would re-lock immediately)
-                            extend_time(15);
+                            // Only add time if there wasn't any left - if this was a
+                            // manual lock with time still remaining, just dismiss it
+                            // (matches what the !unlock/unlock bot command does).
+                            if REMAINING_SECONDS.load(Ordering::SeqCst) <= 0 {
+                                extend_time(15);
+                                crate::time_request::notify_passcode_extend(
+                                    "passcode_extend.source.lock_screen",
+                                    15,
+                                    REMAINING_SECONDS.load(Ordering::SeqCst),
+                                );
+                            }
                             hide_blocking_overlay();
                         } else {
                             PASSCODE_ERROR.store(true, Ordering::SeqCst);
@@ -830,6 +837,11 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                                 _ => 0,
                             };
                             extend_time(minutes);
+                            crate::time_request::notify_passcode_extend(
+                                "passcode_extend.source.lock_screen",
+                                minutes,
+                                REMAINING_SECONDS.load(Ordering::SeqCst),
+                            );
                             PASSCODE_ERROR.store(false, Ordering::SeqCst);
 
                             // Clear the passcode field
@@ -983,8 +995,17 @@ pub unsafe extern "system" fn blocking_overlay_proc(
         WM_KEYDOWN => {
             if wparam.0 == VK_RETURN.0 as usize {
                 if check_blocking_passcode() {
-                    // Add 15 minutes when unlocking (otherwise timer at 0 would re-lock immediately)
-                    extend_time(15);
+                    // Only add time if there wasn't any left - if this was a
+                    // manual lock with time still remaining, just dismiss it
+                    // (matches what the !unlock/unlock bot command does).
+                    if REMAINING_SECONDS.load(Ordering::SeqCst) <= 0 {
+                        extend_time(15);
+                        crate::time_request::notify_passcode_extend(
+                            "passcode_extend.source.lock_screen",
+                            15,
+                            REMAINING_SECONDS.load(Ordering::SeqCst),
+                        );
+                    }
                     hide_blocking_overlay();
                 } else {
                     PASSCODE_ERROR.store(true, Ordering::SeqCst);

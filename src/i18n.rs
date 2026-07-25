@@ -134,6 +134,7 @@ fn en(key: &str) -> &'static str {
         "settings.current" => "Current:",
         "settings.new" => "New:",
         "settings.confirm" => "Confirm:",
+        "settings.enable_rotating_pin" => "Enable rotating daily PIN (via Telegram/Discord, works alongside your passcode)",
         "settings.enable_telegram" => "Enable Telegram Bot",
         "settings.bot_token" => "Bot Token:",
         "settings.chat_id" => "Chat ID:",
@@ -286,6 +287,27 @@ fn en(key: &str) -> &'static str {
         "tg.msg.provide" => "Please provide a message, e.g. /msg Do your homework!",
         "tg.msg.shown" => "Message shown:",
 
+        "tg.setmessage.usage" => "Please provide a message, e.g. /setmessage Time to take a break!",
+        "tg.setmessage.success" => "Blocking screen message updated",
+
+        "tg.setpin.invalid" => "Please provide exactly 4 digits, e.g. /setpin 1234",
+        "tg.setpin.success" => "Passcode updated",
+
+        "tg.rotatingpin.usage" => "Please specify on or off, e.g. /rotatingpin on",
+        "tg.rotatingpin.enabled" => "🔁 Rotating daily PIN enabled. It works alongside your passcode (which still always works too) everywhere a code is needed. Use /getpin to check today's code.",
+        "tg.rotatingpin.disabled" => "🔁 Rotating daily PIN disabled. Only your passcode works now.",
+
+        "tg.getpin.not_enabled" => "The rotating PIN isn't enabled. Turn it on with /rotatingpin on",
+        "tg.getpin.header" => "Today's code:",
+        "tg.getpin.note" => "Works anywhere your passcode does. Changes tomorrow.",
+
+        "tg.setlimit.usage" => "Please specify minutes, e.g. /setlimit 90 or /setlimit saturday 180",
+        "tg.setlimit.invalid_day" => "Unrecognized day - use monday, tuesday, wednesday, thursday, friday, saturday or sunday",
+        "tg.setlimit.invalid_minutes" => "Please specify a whole number of minutes",
+        "tg.setlimit.max_1440" => "Maximum daily limit is 1440 minutes (24 hours)",
+        "tg.setlimit.success" => "Daily limit for",
+        "tg.setlimit.to" => "set to",
+
         "tg.reset.success" => "Timer reset to daily limit",
         "tg.reset.remaining" => "Remaining:",
 
@@ -316,6 +338,11 @@ fn en(key: &str) -> &'static str {
         "dc.cmd.lock" => "Lock the screen",
         "dc.cmd.unlock" => "Unlock without changing remaining time (only if time is left)",
         "dc.cmd.reset" => "Reset timer to daily limit",
+        "dc.cmd.setmessage" => "Change the blocking screen message (e.g., !setmessage Time for a break!)",
+        "dc.cmd.setpin" => "Change the passcode (e.g., !setpin 1234)",
+        "dc.cmd.setlimit" => "Set daily limit in minutes (e.g., !setlimit 90 or !setlimit saturday 180)",
+        "dc.cmd.rotatingpin" => "Toggle the rotating daily PIN on/off (e.g., !rotatingpin on)",
+        "dc.cmd.getpin" => "Get today's rotating PIN (if enabled)",
         "dc.cmd.e30" => "Extend by 30 minutes",
         "dc.cmd.e60" => "Extend by 60 minutes",
         "dc.cmd.e120" => "Extend by 120 minutes",
@@ -332,6 +359,12 @@ fn en(key: &str) -> &'static str {
         "request.notify.reply_tg" => "Reply /extend 30 to grant, or /unlock if there's time left.",
         "request.notify.reply_dc" => "Reply !extend 30 to grant, or !unlock if there's time left.",
         "request.notify.resolved" => "Time request already granted:",
+
+        // ----- Passcode-based Extend Notifications -----
+        "passcode_extend.notify.header" => "used the passcode to add",
+        "passcode_extend.notify.minutes" => "min",
+        "passcode_extend.source.lock_screen" => "lock screen",
+        "passcode_extend.source.tray_menu" => "tray menu",
 
         // ----- Watchdog Tamper Alert -----
         "watchdog.alert.prefix" => "Screen Time Manager stopped unexpectedly on",
@@ -476,6 +509,7 @@ fn de(key: &str) -> &'static str {
         "settings.current" => "Aktuell:",
         "settings.new" => "Neu:",
         "settings.confirm" => "Bestätigen:",
+        "settings.enable_rotating_pin" => "Rotierenden Tages-Code aktivieren (über Telegram/Discord, zusätzlich zu Ihrem Passcode)",
         "settings.enable_telegram" => "Telegram Bot aktivieren",
         "settings.bot_token" => "Bot Token:",
         "settings.chat_id" => "Chat ID:",
@@ -628,6 +662,27 @@ fn de(key: &str) -> &'static str {
         "tg.msg.provide" => "Bitte geben Sie eine Nachricht an, z.B. /msg Mach deine Hausaufgaben!",
         "tg.msg.shown" => "Nachricht angezeigt:",
 
+        "tg.setmessage.usage" => "Bitte geben Sie eine Nachricht an, z.B. /setmessage Zeit für eine Pause!",
+        "tg.setmessage.success" => "Sperrbildschirm-Nachricht aktualisiert",
+
+        "tg.setpin.invalid" => "Bitte geben Sie genau 4 Ziffern an, z.B. /setpin 1234",
+        "tg.setpin.success" => "Code aktualisiert",
+
+        "tg.rotatingpin.usage" => "Bitte geben Sie on oder off an, z.B. /rotatingpin on",
+        "tg.rotatingpin.enabled" => "🔁 Rotierender Tages-Code aktiviert. Er funktioniert zusätzlich zu Ihrem Passcode (der weiterhin immer funktioniert) überall, wo ein Code benötigt wird. Verwenden Sie /getpin, um den heutigen Code abzurufen.",
+        "tg.rotatingpin.disabled" => "🔁 Rotierender Tages-Code deaktiviert. Nur Ihr Passcode funktioniert jetzt.",
+
+        "tg.getpin.not_enabled" => "Der rotierende Code ist nicht aktiviert. Aktivieren Sie ihn mit /rotatingpin on",
+        "tg.getpin.header" => "Heutiger Code:",
+        "tg.getpin.note" => "Funktioniert überall wie Ihr Passcode. Ändert sich morgen.",
+
+        "tg.setlimit.usage" => "Bitte geben Sie Minuten an, z.B. /setlimit 90 oder /setlimit saturday 180",
+        "tg.setlimit.invalid_day" => "Unbekannter Tag - verwenden Sie monday, tuesday, wednesday, thursday, friday, saturday oder sunday",
+        "tg.setlimit.invalid_minutes" => "Bitte geben Sie eine ganze Anzahl Minuten an",
+        "tg.setlimit.max_1440" => "Maximales Tageslimit ist 1440 Minuten (24 Stunden)",
+        "tg.setlimit.success" => "Tageslimit für",
+        "tg.setlimit.to" => "gesetzt auf",
+
         "tg.reset.success" => "Timer auf Tageslimit zurückgesetzt",
         "tg.reset.remaining" => "Verbleibend:",
 
@@ -658,6 +713,11 @@ fn de(key: &str) -> &'static str {
         "dc.cmd.lock" => "Bildschirm sperren",
         "dc.cmd.unlock" => "Entsperren ohne verbleibende Zeit zu ändern (nur wenn noch Zeit übrig ist)",
         "dc.cmd.reset" => "Timer auf Tageslimit zurücksetzen",
+        "dc.cmd.setmessage" => "Sperrbildschirm-Nachricht ändern (z.B. !setmessage Zeit für eine Pause!)",
+        "dc.cmd.setpin" => "Code ändern (z.B. !setpin 1234)",
+        "dc.cmd.setlimit" => "Tageslimit in Minuten setzen (z.B. !setlimit 90 oder !setlimit saturday 180)",
+        "dc.cmd.rotatingpin" => "Rotierenden Tages-Code ein-/ausschalten (z.B. !rotatingpin on)",
+        "dc.cmd.getpin" => "Heutigen rotierenden Code abrufen (falls aktiviert)",
         "dc.cmd.e30" => "Um 30 Minuten verlängern",
         "dc.cmd.e60" => "Um 60 Minuten verlängern",
         "dc.cmd.e120" => "Um 120 Minuten verlängern",
@@ -674,6 +734,12 @@ fn de(key: &str) -> &'static str {
         "request.notify.reply_tg" => "Antworten Sie mit /extend 30 zum Gewähren, oder /unlock falls noch Zeit übrig ist.",
         "request.notify.reply_dc" => "Antworten Sie mit !extend 30 zum Gewähren, oder !unlock falls noch Zeit übrig ist.",
         "request.notify.resolved" => "Zeitanfrage bereits gewährt:",
+
+        // ----- Passcode-basierte Verlängerungs-Benachrichtigungen -----
+        "passcode_extend.notify.header" => "hat den Code verwendet, um",
+        "passcode_extend.notify.minutes" => "Min hinzuzufügen",
+        "passcode_extend.source.lock_screen" => "Sperrbildschirm",
+        "passcode_extend.source.tray_menu" => "Taskleisten-Menü",
 
         // ----- Watchdog Manipulationswarnung -----
         "watchdog.alert.prefix" => "Bildschirmzeit Manager wurde unerwartet beendet auf",

@@ -12,8 +12,9 @@ use serenity::client::{Client, Context, EventHandler};
 use crate::database;
 use crate::i18n;
 use crate::remote_commands::{
-    cmd_extend, cmd_history, cmd_lock, cmd_msg, cmd_pause, cmd_reduce, cmd_reset, cmd_resume,
-    cmd_status, cmd_time, cmd_unlock,
+    cmd_extend, cmd_getpin, cmd_history, cmd_lock, cmd_msg, cmd_pause, cmd_reduce, cmd_reset,
+    cmd_resume, cmd_rotatingpin, cmd_setlimit, cmd_setmessage, cmd_setpin, cmd_status, cmd_time,
+    cmd_unlock,
 };
 use crate::time_request;
 
@@ -108,6 +109,11 @@ impl EventHandler for Handler {
             "lock" | "stop" => cmd_lock(),
             "unlock" => cmd_unlock(),
             "reset" => cmd_reset(),
+            "setmessage" => cmd_setmessage(args),
+            "setpin" => cmd_setpin(args),
+            "setlimit" => cmd_setlimit(args),
+            "rotatingpin" => cmd_rotatingpin(args),
+            "getpin" => cmd_getpin(),
             "e30" => cmd_extend(30),
             "e60" => cmd_extend(60),
             "e120" => cmd_extend(120),
@@ -143,6 +149,11 @@ fn help_text() -> String {
         ("!lock", i18n::t("dc.cmd.lock")),
         ("!unlock", i18n::t("dc.cmd.unlock")),
         ("!reset", i18n::t("dc.cmd.reset")),
+        ("!setmessage <text>", i18n::t("dc.cmd.setmessage")),
+        ("!setpin <pin>", i18n::t("dc.cmd.setpin")),
+        ("!setlimit <mins>", i18n::t("dc.cmd.setlimit")),
+        ("!rotatingpin <on|off>", i18n::t("dc.cmd.rotatingpin")),
+        ("!getpin", i18n::t("dc.cmd.getpin")),
         ("!e30", i18n::t("dc.cmd.e30")),
         ("!e60", i18n::t("dc.cmd.e60")),
         ("!e120", i18n::t("dc.cmd.e120")),

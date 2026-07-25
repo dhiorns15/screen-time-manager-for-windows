@@ -31,16 +31,37 @@ pub fn run_check() {
         return;
     }
 
-    // Needed to read the intentional-quit marker and (below) the shared
-    // Telegram/Discord config - this is a fresh process, nothing is cached.
-    let _ = database::init_database();
     if database::recent_intentional_quit() {
+        log("app not running - recent intentional quit, not alerting");
         return;
     }
 
     let relaunched = relaunch_app();
     database::init_shared_database();
+    log(&format!("app not running - relaunched={relaunched}, sending tamper alert"));
     send_tamper_alert(relaunched);
+}
+
+/// Small append-only log, since a Scheduled-Task-launched process has no
+/// visible console to eprintln into - useful for diagnosing why a given run
+/// did or didn't relaunch/alert.
+fn log(msg: &str) {
+    use std::io::Write;
+
+    let path = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".screen-time-manager")
+        .join("watchdog.log");
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[{now}] {msg}");
+    }
 }
 
 unsafe fn app_is_running() -> bool {
@@ -59,7 +80,35 @@ unsafe fn app_is_running() -> bool {
     }
 }
 
+/// Name of the main app's Scheduled Task, as registered by install.ps1.
+const MAIN_TASK_NAME: &str = "ScreenTimeManager";
+
 fn relaunch_app() -> bool {
+    // Ask Task Scheduler to start the app's own registered task rather than
+    // spawning it as a direct child of this watchdog check: a direct child
+    // inherits the watchdog task's Job Object (and any policy Windows
+    // applies to it), and CREATE_BREAKAWAY_FROM_JOB only works if that job
+    // explicitly allows breakaway - it doesn't here, so CreateProcess just
+    // fails outright. The main task has its own separate job with no
+    // execution time limit, so this sidesteps the problem entirely.
+    if relaunch_via_scheduled_task() {
+        return true;
+    }
+    // Fallback for the unlikely case the scheduled task isn't registered
+    // (e.g. install.ps1 was never run) - not ideal if this process happens
+    // to be job-limited, but better than not relaunching at all.
+    relaunch_by_spawning()
+}
+
+fn relaunch_via_scheduled_task() -> bool {
+    std::process::Command::new("schtasks")
+        .args(["/Run", "/TN", MAIN_TASK_NAME])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn relaunch_by_spawning() -> bool {
     let Ok(exe) = std::env::current_exe() else { return false };
     std::process::Command::new(exe).spawn().is_ok()
 }

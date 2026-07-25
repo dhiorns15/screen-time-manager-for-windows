@@ -92,6 +92,10 @@ You can monitor and control screen time from your phone using Telegram. This is 
 - `/pause` - Pause the timer
 - `/resume` - Resume the timer
 - `/history` - See today's pause activity
+- `/setmessage Time for a break!` - Change the blocking screen message remotely
+- `/setpin 1234` - Change the passcode remotely
+- `/setlimit 90` or `/setlimit saturday 180` - Change the daily time limit remotely (today, or a specific day)
+- `/rotatingpin on` and `/getpin` - Optional auto-rotating daily code (see below)
 
 **Setup (one-time):**
 
@@ -121,6 +125,10 @@ You can also monitor and control screen time from a Discord channel, using a Dis
 - `!pause` - Pause the timer
 - `!resume` - Resume the timer
 - `!history` - See today's pause activity
+- `!setmessage Time for a break!` - Change the blocking screen message remotely
+- `!setpin 1234` - Change the passcode remotely
+- `!setlimit 90` or `!setlimit saturday 180` - Change the daily time limit remotely (today, or a specific day)
+- `!rotatingpin on` and `!getpin` - Optional auto-rotating daily code (see below)
 - `!help` - See all commands
 
 **Setup (one-time):**
@@ -142,6 +150,20 @@ Once configured, only you can control the bot in that channel - it ignores comma
 If Telegram and/or Discord is enabled, the lock screen shows a **"Request More Time"** button that doesn't need the passcode. Your child can optionally type a short reason (e.g. "saving my game"), then click it to ping you directly - the message includes their Windows account, remaining time, and the reason if given. Reply `!extend 30` (Discord) or `/extend 30` (Telegram) to grant time, or `!unlock`/`/unlock` to dismiss the screen without changing the timer if there's still time left - either one closes the lock screen automatically. The button has a 5-minute cooldown to prevent spamming.
 
 If both Telegram and Discord are enabled, the request goes to both, but only one reply is needed - whichever one you respond from first, the other gets a short "already handled" notice so you don't have to reply twice.
+
+**Passcode alerts:** if Telegram and/or Discord is enabled, using the passcode to add time - either on the lock screen or via the tray icon's right-click menu - sends you a notification too. This is separate from the request flow above, so you find out any time the passcode grants time, whether or not anyone asked first.
+
+---
+
+## Rotating Daily PIN (Optional)
+
+If you're worried about the passcode being watched and memorized, enable the rotating daily PIN (Settings, or `!rotatingpin on` / `/rotatingpin on`) - a second code that automatically changes every day and works anywhere the regular passcode does. Your regular passcode always keeps working too, so there's no risk of getting locked out if you don't have your phone handy - the rotating code is purely additive. Retrieve today's code any time with `!getpin` / `/getpin`. Off by default.
+
+---
+
+## Automatic Restart & Tamper Alerts
+
+If Screen Time Manager is stopped in any way other than the passcode-protected Quit option (e.g. ended via Task Manager), it's automatically relaunched within about a minute, and you'll get a Telegram/Discord alert if either is enabled. This requires running `install.ps1` as Administrator at least once (it registers a Scheduled Task for this) - see the install instructions above.
 
 ---
 

@@ -10,8 +10,9 @@ use teloxide::utils::command::BotCommands;
 use crate::database;
 use crate::i18n;
 use crate::remote_commands::{
-    cmd_extend, cmd_history, cmd_lock, cmd_msg, cmd_pause, cmd_reduce, cmd_reset, cmd_resume,
-    cmd_status, cmd_time, cmd_unlock,
+    cmd_extend, cmd_getpin, cmd_history, cmd_lock, cmd_msg, cmd_pause, cmd_reduce, cmd_reset,
+    cmd_resume, cmd_rotatingpin, cmd_setlimit, cmd_setmessage, cmd_setpin, cmd_status, cmd_time,
+    cmd_unlock,
 };
 use crate::time_request;
 
@@ -53,6 +54,16 @@ enum Command {
     Unlock,
     #[command(description = "Reset timer to daily limit")]
     Reset,
+    #[command(description = "Change the blocking screen message (e.g., /setmessage Time for a break!)")]
+    Setmessage(String),
+    #[command(description = "Change the passcode (e.g., /setpin 1234)")]
+    Setpin(String),
+    #[command(description = "Set daily limit in minutes (e.g., /setlimit 90 or /setlimit saturday 180)")]
+    Setlimit(String),
+    #[command(description = "Toggle the rotating daily PIN on/off (e.g., /rotatingpin on)")]
+    Rotatingpin(String),
+    #[command(description = "Get today's rotating PIN (if enabled)")]
+    Getpin,
     #[command(description = "Extend by 30 minutes")]
     E30,
     #[command(description = "Extend by 60 minutes")]
@@ -280,6 +291,11 @@ async fn handle_command(
         Command::Stop => cmd_lock(),
         Command::Unlock => cmd_unlock(),
         Command::Reset => cmd_reset(),
+        Command::Setmessage(text) => cmd_setmessage(&text),
+        Command::Setpin(pin) => cmd_setpin(&pin),
+        Command::Setlimit(args) => cmd_setlimit(&args),
+        Command::Rotatingpin(args) => cmd_rotatingpin(&args),
+        Command::Getpin => cmd_getpin(),
         Command::E30 => cmd_extend(30),
         Command::E60 => cmd_extend(60),
         Command::E120 => cmd_extend(120),

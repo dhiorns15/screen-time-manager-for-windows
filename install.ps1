@@ -106,7 +106,7 @@ $watchdogSettings = New-ScheduledTaskSettingsSet `
     -DontStopIfGoingOnBatteries `
     -StartWhenAvailable `
     -MultipleInstances IgnoreNew `
-    -ExecutionTimeLimit (New-TimeSpan -Minutes 1)
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
 
 $watchdogTask = New-ScheduledTask -Action $watchdogAction -Trigger @($watchdogTrigger, $watchdogTrigger2) `
     -Principal $watchdogPrincipal -Settings $watchdogSettings -Description $WatchdogDescription

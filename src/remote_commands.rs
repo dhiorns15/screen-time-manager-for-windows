@@ -218,6 +218,118 @@ pub fn cmd_msg(text: &str) -> String {
     format!("📢 {}: \"{}\"", i18n::t("tg.msg.shown"), text)
 }
 
+pub fn cmd_setmessage(text: &str) -> String {
+    let text = text.trim();
+    if text.is_empty() {
+        return i18n::t("tg.setmessage.usage").to_string();
+    }
+
+    database::set_setting("blocking_message", text);
+
+    format!("📝 {}", i18n::t("tg.setmessage.success"))
+}
+
+pub fn cmd_setpin(args: &str) -> String {
+    let pin = args.trim();
+    if pin.len() != 4 || !pin.chars().all(|c| c.is_ascii_digit()) {
+        return i18n::t("tg.setpin.invalid").to_string();
+    }
+
+    database::set_passcode(pin);
+
+    // Deliberately don't echo the new pin back into chat history.
+    format!("🔑 {}", i18n::t("tg.setpin.success"))
+}
+
+pub fn cmd_rotatingpin(args: &str) -> String {
+    match args.trim().to_lowercase().as_str() {
+        "on" | "enable" | "enabled" => {
+            database::set_rotating_pin_enabled(true);
+            i18n::t("tg.rotatingpin.enabled").to_string()
+        }
+        "off" | "disable" | "disabled" => {
+            database::set_rotating_pin_enabled(false);
+            i18n::t("tg.rotatingpin.disabled").to_string()
+        }
+        _ => i18n::t("tg.rotatingpin.usage").to_string(),
+    }
+}
+
+pub fn cmd_getpin() -> String {
+    if !database::is_rotating_pin_enabled() {
+        return i18n::t("tg.getpin.not_enabled").to_string();
+    }
+    format!(
+        "🔢 {} {}\n{}",
+        i18n::t("tg.getpin.header"),
+        database::get_rotating_pin(),
+        i18n::t("tg.getpin.note"),
+    )
+}
+
+/// Parse a weekday name/abbreviation into the app's 0=Monday..6=Sunday index.
+/// English only, like the rest of the bot command vocabulary.
+fn parse_weekday_arg(s: &str) -> Option<u32> {
+    match s.to_lowercase().as_str() {
+        "mon" | "monday" => Some(0),
+        "tue" | "tues" | "tuesday" => Some(1),
+        "wed" | "weds" | "wednesday" => Some(2),
+        "thu" | "thur" | "thurs" | "thursday" => Some(3),
+        "fri" | "friday" => Some(4),
+        "sat" | "saturday" => Some(5),
+        "sun" | "sunday" => Some(6),
+        _ => None,
+    }
+}
+
+pub fn cmd_setlimit(args: &str) -> String {
+    let args = args.trim();
+    if args.is_empty() {
+        return i18n::t("tg.setlimit.usage").to_string();
+    }
+
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    let (weekday, minutes_str) = if parts.len() == 1 {
+        (database::get_current_weekday(), parts[0])
+    } else {
+        let Some(day) = parse_weekday_arg(parts[0]) else {
+            return i18n::t("tg.setlimit.invalid_day").to_string();
+        };
+        (day, parts[parts.len() - 1])
+    };
+
+    let Ok(minutes) = minutes_str.parse::<u32>() else {
+        return i18n::t("tg.setlimit.invalid_minutes").to_string();
+    };
+    if minutes > 1440 {
+        return i18n::t("tg.setlimit.max_1440").to_string();
+    }
+
+    database::set_daily_limit(weekday, minutes);
+
+    // If today's limit was just lowered, cap remaining time to match -
+    // mirrors the same adjustment the Settings dialog makes on Save.
+    if weekday == database::get_current_weekday() {
+        let new_limit_seconds = (minutes * 60) as i32;
+        let remaining = blocking::get_remaining_seconds();
+        if remaining > new_limit_seconds {
+            blocking::REMAINING_SECONDS.store(new_limit_seconds, Ordering::SeqCst);
+            database::save_remaining_time(new_limit_seconds);
+            unsafe {
+                mini_overlay::update_mini_overlay();
+            }
+        }
+    }
+
+    format!(
+        "📅 {} {} {} {} min",
+        i18n::t("tg.setlimit.success"),
+        i18n::weekday(weekday as usize),
+        i18n::t("tg.setlimit.to"),
+        minutes
+    )
+}
+
 pub fn cmd_reset() -> String {
     let weekday = database::get_current_weekday();
     let daily_limit_minutes = database::get_daily_limit(weekday);
