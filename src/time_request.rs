@@ -102,6 +102,86 @@ pub fn notify_passcode_extend(source_key: &str, minutes: i32, remaining_seconds:
     }
 }
 
+/// Called whenever idle detection flips the timer between paused and running
+/// (see `mini_overlay::check_idle_state`), so the parent can see activity
+/// without having to poll the `status` bot command themselves.
+pub fn notify_activity_status(is_idle: bool, remaining_seconds: i32) {
+    let username = current_windows_username();
+    let mins = remaining_seconds / 60;
+    let secs = remaining_seconds % 60;
+    let (icon, header_key) = if is_idle {
+        ("💤", "activity.notify.idle")
+    } else {
+        ("▶️", "activity.notify.active")
+    };
+
+    let text = format!(
+        "{} {} {}\n⏳ {}: {}:{:02}",
+        icon,
+        username,
+        i18n::t(header_key),
+        i18n::t("tg.status.remaining"),
+        mins, secs,
+    );
+
+    let tg = database::get_telegram_config();
+    let dc = database::get_discord_config();
+
+    if tg.enabled {
+        telegram::notify_admin(&text);
+    }
+    if dc.enabled {
+        discord::notify_admin(&text);
+    }
+}
+
+/// Called when remaining time crosses one of the configured warning
+/// thresholds (the same ones that trigger the kid-facing overlay), so the
+/// parent gets the same heads-up without needing to be looking at `status`.
+pub fn notify_low_time(minutes: u32, remaining_seconds: i32) {
+    let username = current_windows_username();
+    let mins = remaining_seconds / 60;
+    let secs = remaining_seconds % 60;
+
+    let text = format!(
+        "⚠️ {} {} {} {}\n⏳ {}: {}:{:02}",
+        username,
+        i18n::t("warning.notify.header"),
+        minutes,
+        i18n::t("warning.notify.minutes"),
+        i18n::t("tg.status.remaining"),
+        mins, secs,
+    );
+
+    let tg = database::get_telegram_config();
+    let dc = database::get_discord_config();
+
+    if tg.enabled {
+        telegram::notify_admin(&text);
+    }
+    if dc.enabled {
+        discord::notify_admin(&text);
+    }
+}
+
+/// Called the moment remaining time hits zero and the blocking overlay
+/// triggers - the actual enforcement event, so worth a push regardless of
+/// whether either warning threshold was configured/reached first.
+pub fn notify_out_of_time() {
+    let username = current_windows_username();
+    let text = format!("⏰ {} {}", username, i18n::t("outoftime.notify.header"));
+
+    let tg = database::get_telegram_config();
+    let dc = database::get_discord_config();
+
+    if tg.enabled {
+        telegram::notify_admin(&text);
+    }
+    if dc.enabled {
+        discord::notify_admin(&text);
+    }
+}
+
 /// Called when `database::take_pending_clock_tamper_alert` reports a newly
 /// detected system-clock jump - the app is continuing to enforce today's
 /// limit as already tracked rather than granting a fresh allowance for

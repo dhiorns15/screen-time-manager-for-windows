@@ -346,10 +346,14 @@ fn check_idle_state() {
         // User is idle - pause if not already paused (manual or idle)
         if !currently_idle_paused && !IS_PAUSED.load(Ordering::SeqCst) {
             IS_IDLE_PAUSED.store(true, Ordering::SeqCst);
+            let remaining = REMAINING_SECONDS.load(Ordering::SeqCst);
+            crate::time_request::notify_activity_status(true, remaining);
         }
     } else if currently_idle_paused {
         // User is back - resume from idle pause
         IS_IDLE_PAUSED.store(false, Ordering::SeqCst);
+        let remaining = REMAINING_SECONDS.load(Ordering::SeqCst);
+        crate::time_request::notify_activity_status(false, remaining);
     }
 }
 
@@ -481,18 +485,21 @@ pub unsafe extern "system" fn mini_overlay_proc(
                         let (warn1_mins, warn1_msg) = database::get_warning_config(1);
                         if new_time == (warn1_mins * 60) as i32 {
                             crate::overlay::show_overlay(&warn1_msg, 10);
+                            crate::time_request::notify_low_time(warn1_mins, new_time);
                         }
 
                         // Check for warning 2 (e.g., 5 minutes remaining)
                         let (warn2_mins, warn2_msg) = database::get_warning_config(2);
                         if new_time == (warn2_mins * 60) as i32 {
                             crate::overlay::show_overlay(&warn2_msg, 10);
+                            crate::time_request::notify_low_time(warn2_mins, new_time);
                         }
 
                         // Trigger blocking overlay when time reaches 0
                         if new_time == 0 {
                             let msg = database::get_blocking_message();
                             crate::blocking::show_blocking_overlay(&msg);
+                            crate::time_request::notify_out_of_time();
                         }
                     }
                 }

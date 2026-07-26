@@ -379,6 +379,13 @@ fn en(key: &str) -> &'static str {
         "clock_tamper.notify.minutes" => "min",
         "clock_tamper.notify.suffix" => "Continuing to enforce today's remaining time as already tracked - the new date is being ignored until the clock is back in sync.",
 
+        // ----- Activity / Low-time / Out-of-time Alerts -----
+        "activity.notify.idle" => "went idle - timer paused",
+        "activity.notify.active" => "is active again - timer resumed",
+        "warning.notify.header" => "has about",
+        "warning.notify.minutes" => "min left",
+        "outoftime.notify.header" => "is out of screen time - locked now",
+
         // ----- Telegram Setup Wizard -----
         "wizard.title" => "Telegram Setup Wizard",
         "wizard.step" => "Step",
@@ -760,6 +767,13 @@ fn de(key: &str) -> &'static str {
         "clock_tamper.notify.backward" => "Zurückgestellt um",
         "clock_tamper.notify.minutes" => "Min",
         "clock_tamper.notify.suffix" => "Das heutige Restguthaben wird wie bisher verfolgt - das neue Datum wird ignoriert, bis die Uhr wieder synchron ist.",
+
+        // ----- Aktivitäts-/Restzeit-/Zeitablauf-Benachrichtigungen -----
+        "activity.notify.idle" => "ist inaktiv - Timer pausiert",
+        "activity.notify.active" => "ist wieder aktiv - Timer läuft weiter",
+        "warning.notify.header" => "hat noch etwa",
+        "warning.notify.minutes" => "Min übrig",
+        "outoftime.notify.header" => "hat keine Bildschirmzeit mehr - jetzt gesperrt",
 
         // ----- Telegram Setup Wizard -----
         "wizard.title" => "Telegram Einrichtungsassistent",
