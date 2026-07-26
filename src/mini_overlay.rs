@@ -3,6 +3,7 @@
 
 use std::mem::zeroed;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, Ordering};
+use std::sync::Mutex;
 use windows::{
     core::w,
     Win32::{
@@ -327,6 +328,45 @@ fn get_idle_seconds() -> u32 {
     }
 }
 
+/// The calendar date (per `database::effective_today_date`) this running
+/// process last saw - compared every tick to catch the day rolling over
+/// while the app stays open across midnight. Without this, the countdown and
+/// active-time counters only ever reset at process startup: an app left
+/// running overnight would just keep counting down (or sitting at 0) using
+/// the old day's numbers instead of getting a fresh daily allowance.
+static CURRENT_TRACKED_DATE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Detect the day changing under a still-running process and reset the
+/// countdown/session-active counters for the new day, mirroring what
+/// `main.rs` already does at a fresh startup.
+unsafe fn check_day_rollover() {
+    let today = database::effective_today_date();
+    let mut tracked = CURRENT_TRACKED_DATE.lock().unwrap();
+
+    if tracked.as_deref() == Some(today.as_str()) {
+        return;
+    }
+    let is_rollover = tracked.is_some();
+    *tracked = Some(today);
+    drop(tracked);
+
+    if !is_rollover {
+        return; // First tick since startup - nothing to roll over from yet.
+    }
+
+    let remaining = database::load_remaining_time().unwrap_or_else(|| {
+        let weekday = database::get_current_weekday();
+        (database::get_daily_limit(weekday) * 60) as i32
+    });
+    REMAINING_SECONDS.store(remaining, Ordering::SeqCst);
+    SESSION_ACTIVE_SECONDS.store(database::get_session_active_time(), Ordering::SeqCst);
+
+    update_mini_overlay();
+    if remaining > 0 {
+        crate::blocking::hide_blocking_overlay();
+    }
+}
+
 /// Check idle state and update IS_IDLE_PAUSED accordingly
 fn check_idle_state() {
     // Skip if idle detection is disabled
@@ -504,7 +544,9 @@ pub unsafe extern "system" fn mini_overlay_proc(
                     }
                 }
 
-                // Always check idle state (even during manual pause, to track transitions)
+                // Always check for the day rolling over and idle state (even
+                // during manual pause, to track transitions)
+                check_day_rollover();
                 check_idle_state();
 
                 let _ = InvalidateRect(hwnd, None, true);

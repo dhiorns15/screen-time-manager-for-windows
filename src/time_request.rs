@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use crate::database;
 use crate::discord;
 use crate::i18n;
-use crate::remote_commands::current_windows_username;
+use crate::remote_commands::{current_windows_username, format_hm, join_words};
 use crate::telegram;
 
 static PENDING: Mutex<bool> = Mutex::new(false);
@@ -23,15 +23,13 @@ pub fn request_more_time(note: Option<String>, remaining_seconds: i32) {
     *PENDING.lock().unwrap() = true;
 
     let username = current_windows_username();
-    let mins = remaining_seconds / 60;
-    let secs = remaining_seconds % 60;
 
     let mut body = format!(
-        "⏰ {} {}\n⏳ {}: {}:{:02}",
+        "⏰ {} {}\n⏳ {}: {}",
         username,
         i18n::t("request.notify.header"),
         i18n::t("tg.status.remaining"),
-        mins, secs,
+        format_hm(remaining_seconds),
     );
     if let Some(note) = note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
         body.push_str(&format!("\n💬 {}", note));
@@ -77,18 +75,20 @@ pub fn resolve_if_pending(granted_via: &str, detail: &str) {
 /// entered it - the passcode being used is worth knowing about either way.
 pub fn notify_passcode_extend(source_key: &str, minutes: i32, remaining_seconds: i32) {
     let username = current_windows_username();
-    let mins = remaining_seconds / 60;
-    let secs = remaining_seconds % 60;
+
+    // German needs a trailing infinitive ("...um 30m hinzuzufügen") to
+    // complete the "um...zu" clause started by the header; English has
+    // nothing to add after the amount, so that fragment is empty for it.
+    let amount = join_words(&[&format_hm(minutes * 60), i18n::t("passcode_extend.notify.minutes")]);
 
     let text = format!(
-        "🔓 {} {} {} {} ({})\n⏳ {}: {}:{:02}",
+        "🔓 {} {} {} ({})\n⏳ {}: {}",
         username,
         i18n::t("passcode_extend.notify.header"),
-        minutes,
-        i18n::t("passcode_extend.notify.minutes"),
+        amount,
         i18n::t(source_key),
         i18n::t("tg.status.remaining"),
-        mins, secs,
+        format_hm(remaining_seconds),
     );
 
     let tg = database::get_telegram_config();
@@ -107,8 +107,6 @@ pub fn notify_passcode_extend(source_key: &str, minutes: i32, remaining_seconds:
 /// without having to poll the `status` bot command themselves.
 pub fn notify_activity_status(is_idle: bool, remaining_seconds: i32) {
     let username = current_windows_username();
-    let mins = remaining_seconds / 60;
-    let secs = remaining_seconds % 60;
     let (icon, header_key) = if is_idle {
         ("💤", "activity.notify.idle")
     } else {
@@ -116,12 +114,12 @@ pub fn notify_activity_status(is_idle: bool, remaining_seconds: i32) {
     };
 
     let text = format!(
-        "{} {} {}\n⏳ {}: {}:{:02}",
+        "{} {} {}\n⏳ {}: {}",
         icon,
         username,
         i18n::t(header_key),
         i18n::t("tg.status.remaining"),
-        mins, secs,
+        format_hm(remaining_seconds),
     );
 
     let tg = database::get_telegram_config();
@@ -140,17 +138,15 @@ pub fn notify_activity_status(is_idle: bool, remaining_seconds: i32) {
 /// parent gets the same heads-up without needing to be looking at `status`.
 pub fn notify_low_time(minutes: u32, remaining_seconds: i32) {
     let username = current_windows_username();
-    let mins = remaining_seconds / 60;
-    let secs = remaining_seconds % 60;
 
     let text = format!(
-        "⚠️ {} {} {} {}\n⏳ {}: {}:{:02}",
+        "⚠️ {} {} {} {}\n⏳ {}: {}",
         username,
         i18n::t("warning.notify.header"),
-        minutes,
+        format_hm((minutes * 60) as i32),
         i18n::t("warning.notify.minutes"),
         i18n::t("tg.status.remaining"),
-        mins, secs,
+        format_hm(remaining_seconds),
     );
 
     let tg = database::get_telegram_config();
@@ -188,7 +184,6 @@ pub fn notify_out_of_time() {
 /// whatever date the clock now shows.
 pub fn notify_clock_tamper(drift_secs: i64) {
     let username = current_windows_username();
-    let minutes = drift_secs.unsigned_abs() / 60;
     let direction = if drift_secs >= 0 {
         i18n::t("clock_tamper.notify.forward")
     } else {
@@ -196,12 +191,11 @@ pub fn notify_clock_tamper(drift_secs: i64) {
     };
 
     let text = format!(
-        "🕒 {} {}\n{} {} {}\n{}",
+        "🕒 {} {}\n{} {}\n{}",
         username,
         i18n::t("clock_tamper.notify.header"),
         direction,
-        minutes,
-        i18n::t("clock_tamper.notify.minutes"),
+        format_hm(drift_secs.unsigned_abs() as i32),
         i18n::t("clock_tamper.notify.suffix"),
     );
 

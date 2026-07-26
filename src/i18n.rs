@@ -260,12 +260,14 @@ fn en(key: &str) -> &'static str {
 
         "tg.extend.specify_positive" => "Please specify a positive number of minutes",
         "tg.extend.max_120" => "Maximum extension is 120 minutes",
-        "tg.extend.success" => "Extended by {} minutes\nNew remaining:",
+        "tg.extend.success" => "Extended by",
+        "tg.extend.success_suffix" => "",
 
         "tg.reduce.specify_positive" => "Please specify a positive number of minutes",
         "tg.reduce.max_120" => "Maximum reduction is 120 minutes",
         "tg.reduce.not_enough" => "Cannot reduce - not enough time remaining",
-        "tg.reduce.success" => "Reduced by {} minutes\nNew remaining:",
+        "tg.reduce.success" => "Reduced by",
+        "tg.reduce.success_suffix" => "",
 
         "tg.pause.already_paused" => "Timer is already paused. Use /resume to continue.",
         "tg.pause.idle_paused" => "Timer is already paused (idle). It will resume automatically when input is detected.",
@@ -365,7 +367,7 @@ fn en(key: &str) -> &'static str {
 
         // ----- Passcode-based Extend Notifications -----
         "passcode_extend.notify.header" => "used the passcode to add",
-        "passcode_extend.notify.minutes" => "min",
+        "passcode_extend.notify.minutes" => "",
         "passcode_extend.source.lock_screen" => "lock screen",
         "passcode_extend.source.tray_menu" => "tray menu",
 
@@ -379,14 +381,13 @@ fn en(key: &str) -> &'static str {
         "clock_tamper.notify.header" => "the system clock was just changed on",
         "clock_tamper.notify.forward" => "Moved forward by",
         "clock_tamper.notify.backward" => "Moved back by",
-        "clock_tamper.notify.minutes" => "min",
         "clock_tamper.notify.suffix" => "Continuing to enforce today's remaining time as already tracked - the new date is being ignored until the clock is back in sync.",
 
         // ----- Activity / Low-time / Out-of-time Alerts -----
         "activity.notify.idle" => "went idle - timer paused",
         "activity.notify.active" => "is active again - timer resumed",
         "warning.notify.header" => "has about",
-        "warning.notify.minutes" => "min left",
+        "warning.notify.minutes" => "left",
         "outoftime.notify.header" => "is out of screen time - locked now",
 
         // ----- Telegram Setup Wizard -----
@@ -652,12 +653,14 @@ fn de(key: &str) -> &'static str {
 
         "tg.extend.specify_positive" => "Bitte geben Sie eine positive Minutenzahl an",
         "tg.extend.max_120" => "Maximale Verlängerung ist 120 Minuten",
-        "tg.extend.success" => "Um {} Minuten verlängert\nNeu verbleibend:",
+        "tg.extend.success" => "Um",
+        "tg.extend.success_suffix" => "verlängert",
 
         "tg.reduce.specify_positive" => "Bitte geben Sie eine positive Minutenzahl an",
         "tg.reduce.max_120" => "Maximale Verringerung ist 120 Minuten",
         "tg.reduce.not_enough" => "Kann nicht verringern - nicht genug Zeit verbleibend",
-        "tg.reduce.success" => "Um {} Minuten verringert\nNeu verbleibend:",
+        "tg.reduce.success" => "Um",
+        "tg.reduce.success_suffix" => "verringert",
 
         "tg.pause.already_paused" => "Timer ist bereits pausiert. Verwenden Sie /resume zum Fortsetzen.",
         "tg.pause.idle_paused" => "Timer ist bereits pausiert (Leerlauf). Er wird automatisch fortgesetzt, wenn Eingabe erkannt wird.",
@@ -757,7 +760,7 @@ fn de(key: &str) -> &'static str {
 
         // ----- Passcode-basierte Verlängerungs-Benachrichtigungen -----
         "passcode_extend.notify.header" => "hat den Code verwendet, um",
-        "passcode_extend.notify.minutes" => "Min hinzuzufügen",
+        "passcode_extend.notify.minutes" => "hinzuzufügen",
         "passcode_extend.source.lock_screen" => "Sperrbildschirm",
         "passcode_extend.source.tray_menu" => "Taskleisten-Menü",
 
@@ -771,14 +774,13 @@ fn de(key: &str) -> &'static str {
         "clock_tamper.notify.header" => "die Systemuhr wurde soeben geändert auf",
         "clock_tamper.notify.forward" => "Vorgestellt um",
         "clock_tamper.notify.backward" => "Zurückgestellt um",
-        "clock_tamper.notify.minutes" => "Min",
         "clock_tamper.notify.suffix" => "Das heutige Restguthaben wird wie bisher verfolgt - das neue Datum wird ignoriert, bis die Uhr wieder synchron ist.",
 
         // ----- Aktivitäts-/Restzeit-/Zeitablauf-Benachrichtigungen -----
         "activity.notify.idle" => "ist inaktiv - Timer pausiert",
         "activity.notify.active" => "ist wieder aktiv - Timer läuft weiter",
         "warning.notify.header" => "hat noch etwa",
-        "warning.notify.minutes" => "Min übrig",
+        "warning.notify.minutes" => "übrig",
         "outoftime.notify.header" => "hat keine Bildschirmzeit mehr - jetzt gesperrt",
 
         // ----- Telegram Setup Wizard -----

@@ -15,14 +15,33 @@ pub fn current_windows_username() -> String {
     std::env::var("USERNAME").unwrap_or_else(|_| "?".to_string())
 }
 
+/// Format a duration in seconds as "Xh Ym" (or just "Ym" under an hour) -
+/// used throughout bot-facing text instead of raw MM:SS, for a cleaner,
+/// easier-to-scan report.
+pub fn format_hm(total_seconds: i32) -> String {
+    let total_seconds = total_seconds.max(0);
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    if hours > 0 {
+        format!("{}h {}m", hours, minutes)
+    } else {
+        format!("{}m", minutes)
+    }
+}
+
+/// Join non-empty word fragments with single spaces - for composing
+/// "prefix amount suffix" phrases where a language may need words on either
+/// side of the number (German's "um...zu" constructions) or only one side
+/// (English), without stray double-spaces when a fragment is empty.
+pub fn join_words(parts: &[&str]) -> String {
+    parts.iter().filter(|p| !p.is_empty()).copied().collect::<Vec<_>>().join(" ")
+}
+
 pub fn cmd_status() -> String {
     let remaining = blocking::get_remaining_seconds();
     let paused = mini_overlay::is_paused();
     let idle_paused = mini_overlay::is_idle_paused();
     let pause_budget = mini_overlay::get_remaining_pause_budget();
-
-    let mins = remaining / 60;
-    let secs = remaining % 60;
 
     let status_emoji = if remaining <= 60 {
         "🔴"
@@ -44,26 +63,24 @@ pub fn cmd_status() -> String {
         "{}\n\
          ━━━━━━━━━━━━━━━━━━\n\
          👤 {}: {}\n\
-         {} {}: {}:{:02}\n\
+         {} {}: {}\n\
          ⏸ {}: {}\n\
-         🔋 {}: {} min",
+         🔋 {}: {}",
         i18n::t("tg.status.header"),
         i18n::t("tg.status.user"),
         current_windows_username(),
         status_emoji,
         i18n::t("tg.status.remaining"),
-        mins, secs,
+        format_hm(remaining),
         i18n::t("tg.status.paused"),
         pause_status,
         i18n::t("tg.status.pause_budget"),
-        pause_budget / 60
+        format_hm(pause_budget)
     )
 }
 
 pub fn cmd_time() -> String {
     let remaining = blocking::get_remaining_seconds();
-    let mins = remaining / 60;
-    let secs = remaining % 60;
 
     let emoji = if remaining <= 60 {
         "🔴"
@@ -73,7 +90,7 @@ pub fn cmd_time() -> String {
         "🟢"
     };
 
-    format!("{} {}:{:02} remaining", emoji, mins, secs)
+    format!("{} {} remaining", emoji, format_hm(remaining))
 }
 
 pub fn cmd_extend(minutes: i32) -> String {
@@ -93,14 +110,11 @@ pub fn cmd_extend(minutes: i32) -> String {
 
     // Get new remaining time
     let remaining = blocking::get_remaining_seconds();
-    let new_mins = remaining / 60;
-    let new_secs = remaining % 60;
 
-    format!("✅ {} {} min\n{} {}:{:02}",
-        i18n::t("tg.extend.success").replace("{}", ""),
-        minutes,
+    format!("✅ {}\n{} {}",
+        join_words(&[i18n::t("tg.extend.success"), &format_hm(minutes * 60), i18n::t("tg.extend.success_suffix")]),
         i18n::t("tg.status.remaining"),
-        new_mins, new_secs)
+        format_hm(remaining))
 }
 
 pub fn cmd_reduce(minutes: i32) -> String {
@@ -115,23 +129,20 @@ pub fn cmd_reduce(minutes: i32) -> String {
     let reduction_seconds = minutes * 60;
 
     if reduction_seconds >= current {
-        return format!("{} ({}:{:02})",
+        return format!("{} ({})",
             i18n::t("tg.reduce.not_enough"),
-            current / 60, current % 60);
+            format_hm(current));
     }
 
     blocking::reduce_time(minutes);
 
     // Get new remaining time
     let remaining = blocking::get_remaining_seconds();
-    let new_mins = remaining / 60;
-    let new_secs = remaining % 60;
 
-    format!("⏬ {} {} min\n{} {}:{:02}",
-        i18n::t("tg.reduce.success").replace("{}", ""),
-        minutes,
+    format!("⏬ {}\n{} {}",
+        join_words(&[i18n::t("tg.reduce.success"), &format_hm(minutes * 60), i18n::t("tg.reduce.success_suffix")]),
         i18n::t("tg.status.remaining"),
-        new_mins, new_secs)
+        format_hm(remaining))
 }
 
 pub fn cmd_pause() -> String {
@@ -169,10 +180,15 @@ pub fn cmd_resume() -> String {
 pub fn cmd_weekly() -> String {
     let history = database::get_daily_usage_history(14);
 
-    let mut table = format!("{:<6}{:>6}{:>8}\n", "Date", "Used", "Paused");
+    let mut table = format!("{:<6}{:>8}{:>9}\n", "Date", "Used", "Paused");
     for (date, active_min, pause_min) in &history {
         let short_date = date.get(5..).unwrap_or(date); // MM-DD
-        table.push_str(&format!("{:<6}{:>5}m{:>7}m\n", short_date, active_min, pause_min));
+        table.push_str(&format!(
+            "{:<6}{:>8}{:>9}\n",
+            short_date,
+            format_hm(active_min * 60),
+            format_hm(pause_min * 60)
+        ));
     }
 
     format!(
@@ -197,21 +213,13 @@ pub fn cmd_history() -> String {
         current_windows_username(),
     );
 
-    // Format uptime
-    let hours = session_active / 3600;
-    let minutes = (session_active % 3600) / 60;
-    let seconds = session_active % 60;
-    if hours > 0 {
-        response.push_str(&format!("⏱ {} {}h {}m {}s\n", i18n::t("tg.history.uptime"), hours, minutes, seconds));
-    } else {
-        response.push_str(&format!("⏱ {} {}m {}s\n", i18n::t("tg.history.uptime"), minutes, seconds));
-    }
+    response.push_str(&format!("⏱ {} {}\n", i18n::t("tg.history.uptime"), format_hm(session_active)));
 
     response.push_str(&format!(
-        "⏸ {} {} / {} min\n\n",
+        "⏸ {} {} / {}\n\n",
         i18n::t("tg.history.pause_used"),
-        pause_used / 60,
-        pause_config.daily_budget_minutes
+        format_hm(pause_used),
+        format_hm((pause_config.daily_budget_minutes * 60) as i32)
     ));
 
     if log.is_empty() {
@@ -342,11 +350,11 @@ pub fn cmd_setlimit(args: &str) -> String {
     }
 
     format!(
-        "📅 {} {} {} {} min",
+        "📅 {} {} {} {}",
         i18n::t("tg.setlimit.success"),
         i18n::weekday(weekday as usize),
         i18n::t("tg.setlimit.to"),
-        minutes
+        format_hm((minutes * 60) as i32)
     )
 }
 
@@ -365,12 +373,11 @@ pub fn cmd_reset() -> String {
     }
 
     format!(
-        "🔄 {} ({} min)\n{} {}:{:02}",
+        "🔄 {} ({})\n{} {}",
         i18n::t("tg.reset.success"),
-        daily_limit_minutes,
+        format_hm((daily_limit_minutes * 60) as i32),
         i18n::t("tg.reset.remaining"),
-        daily_limit_seconds / 60,
-        daily_limit_seconds % 60
+        format_hm(daily_limit_seconds)
     )
 }
 
@@ -411,10 +418,10 @@ pub fn format_pause_reason(reason: mini_overlay::PauseBlockedReason) -> String {
         mini_overlay::PauseBlockedReason::Disabled => i18n::t("pause.disabled").to_string(),
         mini_overlay::PauseBlockedReason::BudgetExhausted => i18n::t("pause.budget_exhausted").to_string(),
         mini_overlay::PauseBlockedReason::CooldownActive { seconds_remaining } => {
-            format!("{} ({}s)", i18n::t("pause.cooldown"), seconds_remaining)
+            format!("{} ({})", i18n::t("pause.cooldown"), format_hm(seconds_remaining))
         }
         mini_overlay::PauseBlockedReason::MinActiveTimeNotMet { seconds_remaining } => {
-            format!("{} ({}s)", i18n::t("pause.min_active"), seconds_remaining)
+            format!("{} ({})", i18n::t("pause.min_active"), format_hm(seconds_remaining))
         }
         mini_overlay::PauseBlockedReason::TimeTooLow => i18n::t("pause.time_too_low").to_string(),
     }

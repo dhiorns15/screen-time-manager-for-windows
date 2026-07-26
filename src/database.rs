@@ -537,7 +537,7 @@ fn resync_clock_anchor(now_wall: i64, now_tick: i64, date: &str) {
 /// that's not elapsed time - it's the clock being moved - so "today" stays
 /// pinned to the last known-good date until the real clock drifts back
 /// within tolerance on its own.
-fn effective_today_date() -> String {
+pub fn effective_today_date() -> String {
     let today = get_today_date();
     let now_wall = wall_clock_now_secs();
     let now_tick = monotonic_now_ms();
