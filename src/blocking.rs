@@ -306,6 +306,27 @@ unsafe fn check_blocking_passcode() -> bool {
     false
 }
 
+// The passcode EDIT control owns keyboard focus once created, so WM_KEYDOWN
+// never reaches blocking_overlay_proc below it (Win32 routes key messages to
+// the focused window, not its parent) - the VK_RETURN handling further down
+// would otherwise be dead code. Subclassing the edit control to relay just
+// that key up to the parent lets the existing handler do the rest unchanged.
+unsafe extern "system" fn passcode_edit_subclass_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_KEYDOWN && wparam.0 == VK_RETURN.0 as usize {
+        if let Ok(parent) = GetParent(hwnd) {
+            SendMessageW(parent, msg, wparam, lparam);
+        }
+        return LRESULT(0);
+    }
+    let orig_proc: WNDPROC = std::mem::transmute(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    CallWindowProcW(orig_proc, hwnd, msg, wparam, lparam)
+}
+
 pub unsafe extern "system" fn blocking_overlay_proc(
     hwnd: HWND,
     msg: u32,
@@ -434,6 +455,8 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                     w!("Segoe UI"),
                 );
                 SendMessageW(e, WM_SETFONT, WPARAM(hfont.0 as usize), LPARAM(1));
+                let orig = SetWindowLongPtrW(e, GWLP_WNDPROC, passcode_edit_subclass_proc as *const () as isize);
+                SetWindowLongPtrW(e, GWLP_USERDATA, orig);
             }
 
             // Unlock button

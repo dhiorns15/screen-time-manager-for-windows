@@ -101,3 +101,37 @@ pub fn notify_passcode_extend(source_key: &str, minutes: i32, remaining_seconds:
         discord::notify_admin(&text);
     }
 }
+
+/// Called when `database::take_pending_clock_tamper_alert` reports a newly
+/// detected system-clock jump - the app is continuing to enforce today's
+/// limit as already tracked rather than granting a fresh allowance for
+/// whatever date the clock now shows.
+pub fn notify_clock_tamper(drift_secs: i64) {
+    let username = current_windows_username();
+    let minutes = drift_secs.unsigned_abs() / 60;
+    let direction = if drift_secs >= 0 {
+        i18n::t("clock_tamper.notify.forward")
+    } else {
+        i18n::t("clock_tamper.notify.backward")
+    };
+
+    let text = format!(
+        "🕒 {} {}\n{} {} {}\n{}",
+        username,
+        i18n::t("clock_tamper.notify.header"),
+        direction,
+        minutes,
+        i18n::t("clock_tamper.notify.minutes"),
+        i18n::t("clock_tamper.notify.suffix"),
+    );
+
+    let tg = database::get_telegram_config();
+    let dc = database::get_discord_config();
+
+    if tg.enabled {
+        telegram::notify_admin(&text);
+    }
+    if dc.enabled {
+        discord::notify_admin(&text);
+    }
+}

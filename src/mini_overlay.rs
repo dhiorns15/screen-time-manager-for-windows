@@ -471,6 +471,10 @@ pub unsafe extern "system" fn mini_overlay_proc(
                             // Also save session active time
                             let active = SESSION_ACTIVE_SECONDS.load(Ordering::SeqCst);
                             database::save_session_active_time(active);
+
+                            if let Some(drift) = database::take_pending_clock_tamper_alert() {
+                                crate::time_request::notify_clock_tamper(drift);
+                            }
                         }
 
                         // Check for warning 1 (e.g., 10 minutes remaining)

@@ -372,6 +372,13 @@ fn en(key: &str) -> &'static str {
         "watchdog.alert.restart_failed" => "and the automatic restart failed - please check on it.",
         "watchdog.alert.suffix" => "If you didn't do this yourself (e.g. via Quit), this may be an attempt to bypass the time limit.",
 
+        // ----- Clock Tamper Alert -----
+        "clock_tamper.notify.header" => "the system clock was just changed on",
+        "clock_tamper.notify.forward" => "Moved forward by",
+        "clock_tamper.notify.backward" => "Moved back by",
+        "clock_tamper.notify.minutes" => "min",
+        "clock_tamper.notify.suffix" => "Continuing to enforce today's remaining time as already tracked - the new date is being ignored until the clock is back in sync.",
+
         // ----- Telegram Setup Wizard -----
         "wizard.title" => "Telegram Setup Wizard",
         "wizard.step" => "Step",
@@ -746,6 +753,13 @@ fn de(key: &str) -> &'static str {
         "watchdog.alert.restarted" => "und wurde soeben neu gestartet.",
         "watchdog.alert.restart_failed" => "und der automatische Neustart ist fehlgeschlagen - bitte überprüfen.",
         "watchdog.alert.suffix" => "Wenn Sie das nicht selbst getan haben (z.B. über Beenden), könnte dies ein Versuch sein, das Zeitlimit zu umgehen.",
+
+        // ----- Uhrzeit-Manipulationswarnung -----
+        "clock_tamper.notify.header" => "die Systemuhr wurde soeben geändert auf",
+        "clock_tamper.notify.forward" => "Vorgestellt um",
+        "clock_tamper.notify.backward" => "Zurückgestellt um",
+        "clock_tamper.notify.minutes" => "Min",
+        "clock_tamper.notify.suffix" => "Das heutige Restguthaben wird wie bisher verfolgt - das neue Datum wird ignoriert, bis die Uhr wieder synchron ist.",
 
         // ----- Telegram Setup Wizard -----
         "wizard.title" => "Telegram Einrichtungsassistent",

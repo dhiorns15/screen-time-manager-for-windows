@@ -411,9 +411,106 @@ fn get_today_date() -> String {
     format!("{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay)
 }
 
+/// How far the wall clock is allowed to stray from where the monotonic
+/// anchor says it should be before it's treated as tampering rather than
+/// legitimate drift (NTP correction, a clock that was slightly wrong, etc).
+const CLOCK_DRIFT_TOLERANCE_SECS: i64 = 15 * 60;
+
+fn wall_clock_now_secs() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn monotonic_now_ms() -> i64 {
+    use windows::Win32::System::SystemInformation::GetTickCount64;
+    unsafe { GetTickCount64() as i64 }
+}
+
+/// Re-point the clock anchor at the current (trusted) wall-clock/date, and
+/// clear any tamper flag - called whenever the wall clock is judged trustworthy.
+fn resync_clock_anchor(now_wall: i64, now_tick: i64, date: &str) {
+    set_setting("clock_anchor_wall_secs", &now_wall.to_string());
+    set_setting("clock_anchor_tick_ms", &now_tick.to_string());
+    set_setting("clock_anchor_date", date);
+    if get_setting("clock_tamper_active").as_deref() == Some("1") {
+        set_setting("clock_tamper_active", "0");
+        set_setting("clock_tamper_alerted", "0");
+    }
+}
+
+/// The date to use for all "today"-scoped enforcement state (remaining time,
+/// pause allowance, session tracking), gated against system-clock manipulation.
+///
+/// Plain `get_today_date()` is exactly what a kid can move to get a fresh
+/// daily allowance: change the date, then get the app to restart (kill it -
+/// the watchdog relaunches it within a minute anyway) so the loaded state
+/// finds no row for the "new" date and grants a full day. To catch that, a
+/// monotonic anchor (wall-clock time + `GetTickCount64` uptime, which only
+/// moves via an actual reboot, not the Date & Time settings) is persisted
+/// alongside every save. If the real wall clock ever strays more than
+/// `CLOCK_DRIFT_TOLERANCE_SECS` from where the anchor says it should be,
+/// that's not elapsed time - it's the clock being moved - so "today" stays
+/// pinned to the last known-good date until the real clock drifts back
+/// within tolerance on its own.
+fn effective_today_date() -> String {
+    let today = get_today_date();
+    let now_wall = wall_clock_now_secs();
+    let now_tick = monotonic_now_ms();
+
+    let anchor = get_setting("clock_anchor_wall_secs")
+        .and_then(|s| s.parse::<i64>().ok())
+        .zip(get_setting("clock_anchor_tick_ms").and_then(|s| s.parse::<i64>().ok()))
+        .zip(get_setting("clock_anchor_date"));
+
+    let Some(((anchor_wall, anchor_tick), anchor_date)) = anchor else {
+        // First run ever - nothing to compare against yet.
+        resync_clock_anchor(now_wall, now_tick, &today);
+        return today;
+    };
+
+    if now_tick < anchor_tick {
+        // The machine rebooted since the last anchor, so the tick counter
+        // reset and can't sanity-check the wall clock across that gap.
+        // Accept the current time and start fresh from here.
+        resync_clock_anchor(now_wall, now_tick, &today);
+        return today;
+    }
+
+    let expected_wall = anchor_wall + (now_tick - anchor_tick) / 1000;
+    let drift = now_wall - expected_wall;
+
+    if drift.abs() <= CLOCK_DRIFT_TOLERANCE_SECS {
+        resync_clock_anchor(now_wall, now_tick, &today);
+        today
+    } else {
+        set_setting("clock_tamper_active", "1");
+        set_setting("clock_tamper_drift_secs", &drift.to_string());
+        anchor_date
+    }
+}
+
+/// Returns the drift (signed seconds) the first time a clock-tamper episode
+/// is observed, so callers can send exactly one alert per episode instead of
+/// re-notifying on every periodic save while the clock stays off. `None` both
+/// while no episode is active and after one has already been alerted on.
+pub fn take_pending_clock_tamper_alert() -> Option<i64> {
+    if get_setting("clock_tamper_active").as_deref() != Some("1") {
+        return None;
+    }
+    if get_setting("clock_tamper_alerted").as_deref() == Some("1") {
+        return None;
+    }
+    let drift: i64 = get_setting("clock_tamper_drift_secs")?.parse().ok()?;
+    set_setting("clock_tamper_alerted", "1");
+    Some(drift)
+}
+
 /// Save remaining time to database (associated with current date)
 pub fn save_remaining_time(seconds: i32) {
-    let date = get_today_date();
+    let date = effective_today_date();
     let key = format!("remaining_time_{}", date);
     set_setting(&key, &seconds.to_string());
 }
@@ -421,7 +518,7 @@ pub fn save_remaining_time(seconds: i32) {
 /// Load remaining time from database for today
 #[allow(dead_code)]
 pub fn load_remaining_time() -> Option<i32> {
-    let date = get_today_date();
+    let date = effective_today_date();
     let key = format!("remaining_time_{}", date);
     get_setting(&key).and_then(|s| s.parse().ok())
 }
@@ -491,7 +588,7 @@ pub fn get_pause_config() -> PauseConfig {
 
 /// Get pause time used today (in seconds)
 pub fn get_pause_used_today() -> i32 {
-    let date = get_today_date();
+    let date = effective_today_date();
     let key = format!("pause_used_{}", date);
     get_setting(&key)
         .and_then(|s| s.parse().ok())
@@ -500,7 +597,7 @@ pub fn get_pause_used_today() -> i32 {
 
 /// Save pause time used today (in seconds)
 pub fn save_pause_used_today(seconds: i32) {
-    let date = get_today_date();
+    let date = effective_today_date();
     let key = format!("pause_used_{}", date);
     set_setting(&key, &seconds.to_string());
 }
@@ -537,7 +634,7 @@ pub fn get_current_timestamp() -> i64 {
 
 /// Get the session start time used today (in seconds) - tracks when timer started today
 pub fn get_session_active_time() -> i32 {
-    let date = get_today_date();
+    let date = effective_today_date();
     let key = format!("session_active_{}", date);
     get_setting(&key)
         .and_then(|s| s.parse().ok())
@@ -546,7 +643,7 @@ pub fn get_session_active_time() -> i32 {
 
 /// Save session active time (in seconds)
 pub fn save_session_active_time(seconds: i32) {
-    let date = get_today_date();
+    let date = effective_today_date();
     let key = format!("session_active_{}", date);
     set_setting(&key, &seconds.to_string());
 }

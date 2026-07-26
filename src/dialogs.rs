@@ -7,9 +7,9 @@ use windows::{
     Win32::{
         Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::Gdi::{
-            BeginPaint, CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteObject,
+            BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject,
             DrawTextW, Ellipse, EndPaint, FillRect, InvalidateRect, LineTo, MoveToEx, SelectObject,
-            SetBkMode, SetTextColor, SetWindowRgn, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK,
+            SetBkMode, SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK,
             FW_BOLD, FW_NORMAL, HDC, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
         },
         System::LibraryLoader::GetModuleHandleW,
@@ -85,6 +85,28 @@ pub unsafe fn verify_passcode_for_quit(parent_hwnd: HWND) -> bool {
     DIALOG_RESULT = None;
     DIALOG_ERROR = false;
 
+    // A plain WS_CHILD EDIT control owns keyboard focus once created, so
+    // WM_KEYDOWN never reaches this dialog's own window proc below (Win32
+    // routes key messages to the focused window, not its parent) - the
+    // VK_RETURN/VK_ESCAPE handling further down would otherwise be dead code.
+    // Subclassing the edit control to relay just those two keys up to the
+    // parent lets the existing dialog-level handler do the rest unchanged.
+    unsafe extern "system" fn edit_subclass_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if msg == WM_KEYDOWN && (wparam.0 == VK_RETURN.0 as usize || wparam.0 == VK_ESCAPE.0 as usize) {
+            if let Ok(parent) = GetParent(hwnd) {
+                SendMessageW(parent, msg, wparam, lparam);
+            }
+            return LRESULT(0);
+        }
+        let orig_proc: WNDPROC = std::mem::transmute(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        CallWindowProcW(orig_proc, hwnd, msg, wparam, lparam)
+    }
+
     unsafe extern "system" fn dialog_proc(
         hwnd: HWND,
         msg: u32,
@@ -119,6 +141,8 @@ pub unsafe fn verify_passcode_for_quit(parent_hwnd: HWND) -> bool {
                         w!("Segoe UI"),
                     );
                     SendMessageW(e, WM_SETFONT, WPARAM(hfont.0 as usize), LPARAM(1));
+                    let orig = SetWindowLongPtrW(e, GWLP_WNDPROC, edit_subclass_proc as *const () as isize);
+                    SetWindowLongPtrW(e, GWLP_USERDATA, orig);
                     let _ = SetFocus(e);
                 }
 
@@ -311,9 +335,6 @@ pub unsafe fn verify_passcode_for_quit(parent_hwnd: HWND) -> bool {
     );
 
     if let Ok(dlg) = dialog_hwnd {
-        let rgn = CreateRoundRectRgn(0, 0, dialog_width, dialog_height, scale(10), scale(10));
-        SetWindowRgn(dlg, rgn, true);
-
         let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
 
@@ -1297,9 +1318,6 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
     );
 
     if let Ok(dlg) = dialog_hwnd {
-        let rgn = CreateRoundRectRgn(0, 0, dialog_width, dialog_height, scale(10), scale(10));
-        SetWindowRgn(dlg, rgn, true);
-
         let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
 
@@ -1661,9 +1679,6 @@ pub unsafe fn show_stats_dialog(parent_hwnd: HWND) {
     );
 
     if let Ok(dlg) = dialog_hwnd {
-        let rgn = CreateRoundRectRgn(0, 0, dialog_width, dialog_height, scale(10), scale(10));
-        SetWindowRgn(dlg, rgn, true);
-
         let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
 
@@ -1742,9 +1757,6 @@ pub unsafe fn show_telegram_wizard(parent_hwnd: HWND) {
 
     if let Ok(hwnd) = wizard_hwnd {
         WIZARD_HWND = Some(hwnd);
-        let rgn = CreateRoundRectRgn(0, 0, dialog_width, dialog_height, scale(12), scale(12));
-        SetWindowRgn(hwnd, rgn, true);
-
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
 
@@ -2620,9 +2632,6 @@ pub unsafe fn show_discord_wizard(parent_hwnd: HWND) {
     );
 
     if let Ok(hwnd) = wizard_hwnd {
-        let rgn = CreateRoundRectRgn(0, 0, dialog_width, dialog_height, scale(12), scale(12));
-        SetWindowRgn(hwnd, rgn, true);
-
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
 
