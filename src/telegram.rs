@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use teloxide::prelude::*;
 use teloxide::error_handlers::LoggingErrorHandler;
+use teloxide::types::ParseMode;
 use teloxide::utils::command::BotCommands;
 
 use crate::database;
@@ -12,7 +13,7 @@ use crate::i18n;
 use crate::remote_commands::{
     cmd_extend, cmd_getpin, cmd_history, cmd_lock, cmd_msg, cmd_pause, cmd_reduce, cmd_reset,
     cmd_resume, cmd_rotatingpin, cmd_setlimit, cmd_setmessage, cmd_setpin, cmd_status, cmd_time,
-    cmd_unlock,
+    cmd_unlock, cmd_weekly,
 };
 use crate::time_request;
 
@@ -44,6 +45,8 @@ enum Command {
     Resume,
     #[command(description = "Show today's pause activity")]
     History,
+    #[command(description = "Show a 2-week usage table")]
+    Weekly,
     #[command(description = "Show a message on screen (e.g., /msg Do your homework!)")]
     Msg(String),
     #[command(description = "Lock the screen")]
@@ -277,6 +280,12 @@ async fn handle_command(
         _ => None,
     };
 
+    // The weekly table is sent as a MarkdownV2 code block so it actually
+    // lines up as a table client-side - every other command's response is
+    // sent as plain text, so this needs to be known before `cmd` is consumed
+    // by the match below.
+    let is_weekly = matches!(&cmd, Command::Weekly);
+
     let response = match cmd {
         Command::Start => unreachable!(), // Handled above
         Command::Status => cmd_status(),
@@ -286,6 +295,7 @@ async fn handle_command(
         Command::Pause => cmd_pause(),
         Command::Resume => cmd_resume(),
         Command::History => cmd_history(),
+        Command::Weekly => cmd_weekly(),
         Command::Msg(text) => cmd_msg(&text),
         Command::Lock => cmd_lock(),
         Command::Stop => cmd_lock(),
@@ -307,7 +317,11 @@ async fn handle_command(
         time_request::resolve_if_pending("Telegram", &detail);
     }
 
-    bot.send_message(msg.chat.id, response).await?;
+    if is_weekly {
+        bot.send_message(msg.chat.id, response).parse_mode(ParseMode::MarkdownV2).await?;
+    } else {
+        bot.send_message(msg.chat.id, response).await?;
+    }
     Ok(())
 }
 

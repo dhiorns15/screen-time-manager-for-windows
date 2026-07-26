@@ -411,6 +411,88 @@ fn get_today_date() -> String {
     format!("{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay)
 }
 
+/// Days since 1970-01-01 for a (proleptic Gregorian) date - Howard Hinnant's
+/// well-known `days_from_civil` algorithm. Exact for every month/year length,
+/// unlike the flat-30-days-per-month approximation `get_current_timestamp`
+/// uses (fine for that function's short-duration cooldown math, but wrong by
+/// design for walking back real calendar dates here).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Inverse of `days_from_civil`.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// The date `n` days before `date` (a "YYYY-MM-DD" string), computed exactly.
+fn date_n_days_before(date: &str, n: i64) -> String {
+    let parts: Vec<i64> = date.splitn(3, '-').filter_map(|p| p.parse().ok()).collect();
+    let [y, m, d] = parts[..] else { return date.to_string() };
+    let (y, m, d) = civil_from_days(days_from_civil(y, m, d) - n);
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+/// How many days of per-day enforcement/usage data to keep around.
+const DAILY_DATA_RETENTION_DAYS: i64 = 14;
+
+/// Usage for the last `days` calendar days (oldest first): date, minutes
+/// actively used, minutes spent paused. Used for the bot's multi-day report.
+pub fn get_daily_usage_history(days: u32) -> Vec<(String, i32, i32)> {
+    let today = effective_today_date();
+    (0..days as i64)
+        .rev()
+        .map(|n| {
+            let date = date_n_days_before(&today, n);
+            let active = get_setting(&format!("session_active_{}", date))
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(0)
+                / 60;
+            let paused = get_setting(&format!("pause_used_{}", date))
+                .and_then(|s| s.parse::<i32>().ok())
+                .unwrap_or(0)
+                / 60;
+            (date, active, paused)
+        })
+        .collect()
+}
+
+/// Delete per-day enforcement/usage rows older than
+/// `DAILY_DATA_RETENTION_DAYS`, so the settings table doesn't grow forever -
+/// every "today"-scoped key (remaining time, pause usage, session tracking,
+/// pause log) accumulates one row per calendar day with nothing else ever
+/// cleaning them up. Safe to call often; cheap no-op once nothing qualifies.
+pub fn prune_old_daily_data() {
+    let cutoff = date_n_days_before(&effective_today_date(), DAILY_DATA_RETENTION_DAYS);
+
+    let Ok(guard) = DB_CONNECTION.lock() else { return };
+    let Some(conn) = guard.as_ref() else { return };
+
+    for prefix in ["remaining_time_", "session_active_", "pause_used_", "pause_log_"] {
+        let pattern = format!("{}%", prefix);
+        let _ = conn.execute(
+            "DELETE FROM settings WHERE key LIKE ?1 AND substr(key, ?2) < ?3",
+            params![pattern, (prefix.len() + 1) as i64, cutoff],
+        );
+    }
+}
+
 /// How far the wall clock is allowed to stray from where the monotonic
 /// anchor says it should be before it's treated as tampering rather than
 /// legitimate drift (NTP correction, a clock that was slightly wrong, etc).

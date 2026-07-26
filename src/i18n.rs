@@ -284,6 +284,8 @@ fn en(key: &str) -> &'static str {
         "tg.history.pause_used" => "Pause used:",
         "tg.history.no_events" => "No pause events today",
 
+        "tg.weekly.header" => "2-Week Usage",
+
         "tg.msg.provide" => "Please provide a message, e.g. /msg Do your homework!",
         "tg.msg.shown" => "Message shown:",
 
@@ -334,6 +336,7 @@ fn en(key: &str) -> &'static str {
         "dc.cmd.pause" => "Pause the timer",
         "dc.cmd.resume" => "Resume the timer",
         "dc.cmd.history" => "Show today's pause activity",
+        "dc.cmd.weekly" => "Show a 2-week usage table",
         "dc.cmd.msg" => "Show a message on screen (e.g., !msg Do your homework!)",
         "dc.cmd.lock" => "Lock the screen",
         "dc.cmd.unlock" => "Unlock without changing remaining time (only if time is left)",
@@ -673,6 +676,8 @@ fn de(key: &str) -> &'static str {
         "tg.history.pause_used" => "Pause genutzt:",
         "tg.history.no_events" => "Keine Pause-Ereignisse heute",
 
+        "tg.weekly.header" => "Nutzung der letzten 2 Wochen",
+
         "tg.msg.provide" => "Bitte geben Sie eine Nachricht an, z.B. /msg Mach deine Hausaufgaben!",
         "tg.msg.shown" => "Nachricht angezeigt:",
 
@@ -723,6 +728,7 @@ fn de(key: &str) -> &'static str {
         "dc.cmd.pause" => "Timer pausieren",
         "dc.cmd.resume" => "Timer fortsetzen",
         "dc.cmd.history" => "Heutige Pause-Aktivität anzeigen",
+        "dc.cmd.weekly" => "2-Wochen-Nutzungstabelle anzeigen",
         "dc.cmd.msg" => "Nachricht anzeigen (z.B. !msg Mach deine Hausaufgaben!)",
         "dc.cmd.lock" => "Bildschirm sperren",
         "dc.cmd.unlock" => "Entsperren ohne verbleibende Zeit zu ändern (nur wenn noch Zeit übrig ist)",

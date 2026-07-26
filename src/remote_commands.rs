@@ -164,6 +164,26 @@ pub fn cmd_resume() -> String {
     }
 }
 
+/// 14-day usage table (minutes active / paused per day), sent as a monospace
+/// code block so it lines up as an actual table in Telegram/Discord.
+pub fn cmd_weekly() -> String {
+    let history = database::get_daily_usage_history(14);
+
+    let mut table = format!("{:<6}{:>6}{:>8}\n", "Date", "Used", "Paused");
+    for (date, active_min, pause_min) in &history {
+        let short_date = date.get(5..).unwrap_or(date); // MM-DD
+        table.push_str(&format!("{:<6}{:>5}m{:>7}m\n", short_date, active_min, pause_min));
+    }
+
+    format!(
+        "📊 {}\n👤 {}: {}\n```\n{}```",
+        i18n::t("tg.weekly.header"),
+        i18n::t("tg.status.user"),
+        current_windows_username(),
+        table,
+    )
+}
+
 pub fn cmd_history() -> String {
     let log = database::get_pause_log_today();
     let pause_used = database::get_pause_used_today();

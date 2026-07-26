@@ -85,6 +85,10 @@ fn main() {
             return;
         }
 
+        // Housekeeping: drop per-day usage/enforcement rows older than the
+        // retention window now that the database is open.
+        database::prune_old_daily_data();
+
         // Initialize the shared machine-wide database (bot config); safe to
         // fail (e.g. missing permissions), falls back to per-account storage
         database::init_shared_database();
