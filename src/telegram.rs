@@ -2,7 +2,7 @@
 //! Provides remote monitoring and control via Telegram commands
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use teloxide::prelude::*;
 use teloxide::error_handlers::LoggingErrorHandler;
 use teloxide::types::ParseMode;
@@ -40,8 +40,12 @@ static BOT_INSTANCE: Mutex<Option<Bot>> = Mutex::new(None);
 /// overlapping bot instances alive at once.
 static BOT_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 
-/// Admin chat ID for notifications
-static ADMIN_CHAT_ID: OnceLock<i64> = OnceLock::new();
+/// Admin chat ID for notifications. A Mutex rather than a OnceLock for the
+/// same reason as BOT_INSTANCE above - it also needs to track the current
+/// config, not just the first-ever value, since the admin could change the
+/// configured chat ID in Settings while a bot generation from before that
+/// change is still using the old one, or across a session-handoff restart.
+static ADMIN_CHAT_ID: Mutex<Option<i64>> = Mutex::new(None);
 
 #[derive(BotCommands, Clone, Debug)]
 #[command(rename_rule = "lowercase", description = "Screen Time Manager commands:")]
@@ -126,10 +130,9 @@ pub fn start_bot_thread() {
 
     let admin_chat_id = config.admin_chat_id;
 
-    // Store admin chat ID for notifications
-    if let Some(id) = admin_chat_id {
-        let _ = ADMIN_CHAT_ID.set(id);
-    }
+    // Store admin chat ID for notifications - always overwrite, in case it
+    // changed in Settings since the last time a bot generation started.
+    *ADMIN_CHAT_ID.lock().unwrap() = admin_chat_id;
 
     // Wait for the previous generation's thread to fully exit before
     // resetting BOT_SHUTDOWN and spawning a new one - see BOT_THREAD.
@@ -143,10 +146,19 @@ pub fn start_bot_thread() {
     BOT_SHUTDOWN.store(false, Ordering::SeqCst);
 
     let handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-        rt.block_on(async {
-            run_bot(token, admin_chat_id).await;
-        });
+        // Unlike a one-shot startup failure, this runs on every bot-thread
+        // generation (each Fast-User-Switching hand-off spawns a fresh one -
+        // see session.rs) - panicking here would be the exact mistake
+        // add_tray_icon used to make, just with a resource-exhaustion
+        // trigger instead of a shell-not-ready one. BOT_INSTANCE/BOT_RUNNING
+        // still need resetting on failure so a bad runtime creation can't
+        // wedge them true/Some forever and block every later restart.
+        match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt.block_on(async {
+                run_bot(token, admin_chat_id).await;
+            }),
+            Err(e) => eprintln!("[Telegram] Failed to create tokio runtime: {e}"),
+        }
         *BOT_INSTANCE.lock().unwrap() = None;
         BOT_RUNNING.store(false, Ordering::SeqCst);
     });
@@ -168,7 +180,8 @@ pub fn stop_bot_thread() {
 /// from the blocking overlay). No-op if the bot isn't connected/configured.
 pub fn notify_admin(text: &str) {
     let bot = BOT_INSTANCE.lock().unwrap().clone();
-    if let (Some(bot), Some(&chat_id)) = (bot, ADMIN_CHAT_ID.get()) {
+    let chat_id = *ADMIN_CHAT_ID.lock().unwrap();
+    if let (Some(bot), Some(chat_id)) = (bot, chat_id) {
         let text = text.to_string();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().ok();
@@ -187,7 +200,8 @@ pub fn signal_shutdown() {
 
     // Send shutdown notification if possible
     let bot = BOT_INSTANCE.lock().unwrap().clone();
-    if let (Some(bot), Some(&chat_id)) = (bot, ADMIN_CHAT_ID.get()) {
+    let chat_id = *ADMIN_CHAT_ID.lock().unwrap();
+    if let (Some(bot), Some(chat_id)) = (bot, chat_id) {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().ok();
             if let Some(rt) = rt {

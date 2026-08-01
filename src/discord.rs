@@ -2,7 +2,7 @@
 //! Provides remote monitoring and control via a Discord bot listening in one channel
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serenity::all::{ChannelId, GatewayIntents, Http, Message, Ready};
@@ -42,8 +42,12 @@ static BOT_HTTP: Mutex<Option<Arc<Http>>> = Mutex::new(None);
 /// teardown, leaving two overlapping Discord gateway clients alive at once.
 static BOT_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 
-/// Channel notifications are posted to
-static NOTIFY_CHANNEL_ID: OnceLock<u64> = OnceLock::new();
+/// Channel notifications are posted to. A Mutex rather than a OnceLock for
+/// the same reason as BOT_HTTP above - it also needs to track the current
+/// config, not just the first-ever value, since the admin could change the
+/// configured channel in Settings while a bot generation from before that
+/// change is still using the old one, or across a session-handoff restart.
+static NOTIFY_CHANNEL_ID: Mutex<Option<u64>> = Mutex::new(None);
 
 struct Handler {
     channel_id: u64,
@@ -242,10 +246,19 @@ pub fn start_bot_thread() {
     BOT_SHUTDOWN.store(false, Ordering::SeqCst);
 
     let handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-        rt.block_on(async {
-            run_bot(token, channel_id, admin_user_id).await;
-        });
+        // Unlike a one-shot startup failure, this runs on every bot-thread
+        // generation (each Fast-User-Switching hand-off spawns a fresh one -
+        // see session.rs) - panicking here would be the exact mistake
+        // add_tray_icon used to make, just with a resource-exhaustion
+        // trigger instead of a shell-not-ready one. BOT_HTTP/BOT_RUNNING
+        // still need resetting on failure so a bad runtime creation can't
+        // wedge them true/Some forever and block every later restart.
+        match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt.block_on(async {
+                run_bot(token, channel_id, admin_user_id).await;
+            }),
+            Err(e) => eprintln!("[Discord] Failed to create tokio runtime: {e}"),
+        }
         *BOT_HTTP.lock().unwrap() = None;
         BOT_RUNNING.store(false, Ordering::SeqCst);
     });
@@ -267,7 +280,8 @@ pub fn stop_bot_thread() {
 /// from the blocking overlay). No-op if the bot isn't connected/configured.
 pub fn notify_admin(text: &str) {
     let http = BOT_HTTP.lock().unwrap().clone();
-    if let (Some(http), Some(&channel_id)) = (http, NOTIFY_CHANNEL_ID.get()) {
+    let channel_id = *NOTIFY_CHANNEL_ID.lock().unwrap();
+    if let (Some(http), Some(channel_id)) = (http, channel_id) {
         let text = text.to_string();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().ok();
@@ -285,7 +299,8 @@ pub fn signal_shutdown() {
     BOT_SHUTDOWN.store(true, Ordering::SeqCst);
 
     let http = BOT_HTTP.lock().unwrap().clone();
-    if let (Some(http), Some(&channel_id)) = (http, NOTIFY_CHANNEL_ID.get()) {
+    let channel_id = *NOTIFY_CHANNEL_ID.lock().unwrap();
+    if let (Some(http), Some(channel_id)) = (http, channel_id) {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().ok();
             if let Some(rt) = rt {
@@ -314,7 +329,9 @@ async fn run_bot(token: String, channel_id: u64, admin_user_id: Option<u64>) {
     };
 
     *BOT_HTTP.lock().unwrap() = Some(client.http.clone());
-    let _ = NOTIFY_CHANNEL_ID.set(channel_id);
+    // Always overwrite, in case it changed in Settings since the last time a
+    // bot generation started - see NOTIFY_CHANNEL_ID.
+    *NOTIFY_CHANNEL_ID.lock().unwrap() = Some(channel_id);
 
     let shard_manager = client.shard_manager.clone();
     tokio::spawn(async move {

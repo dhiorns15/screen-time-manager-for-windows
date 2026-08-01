@@ -97,9 +97,20 @@ pub unsafe fn remove_tray_icon() {
     }
 }
 
-/// Show the context menu when right-clicking the tray icon
+/// Show the context menu when right-clicking the tray icon. Every Win32 call
+/// in here (and in show_context_menu_with_pause) used to `.expect()`/`panic!`
+/// on failure - the same mistake that made a transient Shell_NotifyIconW
+/// failure fatal (see add_tray_icon) - except this path runs on every single
+/// right-click, not just once at startup, so a transient GDI/shell hiccup
+/// here could kill the whole app at any time during normal use. Now these
+/// just skip showing the menu for this click and log, since a missed menu
+/// open is recoverable (the user can just click again) in a way that losing
+/// the whole app is not.
 pub unsafe fn show_context_menu(hwnd: HWND) {
-    let hmenu = CreatePopupMenu().expect("Failed to create popup menu");
+    let Ok(hmenu) = CreatePopupMenu() else {
+        eprintln!("[Tray] Failed to create context menu");
+        return;
+    };
 
     // Determine pause menu item text and state
     let paused = is_paused();
@@ -158,63 +169,67 @@ pub unsafe fn show_context_menu(hwnd: HWND) {
     show_context_menu_with_pause(hwnd, hmenu, PCWSTR(pause_wide.as_ptr()), pause_flags);
 }
 
-/// Helper to show context menu with pause item
+/// Helper to show context menu with pause item. See `show_context_menu` for
+/// why failures here bail out (log + clean up + return) instead of panicking.
 unsafe fn show_context_menu_with_pause(hwnd: HWND, hmenu: HMENU, pause_text: PCWSTR, pause_flags: MENU_ITEM_FLAGS) {
+    // Bails out of the enclosing function on failure, after tearing down the
+    // partially-built menu - a macro rather than a helper fn since an early
+    // `return` needs to unwind this specific call site, not just report a bool.
+    macro_rules! insert_or_bail {
+        ($pos:expr, $flags:expr, $id:expr, $text:expr) => {
+            if InsertMenuW(hmenu, $pos, $flags, $id, $text).is_err() {
+                eprintln!("[Tray] Failed to build context menu - skipping this open");
+                let _ = DestroyMenu(hmenu);
+                return;
+            }
+        };
+    }
+
     let stats_text = i18n::wide("tray.stats");
-    InsertMenuW(hmenu, 0, MF_BYPOSITION | MF_STRING, IDM_TODAYS_STATS as usize, PCWSTR(stats_text.as_ptr()))
-        .expect("Failed to insert menu item");
+    insert_or_bail!(0, MF_BYPOSITION | MF_STRING, IDM_TODAYS_STATS as usize, PCWSTR(stats_text.as_ptr()));
     let settings_text = i18n::wide("tray.settings");
-    InsertMenuW(hmenu, 1, MF_BYPOSITION | MF_STRING, IDM_SETTINGS as usize, PCWSTR(settings_text.as_ptr()))
-        .expect("Failed to insert menu item");
-    InsertMenuW(hmenu, 2, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null())
-        .expect("Failed to insert separator");
+    insert_or_bail!(1, MF_BYPOSITION | MF_STRING, IDM_SETTINGS as usize, PCWSTR(settings_text.as_ptr()));
+    insert_or_bail!(2, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
     let extend15_text = i18n::wide("tray.extend_15");
-    InsertMenuW(hmenu, 3, MF_BYPOSITION | MF_STRING, IDM_EXTEND_15 as usize, PCWSTR(extend15_text.as_ptr()))
-        .expect("Failed to insert menu item");
+    insert_or_bail!(3, MF_BYPOSITION | MF_STRING, IDM_EXTEND_15 as usize, PCWSTR(extend15_text.as_ptr()));
     let extend45_text = i18n::wide("tray.extend_45");
-    InsertMenuW(hmenu, 4, MF_BYPOSITION | MF_STRING, IDM_EXTEND_45 as usize, PCWSTR(extend45_text.as_ptr()))
-        .expect("Failed to insert menu item");
-    InsertMenuW(hmenu, 5, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null())
-        .expect("Failed to insert separator");
+    insert_or_bail!(4, MF_BYPOSITION | MF_STRING, IDM_EXTEND_45 as usize, PCWSTR(extend45_text.as_ptr()));
+    insert_or_bail!(5, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
 
     // Pause menu item with dynamic text
-    InsertMenuW(hmenu, 6, pause_flags, IDM_PAUSE_TOGGLE as usize, pause_text)
-        .expect("Failed to insert pause menu item");
+    insert_or_bail!(6, pause_flags, IDM_PAUSE_TOGGLE as usize, pause_text);
 
     let mut idx = 7;
 
     // Show idle status if idle-paused
     if is_idle_paused() {
         let idle_text = i18n::wide("tray.idle_paused");
-        InsertMenuW(hmenu, idx, MF_BYPOSITION | MF_STRING | MF_GRAYED, 0, PCWSTR(idle_text.as_ptr()))
-            .expect("Failed to insert idle status");
+        insert_or_bail!(idx, MF_BYPOSITION | MF_STRING | MF_GRAYED, 0, PCWSTR(idle_text.as_ptr()));
         idx += 1;
     }
 
-    InsertMenuW(hmenu, idx, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null())
-        .expect("Failed to insert separator");
+    insert_or_bail!(idx, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
     idx += 1;
     let warning_text = i18n::wide("tray.show_warning");
-    InsertMenuW(hmenu, idx, MF_BYPOSITION | MF_STRING, IDM_SHOW_OVERLAY as usize, PCWSTR(warning_text.as_ptr()))
-        .expect("Failed to insert menu item");
+    insert_or_bail!(idx, MF_BYPOSITION | MF_STRING, IDM_SHOW_OVERLAY as usize, PCWSTR(warning_text.as_ptr()));
     idx += 1;
     let blocking_text = i18n::wide("tray.show_blocking");
-    InsertMenuW(hmenu, idx, MF_BYPOSITION | MF_STRING, IDM_SHOW_BLOCKING as usize, PCWSTR(blocking_text.as_ptr()))
-        .expect("Failed to insert menu item");
+    insert_or_bail!(idx, MF_BYPOSITION | MF_STRING, IDM_SHOW_BLOCKING as usize, PCWSTR(blocking_text.as_ptr()));
     idx += 1;
-    InsertMenuW(hmenu, idx, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null())
-        .expect("Failed to insert separator");
+    insert_or_bail!(idx, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
     idx += 1;
     let about_text = i18n::wide("tray.about");
-    InsertMenuW(hmenu, idx, MF_BYPOSITION | MF_STRING, IDM_ABOUT as usize, PCWSTR(about_text.as_ptr()))
-        .expect("Failed to insert menu item");
+    insert_or_bail!(idx, MF_BYPOSITION | MF_STRING, IDM_ABOUT as usize, PCWSTR(about_text.as_ptr()));
     idx += 1;
     let quit_text = i18n::wide("tray.quit");
-    InsertMenuW(hmenu, idx, MF_BYPOSITION | MF_STRING, IDM_QUIT as usize, PCWSTR(quit_text.as_ptr()))
-        .expect("Failed to insert menu item");
+    insert_or_bail!(idx, MF_BYPOSITION | MF_STRING, IDM_QUIT as usize, PCWSTR(quit_text.as_ptr()));
 
     let mut point = zeroed();
-    GetCursorPos(&mut point).expect("Failed to get cursor position");
+    if GetCursorPos(&mut point).is_err() {
+        eprintln!("[Tray] Failed to get cursor position - skipping this open");
+        let _ = DestroyMenu(hmenu);
+        return;
+    }
 
     let _ = SetForegroundWindow(hwnd);
 
