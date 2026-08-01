@@ -175,13 +175,12 @@ pub fn cmd_resume() -> String {
     }
 }
 
-/// 14-day usage table (minutes active / paused per day), sent as a monospace
-/// code block so it lines up as an actual table in Telegram/Discord.
-pub fn cmd_weekly() -> String {
-    let history = database::get_daily_usage_history(14);
-
+/// 14-day usage table (minutes active / paused per day) for one user, sent
+/// as a monospace code block so it lines up as an actual table in
+/// Telegram/Discord.
+fn weekly_table_for(username: &str, history: &[(String, i32, i32)]) -> String {
     let mut table = format!("{:<6}{:>8}{:>9}\n", "Date", "Used", "Paused");
-    for (date, active_min, pause_min) in &history {
+    for (date, active_min, pause_min) in history {
         let short_date = date.get(5..).unwrap_or(date); // MM-DD
         table.push_str(&format!(
             "{:<6}{:>8}{:>9}\n",
@@ -190,14 +189,30 @@ pub fn cmd_weekly() -> String {
             format_hm(pause_min * 60)
         ));
     }
+    format!("👤 {}\n```\n{}```", username, table)
+}
 
-    format!(
-        "📊 {}\n👤 {}: {}\n```\n{}```",
-        i18n::t("tg.weekly.header"),
-        i18n::t("tg.status.user"),
-        current_windows_username(),
-        table,
-    )
+/// 14-day usage table for every Windows account that's used this app on
+/// this machine - not just whoever happens to be running the command -
+/// built from the shared database's mirrored per-user stats (see
+/// `database::mirror_shared_daily_stat`). Falls back to this account's own
+/// local history alone if the shared registry is empty (e.g. the shared
+/// database is unavailable, or this is the first run since the per-user
+/// mirroring was added and no shared history has accumulated yet).
+pub fn cmd_weekly() -> String {
+    let all_users = database::get_all_users_daily_usage_history(14);
+
+    let body = if all_users.is_empty() {
+        weekly_table_for(&current_windows_username(), &database::get_daily_usage_history(14))
+    } else {
+        all_users
+            .iter()
+            .map(|(username, history)| weekly_table_for(username, history))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!("📊 {}\n{}", i18n::t("tg.weekly.header"), body)
 }
 
 pub fn cmd_history() -> String {

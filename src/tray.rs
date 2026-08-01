@@ -30,7 +30,30 @@ use std::sync::atomic::Ordering;
 /// Global state for the notification icon data
 pub static mut NOTIFY_ICON_DATA: Option<NOTIFYICONDATAW> = None;
 
-/// Add the system tray icon
+/// Registered id for the "TaskbarCreated" message, broadcast to every
+/// top-level window whenever Explorer's shell (re)starts. Listened for in
+/// `window_proc` to re-add the tray icon if it wasn't there yet - see
+/// `add_tray_icon`'s retry comment for why that happens.
+pub static mut WM_TASKBARCREATED: u32 = 0;
+
+/// How many times to retry `Shell_NotifyIconW(NIM_ADD, ...)` before giving up
+/// on this attempt (a later "TaskbarCreated" message - see WM_TASKBARCREATED
+/// above - still retries again after that).
+const TRAY_ICON_ADD_RETRIES: u32 = 5;
+
+/// Add the system tray icon. Failure here is expected to happen occasionally
+/// and is *not* fatal: `Shell_NotifyIconW(NIM_ADD, ...)` can transiently fail
+/// right after logon if Explorer's shell notification area hasn't finished
+/// starting up yet - most likely on a session that just started (a fresh
+/// sign-in, especially the first-ever logon for an account, or one competing
+/// for resources under Fast User Switching) rather than a desktop that's
+/// been up for a while. This used to `panic!` on that failure, which - since
+/// this crate builds with `panic = "abort"` - killed the *entire app*, not
+/// just the icon, over what's normally a purely cosmetic, retryable hiccup:
+/// screen-time enforcement has nothing to do with whether the tray icon
+/// exists. Retries a few times immediately, and if it still hasn't worked,
+/// logs and leaves the app running iconless rather than crashing it - the
+/// WM_TASKBARCREATED handler in `window_proc` gets another chance later.
 pub unsafe fn add_tray_icon(hwnd: HWND) {
     let hinstance = GetModuleHandleW(None).expect("Failed to get module handle");
 
@@ -54,11 +77,16 @@ pub unsafe fn add_tray_icon(hwnd: HWND) {
     nid.hIcon = hicon;
     nid.szTip = tip_buffer;
 
-    if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
-        panic!("Failed to add tray icon");
+    for attempt in 1..=TRAY_ICON_ADD_RETRIES {
+        if Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
+            NOTIFY_ICON_DATA = Some(nid);
+            return;
+        }
+        if attempt < TRAY_ICON_ADD_RETRIES {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
     }
-
-    NOTIFY_ICON_DATA = Some(nid);
+    eprintln!("[Tray] Shell_NotifyIconW(NIM_ADD) failed after {TRAY_ICON_ADD_RETRIES} attempts - continuing without a tray icon until TaskbarCreated fires");
 }
 
 /// Remove the system tray icon
@@ -210,6 +238,14 @@ pub unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if WM_TASKBARCREATED != 0 && msg == WM_TASKBARCREATED {
+        // Explorer's shell just (re)started - re-add the icon whether it's
+        // recovering from an Explorer restart or from add_tray_icon's own
+        // initial attempts having exhausted their retries (see there).
+        add_tray_icon(hwnd);
+        return LRESULT(0);
+    }
+
     match msg {
         WM_TRAYICON => {
             let event = lparam.0 as u32;
@@ -293,6 +329,35 @@ pub unsafe extern "system" fn window_proc(
                     }
                 }
                 _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_QUERYENDSESSION => {
+            // Windows is asking whether it's OK to shut down/log off. Mark
+            // this session as ending right away, before allowing it to
+            // proceed - a fast/forced shutdown can kill this process before
+            // WM_ENDSESSION (or our own cleanup below) gets to run, and
+            // without this marker the watchdog would otherwise treat an
+            // ordinary shutdown or sign-out exactly like tampering and send
+            // a false "unexpectedly stopped" alert instead of no alert at all.
+            // Deliberately the time-bounded `mark_session_ending`, not the
+            // indefinite `mark_intentional_quit` used by the passcode-Quit
+            // menu item below - this session is ending regardless, so unlike
+            // a deliberate Quit there's no "stay off until told otherwise"
+            // intent to preserve, and an indefinite marker left over from
+            // this shutdown could otherwise wrongly suppress the watchdog in
+            // a *later* session too (see `database::mark_session_ending`).
+            crate::database::mark_session_ending();
+            LRESULT(1) // TRUE - allow the shutdown/logoff to proceed
+        }
+        WM_ENDSESSION => {
+            // wParam is nonzero only if the session is actually ending (not
+            // vetoed by some other app) - tear down the same way the
+            // passcode-protected Quit does, so the admin chat gets the same
+            // graceful "shutting down" notification instead of nothing (or,
+            // without the WM_QUERYENDSESSION marker above, a tamper alert).
+            if wparam.0 != 0 {
+                DestroyWindow(hwnd).ok();
             }
             LRESULT(0)
         }

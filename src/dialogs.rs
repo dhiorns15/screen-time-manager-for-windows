@@ -1085,8 +1085,10 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                                 return LRESULT(0);
                             }
 
-                            // Save new passcode
-                            set_setting("passcode", &new_pass);
+                            // Save new passcode (shared machine-wide, so it
+                            // works no matter which Windows account is
+                            // logged in - see database::set_passcode)
+                            crate::database::set_passcode(&new_pass);
                         }
 
                         // Save rotating PIN toggle

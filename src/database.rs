@@ -155,12 +155,17 @@ pub fn init_shared_database() {
 
     *SHARED_DB_CONNECTION.lock().unwrap() = Some(conn);
 
-    // One-time migration: carry over bot settings from the old per-user
-    // storage so existing setups (Telegram/Discord already configured
-    // before this became shared) don't have to be redone.
-    const MIGRATED_KEYS: [&str; 7] = [
+    // One-time migration: carry over bot settings and the passcode/rotating
+    // PIN from the old per-user storage so existing setups (already
+    // configured before these became shared) don't have to be redone. Only
+    // the first account to launch after this migrates its local value in -
+    // every other account then defers to that same shared value, which is
+    // the point: one passcode/PIN that works no matter which Windows
+    // account is logged in, instead of each account's own separate one.
+    const MIGRATED_KEYS: [&str; 10] = [
         TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_CHAT_ID, TELEGRAM_ENABLED,
         DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID, DISCORD_ADMIN_USER_ID, DISCORD_ENABLED,
+        "passcode", ROTATING_PIN_ENABLED, ROTATING_PIN_SECRET,
     ];
     for key in MIGRATED_KEYS {
         if get_shared_setting(key).is_none() {
@@ -233,38 +238,110 @@ pub fn mark_intentional_quit() {
 /// still has no marker and is caught normally.
 pub fn clear_intentional_quit_marker() {
     let _ = std::fs::remove_file(intentional_quit_marker_path());
+    let _ = std::fs::remove_file(session_ending_marker_path());
 }
 
-/// Whether the app's most recent stop was the passcode-protected Quit menu
-/// item, rather than being killed out from under the timer. The marker is
-/// cleared on every real app start (see `clear_intentional_quit_marker`), so
-/// its mere presence - no time window needed - means nothing has run since
-/// that sanctioned quit.
-pub fn quit_was_intentional() -> bool {
-    intentional_quit_marker_path().exists()
+/// Path to the marker written on an ordinary WM_QUERYENDSESSION (shutdown/
+/// logoff/restart/sign-out), as opposed to the passcode-protected Quit above.
+/// Kept separate from `intentional_quit_marker_path` - and, unlike it,
+/// time-bounded (see `session_ending_recently`) rather than cleared only by
+/// the app's next real start. A shutdown/logoff ends the session the app was
+/// running in, so "the app's next real start" is a *new* session's `AtLogOn`
+/// launch, which can be delayed or occasionally not fire at all (e.g. under
+/// Fast User Switching); an indefinite marker left over from the *previous*
+/// session would then wrongly convince the watchdog in the new session that
+/// this, too, was sanctioned, and it would never relaunch - stuck until
+/// someone notices and starts the app by hand.
+fn session_ending_marker_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".screen-time-manager")
+        .join("session_ending")
 }
 
-/// Get the passcode from the database
-pub fn get_passcode() -> Option<String> {
-    let guard = DB_CONNECTION.lock().ok()?;
-    guard.as_ref()?.query_row(
-        "SELECT value FROM settings WHERE key = 'passcode'",
-        [],
-        |row| row.get(0),
-    ).ok()
-}
-
-/// Set the passcode in the database
-pub fn set_passcode(code: &str) -> bool {
-    if let Ok(guard) = DB_CONNECTION.lock() {
-        if let Some(conn) = guard.as_ref() {
-            return conn.execute(
-                "UPDATE settings SET value = ?1 WHERE key = 'passcode'",
-                params![code],
-            ).is_ok();
-        }
+/// Record that this session is ending via WM_QUERYENDSESSION, so a watchdog
+/// check that happens to race the process's teardown doesn't mistake it for
+/// tampering. Time-bounded (see `session_ending_recently`), so it can only
+/// ever suppress a check for a couple of minutes around the actual shutdown -
+/// unlike the passcode-Quit marker, it must never be able to permanently
+/// block the watchdog if the following session's own auto-launch misfires.
+pub fn mark_session_ending() {
+    let path = session_ending_marker_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
     }
-    false
+    let _ = std::fs::write(&path, wall_clock_now_secs().to_string());
+}
+
+/// How long after `mark_session_ending` the marker still counts as covering
+/// an in-progress shutdown - just needs to bridge the gap between
+/// WM_QUERYENDSESSION and the process actually exiting, not an entire
+/// session.
+const SESSION_ENDING_MARKER_MAX_AGE_SECS: i64 = 120;
+
+fn session_ending_recently() -> bool {
+    std::fs::read_to_string(session_ending_marker_path())
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .is_some_and(|written_at| wall_clock_now_secs() - written_at < SESSION_ENDING_MARKER_MAX_AGE_SECS)
+}
+
+/// Whether the app's most recent stop was either the passcode-protected Quit
+/// menu item, or an ordinary shutdown/logoff still within its brief grace
+/// window - rather than being killed out from under the timer. The
+/// passcode-Quit marker is cleared on every real app start (see
+/// `clear_intentional_quit_marker`), so its mere presence - no time window
+/// needed - means nothing has run since that sanctioned quit; the session-
+/// ending marker instead ages out on its own (see `session_ending_recently`)
+/// so it can never get stuck suppressing the watchdog past the shutdown it
+/// was meant to cover.
+pub fn quit_was_intentional() -> bool {
+    intentional_quit_marker_path().exists() || session_ending_recently()
+}
+
+/// Path to the marker recording which session's logon (see
+/// `session::logon_token`) the watchdog last confirmed the main app running
+/// under. Lets it tell "hasn't started yet this session - be patient" apart
+/// from "was running earlier this session, isn't now - that's a real
+/// problem" regardless of how long a slow session start takes. A plain file
+/// rather than a DB row, same reasoning as the intentional-quit marker above.
+fn confirmed_running_marker_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".screen-time-manager")
+        .join("confirmed_running_logon_token")
+}
+
+/// Record that the watchdog just observed the app running under the given
+/// session logon token.
+pub fn record_confirmed_running(logon_token: i64) {
+    let path = confirmed_running_marker_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, logon_token.to_string());
+}
+
+/// Whether the app has already been confirmed running at some point under
+/// the given session logon token (i.e. this exact session, not a previous
+/// one that happened to leave a stale marker behind).
+pub fn was_confirmed_running_this_session(logon_token: i64) -> bool {
+    std::fs::read_to_string(confirmed_running_marker_path())
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        == Some(logon_token)
+}
+
+/// Get the passcode. Shared machine-wide (see `SHARED_DB_CONNECTION`) so the
+/// same passcode works no matter which Windows account is logged in, rather
+/// than each account needing its own set separately.
+pub fn get_passcode() -> Option<String> {
+    get_shared_setting("passcode")
+}
+
+/// Set the passcode. Shared machine-wide - see `get_passcode`.
+pub fn set_passcode(code: &str) -> bool {
+    set_shared_setting("passcode", code)
 }
 
 /// Settings keys for the optional rotating daily PIN
@@ -274,26 +351,27 @@ const ROTATING_PIN_SECRET: &str = "rotating_pin_secret";
 /// Whether the rotating daily PIN is enabled (off by default) - when on, it
 /// works everywhere the regular passcode does, as an additional valid code
 /// alongside it (the regular passcode always keeps working too, so there's
-/// no lockout risk if the rotating code isn't at hand).
+/// no lockout risk if the rotating code isn't at hand). Shared machine-wide,
+/// same as the passcode - see `get_passcode`.
 pub fn is_rotating_pin_enabled() -> bool {
-    get_setting(ROTATING_PIN_ENABLED).map(|s| s == "true").unwrap_or(false)
+    get_shared_setting(ROTATING_PIN_ENABLED).map(|s| s == "true").unwrap_or(false)
 }
 
 /// Enable/disable the rotating daily PIN
 pub fn set_rotating_pin_enabled(enabled: bool) {
-    set_setting(ROTATING_PIN_ENABLED, if enabled { "true" } else { "false" });
+    set_shared_setting(ROTATING_PIN_ENABLED, if enabled { "true" } else { "false" });
 }
 
 /// Get (creating if needed) the secret used to derive the daily rotating PIN
 fn get_or_create_rotating_secret() -> String {
-    if let Some(secret) = get_setting(ROTATING_PIN_SECRET) {
+    if let Some(secret) = get_shared_setting(ROTATING_PIN_SECRET) {
         return secret;
     }
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     let seed = RandomState::new().build_hasher().finish();
     let secret = seed.to_string();
-    set_setting(ROTATING_PIN_SECRET, &secret);
+    set_shared_setting(ROTATING_PIN_SECRET, &secret);
     secret
 }
 
@@ -473,6 +551,83 @@ pub fn get_daily_usage_history(days: u32) -> Vec<(String, i32, i32)> {
         .collect()
 }
 
+/// Shared-database registry of Windows account names with mirrored daily
+/// stats (see `mirror_shared_daily_stat`) - comma-separated, since the
+/// shared database is a flat key-value store. Kept as an explicit list
+/// rather than parsed out of key names, since a username can itself contain
+/// underscores/digits that would make splitting a `user_active_<name>_<date>`
+/// key ambiguous.
+const SHARED_KNOWN_USERS_KEY: &str = "known_usernames";
+
+fn shared_user_stat_key(kind: &str, username: &str, date: &str) -> String {
+    format!("user_{kind}_{username}_{date}")
+}
+
+/// Register `username` in the shared accounts registry, if not already
+/// present.
+fn register_shared_username(username: &str) {
+    let existing = get_shared_setting(SHARED_KNOWN_USERS_KEY).unwrap_or_default();
+    if existing.split(',').any(|u| u == username) {
+        return;
+    }
+    let updated = if existing.is_empty() {
+        username.to_string()
+    } else {
+        format!("{existing},{username}")
+    };
+    set_shared_setting(SHARED_KNOWN_USERS_KEY, &updated);
+}
+
+/// Mirror one of today's per-day usage counters (`kind` is "active" or
+/// "pause") into the shared database under this Windows account's name, so
+/// bot commands like !weekly can report every account's usage - not just
+/// whichever one happens to be running the command - without needing
+/// filesystem access to other accounts' per-user databases (which a
+/// standard Windows account can't read).
+fn mirror_shared_daily_stat(kind: &str, date: &str, seconds: i32) {
+    let username = crate::remote_commands::current_windows_username();
+    register_shared_username(&username);
+    set_shared_setting(&shared_user_stat_key(kind, &username, date), &seconds.to_string());
+}
+
+/// Usage for the last `days` calendar days, for every Windows account that's
+/// used this app on this machine (username, then oldest-first per-day date/
+/// active-minutes/paused-minutes) - the multi-user counterpart of
+/// `get_daily_usage_history`, built from the shared database's mirrored
+/// per-user stats rather than any single account's own local history.
+pub fn get_all_users_daily_usage_history(days: u32) -> Vec<(String, Vec<(String, i32, i32)>)> {
+    let today = effective_today_date();
+    let mut usernames: Vec<String> = get_shared_setting(SHARED_KNOWN_USERS_KEY)
+        .unwrap_or_default()
+        .split(',')
+        .filter(|u| !u.is_empty())
+        .map(|u| u.to_string())
+        .collect();
+    usernames.sort();
+
+    usernames
+        .into_iter()
+        .map(|username| {
+            let history = (0..days as i64)
+                .rev()
+                .map(|n| {
+                    let date = date_n_days_before(&today, n);
+                    let active = get_shared_setting(&shared_user_stat_key("active", &username, &date))
+                        .and_then(|s| s.parse::<i32>().ok())
+                        .unwrap_or(0)
+                        / 60;
+                    let paused = get_shared_setting(&shared_user_stat_key("pause", &username, &date))
+                        .and_then(|s| s.parse::<i32>().ok())
+                        .unwrap_or(0)
+                        / 60;
+                    (date, active, paused)
+                })
+                .collect();
+            (username, history)
+        })
+        .collect()
+}
+
 /// Delete per-day enforcement/usage rows older than
 /// `DAILY_DATA_RETENTION_DAYS`, so the settings table doesn't grow forever -
 /// every "today"-scoped key (remaining time, pause usage, session tracking,
@@ -481,15 +636,32 @@ pub fn get_daily_usage_history(days: u32) -> Vec<(String, i32, i32)> {
 pub fn prune_old_daily_data() {
     let cutoff = date_n_days_before(&effective_today_date(), DAILY_DATA_RETENTION_DAYS);
 
-    let Ok(guard) = DB_CONNECTION.lock() else { return };
-    let Some(conn) = guard.as_ref() else { return };
+    if let Ok(guard) = DB_CONNECTION.lock() {
+        if let Some(conn) = guard.as_ref() {
+            for prefix in ["remaining_time_", "session_active_", "pause_used_", "pause_log_"] {
+                let pattern = format!("{}%", prefix);
+                let _ = conn.execute(
+                    "DELETE FROM settings WHERE key LIKE ?1 AND substr(key, ?2) < ?3",
+                    params![pattern, (prefix.len() + 1) as i64, cutoff],
+                );
+            }
+        }
+    }
 
-    for prefix in ["remaining_time_", "session_active_", "pause_used_", "pause_log_"] {
-        let pattern = format!("{}%", prefix);
-        let _ = conn.execute(
-            "DELETE FROM settings WHERE key LIKE ?1 AND substr(key, ?2) < ?3",
-            params![pattern, (prefix.len() + 1) as i64, cutoff],
-        );
+    // Same retention for the shared per-user mirrored stats (see
+    // `mirror_shared_daily_stat`) - their keys end in the date
+    // (`user_<kind>_<username>_<date>`) rather than starting with it, since
+    // the username in the middle is variable-length, so this uses substr's
+    // negative-offset "last N characters" form to pull the date back out
+    // instead of the prefix-length math the per-account keys above use.
+    // Call this only after `init_shared_database` has run, or it's a no-op.
+    if let Ok(guard) = SHARED_DB_CONNECTION.lock() {
+        if let Some(conn) = guard.as_ref() {
+            let _ = conn.execute(
+                "DELETE FROM settings WHERE key LIKE 'user_%' AND substr(key, -10) < ?1",
+                params![cutoff],
+            );
+        }
     }
 }
 
@@ -682,6 +854,7 @@ pub fn save_pause_used_today(seconds: i32) {
     let date = effective_today_date();
     let key = format!("pause_used_{}", date);
     set_setting(&key, &seconds.to_string());
+    mirror_shared_daily_stat("pause", &date, seconds);
 }
 
 /// Get timestamp of last pause end (Unix timestamp)
@@ -728,6 +901,7 @@ pub fn save_session_active_time(seconds: i32) {
     let date = effective_today_date();
     let key = format!("session_active_{}", date);
     set_setting(&key, &seconds.to_string());
+    mirror_shared_daily_stat("active", &date, seconds);
 }
 
 /// Log a pause event for today

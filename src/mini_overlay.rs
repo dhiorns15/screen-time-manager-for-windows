@@ -544,10 +544,12 @@ pub unsafe extern "system" fn mini_overlay_proc(
                     }
                 }
 
-                // Always check for the day rolling over and idle state (even
-                // during manual pause, to track transitions)
+                // Always check for the day rolling over, idle state, and
+                // which session currently owns the console (even during
+                // manual pause, to keep tracking these transitions)
                 check_day_rollover();
                 check_idle_state();
+                crate::session::sync_remote_bots();
 
                 let _ = InvalidateRect(hwnd, None, true);
             }

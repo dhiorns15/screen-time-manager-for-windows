@@ -70,11 +70,22 @@ Write-Host "Creating scheduled task..." -ForegroundColor White
 
 $action = New-ScheduledTaskAction -Execute $ExePath
 $trigger = New-ScheduledTaskTrigger -AtLogOn
-$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+# GroupId (not UserId) so the task runs for *any* account that logs on, in
+# that account's own session - not just the account that ran this installer.
+# Without this, other Windows accounts never get auto-started at all.
+$principal = New-ScheduledTaskPrincipal -GroupId "BUILTIN\Users" -RunLevel Limited
+# MultipleInstances defaults to IgnoreNew, and Task Scheduler tracks "is this
+# task running" per task definition, not per session - so with the default,
+# a second account logging on (e.g. via Fast User Switching) while the first
+# account's instance is still running gets its AtLogOn trigger silently
+# dropped, and the app never starts for them. Parallel lets each session's
+# trigger launch its own instance; the per-session mutex (see constants.rs)
+# still prevents duplicate launches within the same session.
 $settings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -StartWhenAvailable `
+    -MultipleInstances Parallel `
     -ExecutionTimeLimit (New-TimeSpan -Days 0) `
     -RestartCount 3 `
     -RestartInterval (New-TimeSpan -Minutes 1)
@@ -107,12 +118,19 @@ $watchdogTrigger2 = New-ScheduledTaskTrigger -AtLogOn
 # killed" tamper alert on every ordinary restart/login. The main app task has
 # no such delay, so this gives it a head start.
 $watchdogTrigger2.Delay = "PT2M"
-$watchdogPrincipal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+# Same GroupId reasoning as the main task's principal above - the watchdog
+# needs to run per-user too, not just for whoever installed it.
+$watchdogPrincipal = New-ScheduledTaskPrincipal -GroupId "BUILTIN\Users" -RunLevel Limited
+# Parallel, not IgnoreNew: with two sessions active, the per-minute repetition
+# trigger fires for both sessions' instances at the same tick, and Task
+# Scheduler tracks "is this task running" per task definition rather than per
+# session - so IgnoreNew would silently drop one session's check on every
+# collision, leaving that user's session unmonitored for tampering.
 $watchdogSettings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
     -StartWhenAvailable `
-    -MultipleInstances IgnoreNew `
+    -MultipleInstances Parallel `
     -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
 
 $watchdogTask = New-ScheduledTask -Action $watchdogAction -Trigger @($watchdogTrigger, $watchdogTrigger2) `

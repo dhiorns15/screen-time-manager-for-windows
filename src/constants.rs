@@ -15,8 +15,11 @@ pub const IDM_PAUSE_TOGGLE: u16 = 1007;
 pub const IDM_EXTEND_15: u16 = 1008;
 pub const IDM_EXTEND_45: u16 = 1009;
 
-// Mutex name for single instance
-pub const MUTEX_NAME: &str = "Global\\ScreenTimeManager_SingleInstance_7F3A9B2E";
+// Mutex name for single instance. Deliberately unprefixed (not "Global\\")
+// so it lives in the caller's session namespace - each Windows account (and
+// each Fast-User-Switching session) gets its own instance instead of one
+// account's running app blocking another account's launch.
+pub const MUTEX_NAME: &str = "ScreenTimeManager_SingleInstance_7F3A9B2E";
 
 // Colors (BGR format)
 pub const COLOR_OVERLAY_BG: u32 = 0x00331a00;      // Dark blue-ish

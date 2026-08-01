@@ -24,11 +24,46 @@ use crate::remote_commands::current_windows_username;
 
 pub const WATCHDOG_ARG: &str = "--watchdog-check";
 
+/// How long after this session's own logon to hold off on relaunch/alert if
+/// the app has *never once* been confirmed running yet this session. The
+/// main app task's own -AtLogOn trigger (see install.ps1) is what's actually
+/// supposed to start it on every session start (a fresh sign-in, a restart,
+/// Fast User Switching creating a brand-new session for an account that's
+/// never logged on before) - it just hasn't necessarily finished doing so
+/// yet by the time this check runs. A first-ever logon for a brand-new
+/// Windows account in particular can take several minutes of Windows' own
+/// profile setup before that trigger even fires, so this is deliberately
+/// generous - it's safe to be, since it only applies before the app has ever
+/// been seen running this session (see `was_confirmed_running_this_session`
+/// below): once it *has* been seen running, any later "not running" alerts
+/// immediately regardless of this window, so a quick kill right after a fast
+/// start is still caught right away.
+const STARTUP_GRACE_SECONDS: i64 = 600;
+
 /// Check whether the app is running and relaunch/alert if it was killed
 /// outside of a sanctioned Quit. Safe to call repeatedly (e.g. every minute).
 pub fn run_check() {
+    let logon_token = crate::session::logon_token();
+
     if unsafe { app_is_running() } {
+        if let Some(token) = logon_token {
+            database::record_confirmed_running(token);
+        }
         return;
+    }
+
+    let already_confirmed_this_session = logon_token
+        .is_some_and(database::was_confirmed_running_this_session);
+
+    if !already_confirmed_this_session {
+        if let Some(elapsed) = crate::session::seconds_since_logon() {
+            if elapsed < STARTUP_GRACE_SECONDS {
+                log(&format!(
+                    "app not running - only {elapsed}s since this session's logon and never yet confirmed running this session (< {STARTUP_GRACE_SECONDS}s grace) - assuming it's still starting, not alerting"
+                ));
+                return;
+            }
+        }
     }
 
     if database::quit_was_intentional() {

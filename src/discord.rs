@@ -2,7 +2,7 @@
 //! Provides remote monitoring and control via a Discord bot listening in one channel
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serenity::all::{ChannelId, GatewayIntents, Http, Message, Ready};
@@ -21,8 +21,26 @@ use crate::time_request;
 /// Shutdown signal for graceful termination
 pub static BOT_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-/// HTTP handle for sending notifications outside of the gateway event loop
-static BOT_HTTP: OnceLock<Arc<Http>> = OnceLock::new();
+/// Whether a bot thread is currently running (or starting up) - guards
+/// start_bot_thread/stop_bot_thread so repeated calls (e.g. from the
+/// per-second active-session check in session.rs) are cheap no-ops once
+/// already in the desired state.
+static BOT_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// HTTP handle for sending notifications outside of the gateway event loop.
+/// A Mutex rather than a OnceLock because the bot can be stopped and
+/// restarted within the same process - e.g. when this session loses/regains
+/// console ownership under Fast User Switching (see session.rs) - and
+/// OnceLock can only ever be set once.
+static BOT_HTTP: Mutex<Option<Arc<Http>>> = Mutex::new(None);
+
+/// Handle for the most recently spawned bot thread, if any. `start_bot_thread`
+/// joins this before spawning a new one (see there for why) - BOT_SHUTDOWN is
+/// a single flag shared across every generation of the bot thread, so without
+/// this join, a new generation could reset it to `false` while the *previous*
+/// generation's shutdown-watcher task and Serenity client are still mid-
+/// teardown, leaving two overlapping Discord gateway clients alive at once.
+static BOT_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 
 /// Channel notifications are posted to
 static NOTIFY_CHANNEL_ID: OnceLock<u64> = OnceLock::new();
@@ -36,9 +54,16 @@ struct Handler {
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         eprintln!("[Discord] Bot connected as {}", ready.user.name);
-        let _ = ChannelId::new(self.channel_id)
-            .say(&ctx.http, i18n::t("tg.notify.started"))
-            .await;
+        // Fires on every (re)connect, including a session-handoff reconnect
+        // under Fast User Switching (see session.rs) - so this doubles as an
+        // "active user changed" notice, not just a genuine app startup one.
+        let text = format!(
+            "{}\n👤 {}: {}",
+            i18n::t("tg.notify.started"),
+            i18n::t("tg.status.user"),
+            crate::remote_commands::current_windows_username(),
+        );
+        let _ = ChannelId::new(self.channel_id).say(&ctx.http, text).await;
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
@@ -170,45 +195,79 @@ fn help_text() -> String {
     response
 }
 
-/// Start the Discord bot in a background thread
+/// Start the Discord bot in a background thread. A no-op if a bot thread is
+/// already running/starting - safe to call repeatedly (e.g. from the
+/// per-second active-session check in session.rs).
 pub fn start_bot_thread() {
+    if BOT_RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
     let config = database::get_discord_config();
 
     if !config.enabled {
         eprintln!("[Discord] Bot is disabled in settings");
+        BOT_RUNNING.store(false, Ordering::SeqCst);
         return;
     }
 
     let Some(token) = config.bot_token else {
         eprintln!("[Discord] Bot enabled but no token configured");
+        BOT_RUNNING.store(false, Ordering::SeqCst);
         return;
     };
     if token.is_empty() {
         eprintln!("[Discord] Bot token is empty");
+        BOT_RUNNING.store(false, Ordering::SeqCst);
         return;
     }
 
     let Some(channel_id) = config.channel_id else {
         eprintln!("[Discord] Bot enabled but no channel configured");
+        BOT_RUNNING.store(false, Ordering::SeqCst);
         return;
     };
 
     let admin_user_id = config.admin_user_id;
 
-    std::thread::spawn(move || {
+    // Wait for the previous generation's thread to fully exit before
+    // resetting BOT_SHUTDOWN and spawning a new one - see BOT_THREAD.
+    // BOT_RUNNING having just gone false->true above already means no other
+    // caller can be in this function concurrently, so this handle (if any)
+    // is exactly the generation we need to wait out.
+    if let Some(handle) = BOT_THREAD.lock().unwrap().take() {
+        let _ = handle.join();
+    }
+
+    BOT_SHUTDOWN.store(false, Ordering::SeqCst);
+
+    let handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
         rt.block_on(async {
             run_bot(token, channel_id, admin_user_id).await;
         });
+        *BOT_HTTP.lock().unwrap() = None;
+        BOT_RUNNING.store(false, Ordering::SeqCst);
     });
+    *BOT_THREAD.lock().unwrap() = Some(handle);
+}
+
+/// Stop the Discord bot thread, if one is running. A no-op otherwise - safe
+/// to call repeatedly. Unlike `signal_shutdown`, this doesn't send a
+/// notification: it's used for routine active-session handoffs (see
+/// session.rs), not an actual app shutdown.
+pub fn stop_bot_thread() {
+    if BOT_RUNNING.load(Ordering::SeqCst) {
+        BOT_SHUTDOWN.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Proactively push a message to the configured channel, outside of any
 /// incoming command (e.g. a "requesting more time" notification triggered
 /// from the blocking overlay). No-op if the bot isn't connected/configured.
 pub fn notify_admin(text: &str) {
-    if let (Some(http), Some(&channel_id)) = (BOT_HTTP.get(), NOTIFY_CHANNEL_ID.get()) {
-        let http = http.clone();
+    let http = BOT_HTTP.lock().unwrap().clone();
+    if let (Some(http), Some(&channel_id)) = (http, NOTIFY_CHANNEL_ID.get()) {
         let text = text.to_string();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().ok();
@@ -225,8 +284,8 @@ pub fn notify_admin(text: &str) {
 pub fn signal_shutdown() {
     BOT_SHUTDOWN.store(true, Ordering::SeqCst);
 
-    if let (Some(http), Some(&channel_id)) = (BOT_HTTP.get(), NOTIFY_CHANNEL_ID.get()) {
-        let http = http.clone();
+    let http = BOT_HTTP.lock().unwrap().clone();
+    if let (Some(http), Some(&channel_id)) = (http, NOTIFY_CHANNEL_ID.get()) {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().ok();
             if let Some(rt) = rt {
@@ -254,7 +313,7 @@ async fn run_bot(token: String, channel_id: u64, admin_user_id: Option<u64>) {
         }
     };
 
-    let _ = BOT_HTTP.set(client.http.clone());
+    *BOT_HTTP.lock().unwrap() = Some(client.http.clone());
     let _ = NOTIFY_CHANNEL_ID.set(channel_id);
 
     let shard_manager = client.shard_manager.clone();

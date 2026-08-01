@@ -2,7 +2,7 @@
 //! Provides remote monitoring and control via Telegram commands
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use teloxide::prelude::*;
 use teloxide::error_handlers::LoggingErrorHandler;
 use teloxide::types::ParseMode;
@@ -20,8 +20,25 @@ use crate::time_request;
 /// Shutdown signal for graceful termination
 pub static BOT_SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-/// Bot instance for sending notifications
-static BOT_INSTANCE: OnceLock<Bot> = OnceLock::new();
+/// Whether a bot thread is currently running (or starting up) - guards
+/// start_bot_thread/stop_bot_thread so repeated calls (e.g. from the
+/// per-second active-session check in session.rs) are cheap no-ops once
+/// already in the desired state.
+static BOT_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Bot instance for sending notifications. A Mutex rather than a OnceLock
+/// because the bot can be stopped and restarted within the same process -
+/// e.g. when this session loses/regains console ownership under Fast User
+/// Switching (see session.rs) - and OnceLock can only ever be set once.
+static BOT_INSTANCE: Mutex<Option<Bot>> = Mutex::new(None);
+
+/// Handle for the most recently spawned bot thread, if any. `start_bot_thread`
+/// joins this before spawning a new one (see there for why) - BOT_SHUTDOWN is
+/// a single flag shared across every generation of the bot thread, so without
+/// this join, a new generation could reset it to `false` while the *previous*
+/// generation's shutdown-watcher task is still mid-teardown, leaving two
+/// overlapping bot instances alive at once.
+static BOT_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 
 /// Admin chat ID for notifications
 static ADMIN_CHAT_ID: OnceLock<i64> = OnceLock::new();
@@ -79,22 +96,31 @@ enum Command {
     Help,
 }
 
-/// Start the Telegram bot in a background thread
+/// Start the Telegram bot in a background thread. A no-op if a bot thread is
+/// already running/starting - safe to call repeatedly (e.g. from the
+/// per-second active-session check in session.rs).
 pub fn start_bot_thread() {
+    if BOT_RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
     let config = database::get_telegram_config();
 
     if !config.enabled {
         eprintln!("[Telegram] Bot is disabled in settings");
+        BOT_RUNNING.store(false, Ordering::SeqCst);
         return;
     }
 
     let Some(token) = config.bot_token else {
         eprintln!("[Telegram] Bot enabled but no token configured");
+        BOT_RUNNING.store(false, Ordering::SeqCst);
         return;
     };
 
     if token.is_empty() {
         eprintln!("[Telegram] Bot token is empty");
+        BOT_RUNNING.store(false, Ordering::SeqCst);
         return;
     }
 
@@ -105,20 +131,44 @@ pub fn start_bot_thread() {
         let _ = ADMIN_CHAT_ID.set(id);
     }
 
-    std::thread::spawn(move || {
+    // Wait for the previous generation's thread to fully exit before
+    // resetting BOT_SHUTDOWN and spawning a new one - see BOT_THREAD.
+    // BOT_RUNNING having just gone false->true above already means no other
+    // caller can be in this function concurrently, so this handle (if any)
+    // is exactly the generation we need to wait out.
+    if let Some(handle) = BOT_THREAD.lock().unwrap().take() {
+        let _ = handle.join();
+    }
+
+    BOT_SHUTDOWN.store(false, Ordering::SeqCst);
+
+    let handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
         rt.block_on(async {
             run_bot(token, admin_chat_id).await;
         });
+        *BOT_INSTANCE.lock().unwrap() = None;
+        BOT_RUNNING.store(false, Ordering::SeqCst);
     });
+    *BOT_THREAD.lock().unwrap() = Some(handle);
+}
+
+/// Stop the Telegram bot thread, if one is running. A no-op otherwise - safe
+/// to call repeatedly. Unlike `signal_shutdown`, this doesn't send a
+/// notification: it's used for routine active-session handoffs (see
+/// session.rs), not an actual app shutdown.
+pub fn stop_bot_thread() {
+    if BOT_RUNNING.load(Ordering::SeqCst) {
+        BOT_SHUTDOWN.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Proactively push a message to the configured admin chat, outside of any
 /// incoming command (e.g. a "requesting more time" notification triggered
 /// from the blocking overlay). No-op if the bot isn't connected/configured.
 pub fn notify_admin(text: &str) {
-    if let (Some(bot), Some(&chat_id)) = (BOT_INSTANCE.get(), ADMIN_CHAT_ID.get()) {
-        let bot = bot.clone();
+    let bot = BOT_INSTANCE.lock().unwrap().clone();
+    if let (Some(bot), Some(&chat_id)) = (bot, ADMIN_CHAT_ID.get()) {
         let text = text.to_string();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().ok();
@@ -136,8 +186,8 @@ pub fn signal_shutdown() {
     BOT_SHUTDOWN.store(true, Ordering::SeqCst);
 
     // Send shutdown notification if possible
-    if let (Some(bot), Some(&chat_id)) = (BOT_INSTANCE.get(), ADMIN_CHAT_ID.get()) {
-        let bot = bot.clone();
+    let bot = BOT_INSTANCE.lock().unwrap().clone();
+    if let (Some(bot), Some(&chat_id)) = (bot, ADMIN_CHAT_ID.get()) {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().ok();
             if let Some(rt) = rt {
@@ -156,11 +206,21 @@ async fn run_bot(token: String, admin_chat_id: Option<i64>) {
     let bot = Bot::new(&token);
 
     // Store bot instance for notifications
-    let _ = BOT_INSTANCE.set(bot.clone());
+    *BOT_INSTANCE.lock().unwrap() = Some(bot.clone());
 
-    // Send startup notification
+    // Send startup notification. This fires whenever the bot (re)connects,
+    // including a session-handoff reconnect under Fast User Switching (see
+    // session.rs) - not just a genuine app startup - so it doubles as an
+    // "active user changed" notice: whichever account's session currently
+    // owns the console is the one whose bot is live, and this says who that is.
     if let Some(chat_id) = admin_chat_id {
-        let _ = bot.send_message(ChatId(chat_id), i18n::t("tg.notify.started")).await;
+        let text = format!(
+            "{}\n👤 {}: {}",
+            i18n::t("tg.notify.started"),
+            i18n::t("tg.status.user"),
+            crate::remote_commands::current_windows_username(),
+        );
+        let _ = bot.send_message(ChatId(chat_id), text).await;
     }
 
     // Command handler
