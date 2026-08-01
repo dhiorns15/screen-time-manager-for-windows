@@ -41,7 +41,7 @@ Confirmed to be effectively blocking Fortnite, Roblox and Minecraft.
 
    ![Settings dialog](images/settings.png)
 
-6. **Change the passcode** - Use the "Change Passcode" section to set something your child won't guess!
+6. **Change the passcode** - Use the "Change Passcode" section to set something your child won't guess! This passcode is shared machine-wide - if you have multiple kids on separate Windows accounts on the same PC, changing it from any one of their Settings dialogs changes it for all of them.
 
 ---
 
@@ -109,7 +109,7 @@ You can monitor and control screen time from your phone using Telegram. This is 
 
 Once configured, only you can control the bot - it ignores messages from anyone else.
 
-**Note:** the bot token/chat ID are stored machine-wide (shared across every Windows account on the PC, unlike time limits/passcode which are per-account) - set it up once and it works no matter which child's account is running the app. If you have multiple children on separate standard (non-admin) Windows accounts, run `install.ps1` as Administrator at least once so those accounts get permission to read/write the shared config; otherwise it silently falls back to per-account storage.
+**Note:** the bot token/chat ID - like the passcode and rotating PIN - are stored machine-wide (shared across every Windows account on the PC, unlike time limits, which are per-account) - set it up once and it works no matter which child's account is running the app. If you have multiple children on separate standard (non-admin) Windows accounts, run `install.ps1` as Administrator at least once so those accounts get permission to read/write the shared config; otherwise it silently falls back to per-account storage.
 
 ---
 
@@ -141,7 +141,7 @@ You can also monitor and control screen time from a Discord channel, using a Dis
 
 Once configured, only you can control the bot in that channel - it ignores commands from anyone else.
 
-**Note:** the bot token/channel/user ID are stored machine-wide (shared across every Windows account on the PC, unlike time limits/passcode which are per-account) - set it up once and it works no matter which child's account is running the app. If you have multiple children on separate standard (non-admin) Windows accounts, run `install.ps1` as Administrator at least once so those accounts get permission to read/write the shared config; otherwise it silently falls back to per-account storage. Since the config is shared, `!status`/`!history` (and their Telegram equivalents) show which Windows account is currently logged in, so you can tell whose stats you're looking at.
+**Note:** the bot token/channel/user ID - like the passcode and rotating PIN - are stored machine-wide (shared across every Windows account on the PC, unlike time limits, which are per-account) - set it up once and it works no matter which child's account is running the app. If you have multiple children on separate standard (non-admin) Windows accounts, run `install.ps1` as Administrator at least once so those accounts get permission to read/write the shared config; otherwise it silently falls back to per-account storage. Since the config is shared, `!status`/`!history` (and their Telegram equivalents) show which Windows account is currently logged in, so you can tell whose stats you're looking at. If more than one of your kids' accounts is signed in at once (e.g. via Fast User Switching), only the one currently in the foreground answers bot commands, so you're never talking to two accounts' bots at the same time.
 
 ---
 
@@ -157,13 +157,15 @@ If both Telegram and Discord are enabled, the request goes to both, but only one
 
 ## Rotating Daily PIN (Optional)
 
-If you're worried about the passcode being watched and memorized, enable the rotating daily PIN (Settings, or `!rotatingpin on` / `/rotatingpin on`) - a second code that automatically changes every day and works anywhere the regular passcode does. Your regular passcode always keeps working too, so there's no risk of getting locked out if you don't have your phone handy - the rotating code is purely additive. Retrieve today's code any time with `!getpin` / `/getpin`. Off by default.
+If you're worried about the passcode being watched and memorized, enable the rotating daily PIN (Settings, or `!rotatingpin on` / `/rotatingpin on`) - a second code that automatically changes every day and works anywhere the regular passcode does. Your regular passcode always keeps working too, so there's no risk of getting locked out if you don't have your phone handy - the rotating code is purely additive. Retrieve today's code any time with `!getpin` / `/getpin`. Off by default. Like the passcode, this is shared machine-wide - enabling it (or fetching today's code) from one Windows account applies to all of them.
 
 ---
 
 ## Automatic Restart & Tamper Alerts
 
-If Screen Time Manager is stopped in any way other than the passcode-protected Quit option (e.g. ended via Task Manager), it's automatically relaunched within about a minute, and you'll get a Telegram/Discord alert if either is enabled. This requires running `install.ps1` as Administrator at least once (it registers a Scheduled Task for this) - see the install instructions above.
+If Screen Time Manager is stopped in any way other than the passcode-protected Quit option (e.g. ended via Task Manager), it's automatically relaunched within about a minute, and you'll get a Telegram/Discord alert if either is enabled. This requires running `install.ps1` as Administrator at least once (it registers a Scheduled Task for this) - see "Making It Start Automatically" below.
+
+This also covers auto-starting at logon and the tamper-alert relaunch for **every** Windows account on the PC, not just whichever account you ran `install.ps1` from - so with multiple kids on separate accounts, one Administrator run of `install.ps1` sets all of them up, including if they're signed in at the same time via Fast User Switching.
 
 ---
 
@@ -178,13 +180,15 @@ If Screen Time Manager is stopped in any way other than the passcode-protected Q
 
 ## Making It Start Automatically
 
-To have Screen Time Manager start when Windows boots:
+**Recommended:** right-click `install.ps1` (next to `screen-time-manager.exe`) and choose **Run with PowerShell**, approving the Administrator prompt. Besides starting the app at logon, this also sets up the automatic relaunch/tamper-alert protection described above - and if you have multiple kids on separate Windows accounts, one run sets all of them up, not just the account you ran it from.
+
+**Lighter alternative**, if you'd rather not run a script:
 
 1. Press `Win + R` on your keyboard
 2. Type `shell:startup` and press Enter
 3. Copy the Screen Time Manager app into this folder (or create a shortcut to it)
 
-Now it will start automatically every time the computer turns on.
+This starts the app at logon for the current Windows account only, and skips the watchdog protection - nothing relaunches it if the process is ended (e.g. via Task Manager), and it won't auto-start for any other Windows account on the PC.
 
 ---
 
