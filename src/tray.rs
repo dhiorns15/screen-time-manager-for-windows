@@ -6,7 +6,10 @@ use windows::{
     core::PCWSTR,
     Win32::{
         Foundation::{HWND, LPARAM, LRESULT, WPARAM},
-        System::LibraryLoader::GetModuleHandleW,
+        System::{
+            LibraryLoader::GetModuleHandleW,
+            RemoteDesktop::WTSUnRegisterSessionNotification,
+        },
         UI::{
             Shell::{
                 Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
@@ -376,7 +379,25 @@ pub unsafe extern "system" fn window_proc(
             }
             LRESULT(0)
         }
+        WM_WTSSESSION_CHANGE => {
+            // wParam is one of the WTS_SESSION_* reason codes - only the
+            // lock/unlock pair matters here (see
+            // mini_overlay::set_session_locked for why this pauses the
+            // countdown independent of the idle-detection setting). Other
+            // reasons (remote connect/disconnect, console
+            // connect/disconnect, session logon/logoff) are already covered
+            // by other mechanisms (WM_QUERYENDSESSION, the per-session
+            // mutex) or don't apply to this always-local single-session app.
+            match wparam.0 as u32 {
+                WTS_SESSION_LOCK => crate::mini_overlay::set_session_locked(true),
+                WTS_SESSION_UNLOCK => crate::mini_overlay::set_session_locked(false),
+                _ => {}
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => {
+            let _ = WTSUnRegisterSessionNotification(hwnd);
+
             // Signal Telegram bot to shut down (sends shutdown notification)
             telegram::signal_shutdown();
 

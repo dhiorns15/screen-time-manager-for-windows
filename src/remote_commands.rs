@@ -111,7 +111,7 @@ pub fn cmd_extend(minutes: i32) -> String {
     // Get new remaining time
     let remaining = blocking::get_remaining_seconds();
 
-    format!("✅ {}\n{} {}",
+    format!("✅ {}\n{}: {}",
         join_words(&[i18n::t("tg.extend.success"), &format_hm(minutes * 60), i18n::t("tg.extend.success_suffix")]),
         i18n::t("tg.status.remaining"),
         format_hm(remaining))
@@ -139,7 +139,7 @@ pub fn cmd_reduce(minutes: i32) -> String {
     // Get new remaining time
     let remaining = blocking::get_remaining_seconds();
 
-    format!("⏬ {}\n{} {}",
+    format!("⏬ {}\n{}: {}",
         join_words(&[i18n::t("tg.reduce.success"), &format_hm(minutes * 60), i18n::t("tg.reduce.success_suffix")]),
         i18n::t("tg.status.remaining"),
         format_hm(remaining))

@@ -133,6 +133,38 @@ pub fn notify_activity_status(is_idle: bool, remaining_seconds: i32) {
     }
 }
 
+/// Called whenever the Windows session locks/unlocks (see
+/// `mini_overlay::set_session_locked`), same pattern as
+/// `notify_activity_status` above but for an actual lock rather than the
+/// idle-detection heuristic - so the parent can tell the two apart.
+pub fn notify_session_lock(is_locked: bool, remaining_seconds: i32) {
+    let username = current_windows_username();
+    let (icon, header_key) = if is_locked {
+        ("🔒", "activity.notify.locked")
+    } else {
+        ("🔓", "activity.notify.unlocked")
+    };
+
+    let text = format!(
+        "{} {} {}\n⏳ {}: {}",
+        icon,
+        username,
+        i18n::t(header_key),
+        i18n::t("tg.status.remaining"),
+        format_hm(remaining_seconds),
+    );
+
+    let tg = database::get_telegram_config();
+    let dc = database::get_discord_config();
+
+    if tg.enabled {
+        telegram::notify_admin(&text);
+    }
+    if dc.enabled {
+        discord::notify_admin(&text);
+    }
+}
+
 /// Called when remaining time crosses one of the configured warning
 /// thresholds (the same ones that trigger the kid-facing overlay), so the
 /// parent gets the same heads-up without needing to be looking at `status`.

@@ -37,6 +37,15 @@ pub static SESSION_ACTIVE_SECONDS: AtomicI32 = AtomicI32::new(0);
 // Idle detection state (independent from manual pause)
 pub static IS_IDLE_PAUSED: AtomicBool = AtomicBool::new(false);
 
+/// Whether the Windows session is currently locked (independent from manual
+/// pause and idle detection - always active regardless of the idle-detection
+/// setting, since a locked screen means the account genuinely can't be in
+/// use, not just that nobody's touched the keyboard/mouse recently). Set
+/// directly from `tray::window_proc`'s WM_WTSSESSION_CHANGE handler, not
+/// polled every tick the way idle detection is - the OS tells us the exact
+/// moment this changes, so there's no reason to guess at it.
+pub static IS_LOCK_PAUSED: AtomicBool = AtomicBool::new(false);
+
 /// Timer ID for updating the mini overlay
 pub const TIMER_MINI_UPDATE: usize = 10;
 
@@ -402,6 +411,21 @@ pub fn is_idle_paused() -> bool {
     IS_IDLE_PAUSED.load(Ordering::SeqCst)
 }
 
+/// Record a session lock/unlock transition (see IS_LOCK_PAUSED) and notify
+/// the admin bot(s), same as an idle-state transition. A no-op if this
+/// doesn't actually change the current state, so it's safe to call from
+/// WM_WTSSESSION_CHANGE without tracking whether we've already seen this
+/// particular lock/unlock.
+pub unsafe fn set_session_locked(locked: bool) {
+    let was_locked = IS_LOCK_PAUSED.swap(locked, Ordering::SeqCst);
+    if was_locked == locked {
+        return;
+    }
+    let remaining = REMAINING_SECONDS.load(Ordering::SeqCst);
+    crate::time_request::notify_session_lock(locked, remaining);
+    update_mini_overlay();
+}
+
 /// Window procedure for the mini overlay
 pub unsafe extern "system" fn mini_overlay_proc(
     hwnd: HWND,
@@ -419,10 +443,13 @@ pub unsafe extern "system" fn mini_overlay_proc(
 
             let paused = IS_PAUSED.load(Ordering::SeqCst);
             let idle_paused = IS_IDLE_PAUSED.load(Ordering::SeqCst);
+            let locked = IS_LOCK_PAUSED.load(Ordering::SeqCst);
 
             // Background color changes when paused
             let bg_color = if paused {
                 0x00332200 // Brownish when manually paused
+            } else if locked {
+                0x00332222 // Dark red-ish when locked
             } else if idle_paused {
                 0x00333333 // Grey when idle-paused
             } else {
@@ -444,6 +471,13 @@ pub unsafe extern "system" fn mini_overlay_proc(
                 // Format: "II 0:45" (pause symbol + remaining pause time)
                 let pause_time_str = format_time_compact(pause_remaining);
                 (format!("II {}", pause_time_str), 0x0066CCFF_u32) // Cyan/light blue for paused
+            } else if locked {
+                // Show lock indicator with remaining time - not that anyone
+                // can see this while the actual Windows lock screen (a
+                // separate secure desktop) is covering it, but it's correct
+                // the instant the desktop is visible again too.
+                let time_str = format_time_compact(remaining);
+                (format!("LOCK {}", time_str), 0x005555FF_u32) // Red-ish for locked
             } else if idle_paused {
                 // Show idle indicator with remaining time
                 let time_str = format_time_compact(remaining);
@@ -485,6 +519,7 @@ pub unsafe extern "system" fn mini_overlay_proc(
             if wparam.0 == TIMER_MINI_UPDATE {
                 let paused = IS_PAUSED.load(Ordering::SeqCst);
                 let idle_paused = IS_IDLE_PAUSED.load(Ordering::SeqCst);
+                let locked = IS_LOCK_PAUSED.load(Ordering::SeqCst);
 
                 if paused {
                     // Timer is manually paused - increment pause duration instead
@@ -496,9 +531,14 @@ pub unsafe extern "system" fn mini_overlay_proc(
                         // Auto-resume
                         force_resume();
                     }
-                } else if idle_paused {
-                    // Timer is idle-paused - don't decrement time, don't track session time
-                    // Just redraw to keep the display updated
+                } else if idle_paused || locked {
+                    // Timer is idle-paused or the session is locked - don't
+                    // decrement time, don't track session time. Locked takes
+                    // this same no-op branch regardless of the idle-detection
+                    // setting (see IS_LOCK_PAUSED) - a locked screen means the
+                    // account genuinely can't be in use, not a discretionary
+                    // "no recent input" call. Just redraw to keep the display
+                    // updated.
                 } else {
                     // Timer is running normally
                     let current = REMAINING_SECONDS.load(Ordering::SeqCst);

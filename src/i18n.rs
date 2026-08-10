@@ -251,9 +251,9 @@ fn en(key: &str) -> &'static str {
         // ----- Telegram Bot - Responses -----
         "tg.status.header" => "Screen Time Status",
         "tg.status.user" => "User",
-        "tg.status.remaining" => "Remaining:",
-        "tg.status.paused" => "Paused:",
-        "tg.status.pause_budget" => "Pause budget:",
+        "tg.status.remaining" => "Remaining",
+        "tg.status.paused" => "Paused",
+        "tg.status.pause_budget" => "Pause budget",
         "tg.status.yes" => "Yes",
         "tg.status.no" => "No",
         "tg.status.idle" => "Yes (idle)",
@@ -386,6 +386,8 @@ fn en(key: &str) -> &'static str {
         // ----- Activity / Low-time / Out-of-time Alerts -----
         "activity.notify.idle" => "went idle - timer paused",
         "activity.notify.active" => "is active again - timer resumed",
+        "activity.notify.locked" => "locked the screen - timer paused",
+        "activity.notify.unlocked" => "unlocked the screen - timer resumed",
         "warning.notify.header" => "has about",
         "warning.notify.minutes" => "left",
         "outoftime.notify.header" => "is out of screen time - locked now",
@@ -644,9 +646,9 @@ fn de(key: &str) -> &'static str {
         // ----- Telegram Bot - Responses -----
         "tg.status.header" => "Bildschirmzeit Status",
         "tg.status.user" => "Benutzer",
-        "tg.status.remaining" => "Verbleibend:",
-        "tg.status.paused" => "Pausiert:",
-        "tg.status.pause_budget" => "Pause-Budget:",
+        "tg.status.remaining" => "Verbleibend",
+        "tg.status.paused" => "Pausiert",
+        "tg.status.pause_budget" => "Pause-Budget",
         "tg.status.yes" => "Ja",
         "tg.status.no" => "Nein",
         "tg.status.idle" => "Ja (Leerlauf)",
@@ -779,6 +781,8 @@ fn de(key: &str) -> &'static str {
         // ----- Aktivitäts-/Restzeit-/Zeitablauf-Benachrichtigungen -----
         "activity.notify.idle" => "ist inaktiv - Timer pausiert",
         "activity.notify.active" => "ist wieder aktiv - Timer läuft weiter",
+        "activity.notify.locked" => "hat den Bildschirm gesperrt - Timer pausiert",
+        "activity.notify.unlocked" => "hat den Bildschirm entsperrt - Timer läuft weiter",
         "warning.notify.header" => "hat noch etwa",
         "warning.notify.minutes" => "übrig",
         "outoftime.notify.header" => "hat keine Bildschirmzeit mehr - jetzt gesperrt",

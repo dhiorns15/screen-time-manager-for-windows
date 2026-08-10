@@ -28,6 +28,7 @@ use windows::{
         Foundation::{BOOL, GetLastError, CloseHandle, ERROR_ALREADY_EXISTS},
         System::{
             LibraryLoader::GetModuleHandleW,
+            RemoteDesktop::{WTSRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION},
             Threading::CreateMutexW,
         },
         UI::HiDpi::{SetProcessDpiAwareness, PROCESS_PER_MONITOR_DPI_AWARE},
@@ -158,6 +159,16 @@ fn main() {
             None,
         )
         .expect("Failed to create window");
+
+        // Subscribe to this session's lock/unlock notifications (delivered
+        // as WM_WTSSESSION_CHANGE to `hwnd`, handled in tray::window_proc) so
+        // the countdown can pause while the screen is locked - not fatal if
+        // it fails, same reasoning as add_tray_icon: this is a defense-in-
+        // depth feature, not core functionality, so losing it shouldn't take
+        // the whole app down.
+        if let Err(e) = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) {
+            eprintln!("[Main] Failed to register for session lock notifications: {e}");
+        }
 
         // Create the overlay windows (initially hidden)
         create_overlay_window(hinstance);
