@@ -18,6 +18,7 @@ Confirmed to be effectively blocking Fortnite, Roblox and Minecraft.
 - **Pause Feature** - Kids can pause the timer for breaks (with built-in limits to prevent abuse)
 - **Shut Down Option** - Shut down the computer directly from the lock screen
 - **Works on All Monitors** - Blocks all connected screens
+- **Pauses at the Lock Screen** - Time isn't counted while Windows is locked, so your child's account being signed out doesn't burn through their daily limit
 
 ---
 
