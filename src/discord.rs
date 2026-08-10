@@ -199,6 +199,20 @@ fn help_text() -> String {
     response
 }
 
+/// A single-threaded tokio runtime, for spots that only ever run one task at
+/// a time (the bot's own event loop, or a single outgoing notification) and
+/// don't need `tokio::runtime::Runtime::new()`'s default multi-threaded
+/// runtime - which, with the `rt-multi-thread` feature enabled and no
+/// worker-thread cap, spawns one OS thread per CPU core (16 on a typical
+/// modern machine) every time it's created. `notify_admin`/`signal_shutdown`
+/// each created one of those from scratch just to send a single HTTP
+/// request; `start_bot_thread` creates one per bot-thread generation, which
+/// now also happens on every Fast-User-Switching session hand-off (see
+/// session.rs) instead of just once at startup.
+fn light_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread().enable_all().build()
+}
+
 /// Start the Discord bot in a background thread. A no-op if a bot thread is
 /// already running/starting - safe to call repeatedly (e.g. from the
 /// per-second active-session check in session.rs).
@@ -253,7 +267,7 @@ pub fn start_bot_thread() {
         // trigger instead of a shell-not-ready one. BOT_HTTP/BOT_RUNNING
         // still need resetting on failure so a bad runtime creation can't
         // wedge them true/Some forever and block every later restart.
-        match tokio::runtime::Runtime::new() {
+        match light_runtime() {
             Ok(rt) => rt.block_on(async {
                 run_bot(token, channel_id, admin_user_id).await;
             }),
@@ -284,7 +298,7 @@ pub fn notify_admin(text: &str) {
     if let (Some(http), Some(channel_id)) = (http, channel_id) {
         let text = text.to_string();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().ok();
+            let rt = light_runtime().ok();
             if let Some(rt) = rt {
                 rt.block_on(async {
                     let _ = ChannelId::new(channel_id).say(&http, text).await;
@@ -302,7 +316,7 @@ pub fn signal_shutdown() {
     let channel_id = *NOTIFY_CHANNEL_ID.lock().unwrap();
     if let (Some(http), Some(channel_id)) = (http, channel_id) {
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().ok();
+            let rt = light_runtime().ok();
             if let Some(rt) = rt {
                 rt.block_on(async {
                     let _ = ChannelId::new(channel_id)
