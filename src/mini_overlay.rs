@@ -61,13 +61,8 @@ pub unsafe fn create_mini_overlay(hinstance: windows::Win32::Foundation::HMODULE
     // Apply DPI scaling to dimensions
     let mini_width = scale(MINI_WIDTH_BASE);
     let mini_height = scale(MINI_HEIGHT_BASE);
-    let mini_margin = scale(MINI_MARGIN_BASE);
 
-    let screen_width = GetSystemMetrics(SM_CXSCREEN);
-
-    // Position in top-right corner
-    let x = screen_width - mini_width - mini_margin;
-    let y = mini_margin;
+    let (x, y) = mini_overlay_position();
 
     let ex_style = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT;
 
@@ -103,8 +98,16 @@ pub unsafe fn show_mini_overlay() {
 
     MINI_OVERLAY_VISIBLE.store(true, Ordering::SeqCst);
 
+    // Re-place as well as show: the primary monitor may have changed size
+    // since the window was created.
+    let (x, y) = mini_overlay_position();
     let _ = InvalidateRect(hwnd, None, true);
-    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    let _ = SetWindowPos(
+        hwnd,
+        HWND_TOPMOST,
+        x, y, 0, 0,
+        SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+    );
 
     // Update every second
     let _ = SetTimer(hwnd, TIMER_MINI_UPDATE, 1000, None);
@@ -121,6 +124,13 @@ pub unsafe fn hide_mini_overlay() {
 
     let _ = KillTimer(hwnd, TIMER_MINI_UPDATE);
     let _ = ShowWindow(hwnd, SW_HIDE);
+}
+
+/// Where the mini overlay sits: the top-right corner of the primary monitor
+/// at its current size.
+unsafe fn mini_overlay_position() -> (i32, i32) {
+    let margin = scale(MINI_MARGIN_BASE);
+    (GetSystemMetrics(SM_CXSCREEN) - scale(MINI_WIDTH_BASE) - margin, margin)
 }
 
 /// Update the mini overlay display
@@ -591,9 +601,18 @@ pub unsafe extern "system" fn mini_overlay_proc(
                 check_idle_state();
                 crate::session::sync_remote_bots();
 
+                if MINI_OVERLAY_VISIBLE.load(Ordering::SeqCst) {
+                    crate::blocking::push_to_topmost(hwnd, false);
+                }
                 let _ = InvalidateRect(hwnd, None, true);
             }
             LRESULT(0)
+        }
+        WM_DISPLAYCHANGE => {
+            // Keep to the top-right corner of the (possibly resized) primary
+            let (x, y) = mini_overlay_position();
+            let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }

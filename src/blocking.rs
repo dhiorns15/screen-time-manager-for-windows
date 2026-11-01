@@ -13,12 +13,12 @@ use windows::{
             CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint,
             EnumDisplayMonitors, FillRect, InvalidateRect, RoundRect, SelectObject, SetBkMode,
             SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, FW_BOLD, FW_NORMAL,
-            HDC, HMONITOR, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
+            HDC, HFONT, HMONITOR, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
         },
         Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC},
         System::LibraryLoader::GetModuleHandleW,
         System::Shutdown::{ExitWindowsEx, EWX_SHUTDOWN, SHUTDOWN_REASON},
-        System::Threading::{GetCurrentProcess, OpenProcessToken},
+        System::Threading::{GetCurrentProcess, GetCurrentThreadId, OpenProcessToken},
         Security::{
             AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
             TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
@@ -77,8 +77,27 @@ unsafe fn initiate_shutdown() -> bool {
     ExitWindowsEx(EWX_SHUTDOWN, SHUTDOWN_REASON(0)).is_ok()
 }
 
-/// Storage for secondary monitor overlay handles (stores raw pointers as isize for Send+Sync)
-static SECONDARY_OVERLAY_HWNDS: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+/// Secondary monitor blanker windows (raw HWNDs as isize for Send+Sync) and
+/// the non-primary monitor layout they were built for. `layout` records every
+/// monitor rect enumerated at build time, whether or not its window could be
+/// created, so `sync_monitor_layout` only rebuilds when the monitors
+/// themselves change - not twice a second because one create failed.
+///
+/// Only touched on the UI thread: show/hide_blocking_overlay marshal their
+/// window work there (see `WM_APP_SHOW_OVERLAY`), so no bot thread ever holds
+/// this lock across a cross-thread ShowWindow/SetWindowPos - which would
+/// deadlock against the UI thread blocking on the same lock in its timer.
+struct SecondaryOverlays {
+    hwnds: Vec<isize>,
+    layout: Vec<RECT>,
+}
+static SECONDARY_OVERLAYS: Mutex<SecondaryOverlays> =
+    Mutex::new(SecondaryOverlays { hwnds: Vec::new(), layout: Vec::new() });
+
+/// Fonts owned by the blocking overlay's child controls (shared bold button
+/// font, large passcode font, small request-note font), as raw HFONTs. Kept
+/// so a DPI change can replace them and free the old ones.
+static CHILD_FONTS: Mutex<[isize; 3]> = Mutex::new([0; 3]);
 
 /// Monitor information collected during enumeration
 struct MonitorInfo {
@@ -109,6 +128,16 @@ pub static SHUTDOWN_COUNTDOWN_SECONDS: AtomicI32 = AtomicI32::new(-1);
 pub fn get_remaining_seconds() -> i32 {
     REMAINING_SECONDS.load(Ordering::SeqCst)
 }
+
+/// Posted to the blocking window by show/hide_blocking_overlay when they're
+/// called off the UI thread (the Discord/Telegram command handlers). The
+/// caller updates the shared state synchronously - so e.g. cmd_unlock's
+/// "is it locked?" check sees the result immediately - and the window work
+/// runs when the UI thread picks the message up. Handlers apply whatever the
+/// state says *then*, so a show and a hide posted back to back converge on
+/// the last one.
+const WM_APP_SHOW_OVERLAY: u32 = WM_APP + 1;
+const WM_APP_HIDE_OVERLAY: u32 = WM_APP + 2;
 
 /// Timer IDs
 pub const TIMER_REASSERT_TOPMOST: usize = 2;
@@ -158,15 +187,14 @@ pub unsafe fn show_blocking_overlay(text: &str) {
     show_blocking_overlay_with_time(text, -1);
 }
 
-/// Shows the full-screen blocking overlay with optional remaining time in seconds
+/// Shows the full-screen blocking overlay with optional remaining time in seconds.
+/// Safe to call from any thread: the state changes happen here, the window
+/// work on the UI thread (see `WM_APP_SHOW_OVERLAY`).
 pub unsafe fn show_blocking_overlay_with_time(text: &str, remaining_seconds: i32) {
     let hwnd = HWND(BLOCKING_HWND.load(Ordering::SeqCst));
     if hwnd.0.is_null() {
         return;
     }
-
-    // Hide the mini overlay while blocking screen is shown
-    crate::mini_overlay::hide_mini_overlay();
 
     *BLOCKING_TEXT.lock().unwrap() = Some(text.to_string());
     PASSCODE_ERROR.store(false, Ordering::SeqCst);
@@ -177,6 +205,30 @@ pub unsafe fn show_blocking_overlay_with_time(text: &str, remaining_seconds: i32
     // Initialize shutdown countdown from database setting
     let timeout = crate::database::get_lock_screen_timeout();
     SHUTDOWN_COUNTDOWN_SECONDS.store(timeout, Ordering::SeqCst);
+
+    if !on_ui_thread(hwnd) {
+        let _ = PostMessageW(hwnd, WM_APP_SHOW_OVERLAY, WPARAM(0), LPARAM(0));
+        return;
+    }
+    apply_show_overlay(hwnd);
+}
+
+/// Whether the calling thread owns the given window - i.e. is the UI thread,
+/// the only one that may create, destroy, show or hide our windows without a
+/// synchronous cross-thread SendMessage underneath.
+unsafe fn on_ui_thread(hwnd: HWND) -> bool {
+    GetWindowThreadProcessId(hwnd, None) == GetCurrentThreadId()
+}
+
+/// The window side of showing the overlay. UI thread only.
+unsafe fn apply_show_overlay(hwnd: HWND) {
+    if !is_blocking_overlay_visible() {
+        // A hide was requested after this show was posted; it wins.
+        return;
+    }
+
+    // Hide the mini overlay while blocking screen is shown
+    crate::mini_overlay::hide_mini_overlay();
 
     let edit_ptr = BLOCKING_EDIT_HWND.load(Ordering::SeqCst);
     if !edit_ptr.is_null() {
@@ -200,7 +252,6 @@ pub unsafe fn show_blocking_overlay_with_time(text: &str, remaining_seconds: i32
     let _ = ShowWindow(hwnd, SW_SHOW);
     let _ = SetForegroundWindow(hwnd);
 
-    let edit_ptr = BLOCKING_EDIT_HWND.load(Ordering::SeqCst);
     if !edit_ptr.is_null() {
         let _ = SetFocus(HWND(edit_ptr));
     }
@@ -257,30 +308,45 @@ fn format_time(seconds: i32) -> String {
     }
 }
 
-/// Hides the blocking overlay
+/// Hides the blocking overlay. Safe to call from any thread, like
+/// `show_blocking_overlay_with_time`.
 pub unsafe fn hide_blocking_overlay() {
     let hwnd = HWND(BLOCKING_HWND.load(Ordering::SeqCst));
     if hwnd.0.is_null() {
         return;
     }
 
-    let _ = KillTimer(hwnd, TIMER_REASSERT_TOPMOST);
-    let _ = KillTimer(hwnd, TIMER_COUNTDOWN);
-    let _ = ShowWindow(hwnd, SW_HIDE);
     *BLOCKING_TEXT.lock().unwrap() = None;
 
     // Reset shutdown countdown
     SHUTDOWN_COUNTDOWN_SECONDS.store(-1, Ordering::SeqCst);
 
+    // Save remaining time to database
+    crate::database::save_remaining_time(REMAINING_SECONDS.load(Ordering::SeqCst));
+
+    if !on_ui_thread(hwnd) {
+        let _ = PostMessageW(hwnd, WM_APP_HIDE_OVERLAY, WPARAM(0), LPARAM(0));
+        return;
+    }
+    apply_hide_overlay(hwnd);
+}
+
+/// The window side of hiding the overlay. UI thread only.
+unsafe fn apply_hide_overlay(hwnd: HWND) {
+    if is_blocking_overlay_visible() {
+        // A show was requested after this hide was posted; it wins.
+        return;
+    }
+
+    let _ = KillTimer(hwnd, TIMER_REASSERT_TOPMOST);
+    let _ = KillTimer(hwnd, TIMER_COUNTDOWN);
+    let _ = ShowWindow(hwnd, SW_HIDE);
+
     // Hide secondary monitor overlays
     hide_secondary_overlays();
 
-    // Save remaining time to database
-    let remaining = REMAINING_SECONDS.load(Ordering::SeqCst);
-    crate::database::save_remaining_time(remaining);
-
     // Show mini overlay again if there's remaining time
-    if remaining > 0 {
+    if REMAINING_SECONDS.load(Ordering::SeqCst) > 0 {
         crate::mini_overlay::show_mini_overlay();
     }
 }
@@ -336,227 +402,67 @@ pub unsafe extern "system" fn blocking_overlay_proc(
     match msg {
         WM_CREATE => {
             let hinstance = GetModuleHandleW(None).unwrap();
-            let screen_width = GetSystemMetrics(SM_CXSCREEN);
-            let screen_height = GetSystemMetrics(SM_CYSCREEN);
+            let button = WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32);
 
-            // Panel dimensions - must match WM_PAINT
-            let _panel_width = scale(480);
-            let panel_height = scale(660);
-            let panel_y = (screen_height - panel_height) / 2;
-
-            // Shared button font
-            let btn_font = CreateFontW(
-                scale(16), 0, 0, 0,
-                FW_BOLD.0 as i32,
-                0, 0, 0, 0, 0, 0, 5, 0,
-                w!("Segoe UI"),
-            );
-
+            // Controls are created unplaced; layout_children positions and
+            // sizes them (and does so again after display/DPI changes).
             // Layout: Icon -> Title -> Countdown -> Message -> Extend label -> Extend buttons -> Separator -> Passcode section
 
-            // Extend time buttons - positioned below the "Extend time:" label (which is at scale(200))
-            let extend_btn_width = scale(90);
-            let extend_btn_height = scale(36);
-            let extend_y = panel_y + scale(220);
-            let extend_spacing = scale(15);
-            let total_extend_width = extend_btn_width * 3 + extend_spacing * 2;
-            let extend_start_x = (screen_width - total_extend_width) / 2;
+            // Extend time buttons
+            create_child(hwnd, hinstance, w!("BUTTON"), &i18n::wide("blocking.extend_15"), button, ID_EXTEND_15);
+            create_child(hwnd, hinstance, w!("BUTTON"), &i18n::wide("blocking.extend_30"), button, ID_EXTEND_30);
+            create_child(hwnd, hinstance, w!("BUTTON"), &i18n::wide("blocking.extend_60"), button, ID_EXTEND_60);
 
-            let btn_15_text = i18n::wide("blocking.extend_15");
-            let btn_15 = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                w!("BUTTON"),
-                PCWSTR(btn_15_text.as_ptr()),
-                WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-                extend_start_x,
-                extend_y,
-                extend_btn_width,
-                extend_btn_height,
+            // Passcode edit control
+            if let Some(e) = create_child(
                 hwnd,
-                HMENU(ID_EXTEND_15 as _),
                 hinstance,
-                None,
-            );
-            if let Ok(h) = btn_15 {
-                SendMessageW(h, WM_SETFONT, WPARAM(btn_font.0 as usize), LPARAM(1));
-            }
-
-            let btn_30_text = i18n::wide("blocking.extend_30");
-            let btn_30 = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                w!("BUTTON"),
-                PCWSTR(btn_30_text.as_ptr()),
-                WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-                extend_start_x + extend_btn_width + extend_spacing,
-                extend_y,
-                extend_btn_width,
-                extend_btn_height,
-                hwnd,
-                HMENU(ID_EXTEND_30 as _),
-                hinstance,
-                None,
-            );
-            if let Ok(h) = btn_30 {
-                SendMessageW(h, WM_SETFONT, WPARAM(btn_font.0 as usize), LPARAM(1));
-            }
-
-            let btn_60_text = i18n::wide("blocking.extend_60");
-            let btn_60 = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                w!("BUTTON"),
-                PCWSTR(btn_60_text.as_ptr()),
-                WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-                extend_start_x + (extend_btn_width + extend_spacing) * 2,
-                extend_y,
-                extend_btn_width,
-                extend_btn_height,
-                hwnd,
-                HMENU(ID_EXTEND_60 as _),
-                hinstance,
-                None,
-            );
-            if let Ok(h) = btn_60 {
-                SendMessageW(h, WM_SETFONT, WPARAM(btn_font.0 as usize), LPARAM(1));
-            }
-
-            // Passcode section - positioned lower with better spacing
-            let passcode_section_y = panel_y + scale(310);
-
-            // Passcode edit control - smaller height
-            let edit_width = scale(180);
-            let edit_height = scale(44);
-            let edit_x = (screen_width - edit_width) / 2;
-            let edit_y = passcode_section_y;
-
-            let edit = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
                 w!("EDIT"),
-                w!(""),
+                &[0],
                 WS_CHILD | WS_VISIBLE | WS_BORDER
                     | WINDOW_STYLE(ES_CENTER as u32 | ES_PASSWORD as u32 | ES_NUMBER as u32),
-                edit_x,
-                edit_y,
-                edit_width,
-                edit_height,
-                hwnd,
-                HMENU(ID_PASSCODE_EDIT as _),
-                hinstance,
-                None,
-            ).ok();
-
-            if let Some(e) = edit {
+                ID_PASSCODE_EDIT,
+            ) {
                 BLOCKING_EDIT_HWND.store(e.0, Ordering::SeqCst);
                 SendMessageW(e, EM_SETLIMITTEXT, WPARAM(4), LPARAM(0));
-
-                let hfont = CreateFontW(
-                    scale(28), 0, 0, 0,
-                    FW_BOLD.0 as i32,
-                    0, 0, 0, 0, 0, 0, 5, 0,
-                    w!("Segoe UI"),
-                );
-                SendMessageW(e, WM_SETFONT, WPARAM(hfont.0 as usize), LPARAM(1));
                 let orig = SetWindowLongPtrW(e, GWLP_WNDPROC, passcode_edit_subclass_proc as *const () as isize);
                 SetWindowLongPtrW(e, GWLP_USERDATA, orig);
             }
 
-            // Unlock button
-            let btn_width = scale(180);
-            let btn_height = scale(40);
-            let btn_x = (screen_width - btn_width) / 2;
-            let btn_y = edit_y + edit_height + scale(12);
-
-            let unlock_text = i18n::wide("blocking.unlock");
-            let unlock_btn = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                w!("BUTTON"),
-                PCWSTR(unlock_text.as_ptr()),
-                WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-                btn_x,
-                btn_y,
-                btn_width,
-                btn_height,
-                hwnd,
-                HMENU(ID_UNLOCK_BUTTON as _),
-                hinstance,
-                None,
-            );
-            if let Ok(h) = unlock_btn {
-                SendMessageW(h, WM_SETFONT, WPARAM(btn_font.0 as usize), LPARAM(1));
-            }
-
-            // Shutdown button
-            let shutdown_btn_y = btn_y + btn_height + scale(10);
-            let shutdown_text = i18n::wide("blocking.shutdown");
-            let shutdown_btn = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                w!("BUTTON"),
-                PCWSTR(shutdown_text.as_ptr()),
-                WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-                btn_x,
-                shutdown_btn_y,
-                btn_width,
-                btn_height,
-                hwnd,
-                HMENU(ID_SHUTDOWN_BUTTON as _),
-                hinstance,
-                None,
-            );
-            if let Ok(h) = shutdown_btn {
-                SendMessageW(h, WM_SETFONT, WPARAM(btn_font.0 as usize), LPARAM(1));
-            }
+            // Unlock and shutdown buttons
+            create_child(hwnd, hinstance, w!("BUTTON"), &i18n::wide("blocking.unlock"), button, ID_UNLOCK_BUTTON);
+            create_child(hwnd, hinstance, w!("BUTTON"), &i18n::wide("blocking.shutdown"), button, ID_SHUTDOWN_BUTTON);
 
             // "Request more time" section - no passcode needed, only shown
             // when a bot is actually configured to receive the notification.
             // Layout: separator (WM_PAINT) -> reason label (WM_PAINT) ->
             // note edit -> request button. Must match WM_PAINT.
             if get_telegram_config().enabled || get_discord_config().enabled {
-                let request_width = scale(300);
-                let request_x = (screen_width - request_width) / 2;
-
-                let note_edit = CreateWindowExW(
-                    WINDOW_EX_STYLE(0),
-                    w!("EDIT"),
-                    w!(""),
-                    WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
-                    request_x,
-                    panel_y + scale(508),
-                    request_width,
-                    scale(30),
+                if let Some(e) = create_child(
                     hwnd,
-                    HMENU(ID_REQUEST_NOTE_EDIT as _),
                     hinstance,
-                    None,
-                ).ok();
-                if let Some(e) = note_edit {
+                    w!("EDIT"),
+                    &[0],
+                    WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+                    ID_REQUEST_NOTE_EDIT,
+                ) {
                     REQUEST_NOTE_EDIT_HWND.store(e.0, Ordering::SeqCst);
                     SendMessageW(e, EM_SETLIMITTEXT, WPARAM(100), LPARAM(0));
-                    let note_font = CreateFontW(
-                        scale(14), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"),
-                    );
-                    SendMessageW(e, WM_SETFONT, WPARAM(note_font.0 as usize), LPARAM(1));
                 }
-
-                let request_btn_text = i18n::wide("blocking.request_time_button");
-                let request_btn = CreateWindowExW(
-                    WINDOW_EX_STYLE(0),
-                    w!("BUTTON"),
-                    PCWSTR(request_btn_text.as_ptr()),
-                    WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-                    request_x,
-                    panel_y + scale(548),
-                    request_width,
-                    scale(38),
+                if let Some(h) = create_child(
                     hwnd,
-                    HMENU(ID_REQUEST_TIME_BUTTON as _),
                     hinstance,
-                    None,
-                );
-                if let Ok(h) = request_btn {
+                    w!("BUTTON"),
+                    &i18n::wide("blocking.request_time_button"),
+                    button,
+                    ID_REQUEST_TIME_BUTTON,
+                ) {
                     REQUEST_TIME_HWND.store(h.0, Ordering::SeqCst);
-                    SendMessageW(h, WM_SETFONT, WPARAM(btn_font.0 as usize), LPARAM(1));
                 }
             }
 
+            apply_fonts(hwnd);
+            layout_children(hwnd);
             LRESULT(0)
         }
         WM_PAINT => {
@@ -941,12 +847,15 @@ pub unsafe extern "system" fn blocking_overlay_proc(
         WM_TIMER => {
             match wparam.0 {
                 TIMER_REASSERT_TOPMOST => {
-                    SetWindowPos(
-                        hwnd,
-                        HWND_TOPMOST,
-                        0, 0, 0, 0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                    ).ok();
+                    // Belt and braces for WM_DISPLAYCHANGE: a monitor plugged
+                    // in or rearranged while locked. Cheap when nothing has
+                    // changed (a few metrics and one monitor enumeration).
+                    sync_monitor_layout(hwnd);
+                    push_to_topmost(hwnd, false);
+                    // The secondary blankers need re-asserting too, or an app
+                    // dragged onto another monitor would be usable during
+                    // lockout.
+                    show_secondary_overlays();
                 }
                 TIMER_COUNTDOWN => {
                     // Decrement shutdown countdown
@@ -1044,6 +953,32 @@ pub unsafe extern "system" fn blocking_overlay_proc(
             }
             LRESULT(0)
         }
+        WM_DISPLAYCHANGE => {
+            sync_monitor_layout(hwnd);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_DPICHANGED => {
+            // The primary monitor's DPI changed (a different primary, or the
+            // scale slider). scale() reads a process-wide cache, so refresh
+            // it first, then rebuild fonts and re-lay out; WM_PAINT scales on
+            // the fly. The suggested rect in lparam is ignored: the overlay
+            // always covers the whole primary screen, which
+            // sync_monitor_layout measures directly.
+            crate::dpi::set_dpi((wparam.0 & 0xFFFF) as u32);
+            apply_fonts(hwnd);
+            sync_monitor_layout(hwnd);
+            layout_children(hwnd);
+            let _ = InvalidateRect(hwnd, None, true);
+            LRESULT(0)
+        }
+        WM_APP_SHOW_OVERLAY => {
+            apply_show_overlay(hwnd);
+            LRESULT(0)
+        }
+        WM_APP_HIDE_OVERLAY => {
+            apply_hide_overlay(hwnd);
+            LRESULT(0)
+        }
         WM_ACTIVATE => {
             let edit_ptr = BLOCKING_EDIT_HWND.load(Ordering::SeqCst);
             if !edit_ptr.is_null() {
@@ -1053,6 +988,126 @@ pub unsafe extern "system" fn blocking_overlay_proc(
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+/// Create one child control of the blocking overlay, unplaced (see
+/// `layout_children`).
+unsafe fn create_child(
+    parent: HWND,
+    hinstance: windows::Win32::Foundation::HMODULE,
+    class: PCWSTR,
+    text: &[u16],
+    style: WINDOW_STYLE,
+    id: i32,
+) -> Option<HWND> {
+    CreateWindowExW(
+        WINDOW_EX_STYLE(0),
+        class,
+        PCWSTR(text.as_ptr()),
+        style,
+        0, 0, 0, 0,
+        parent,
+        HMENU(id as _),
+        hinstance,
+        None,
+    )
+    .ok()
+}
+
+/// Create the child controls' fonts at the current DPI and hand them out,
+/// freeing the previous set. Called from WM_CREATE and WM_DPICHANGED.
+unsafe fn apply_fonts(hwnd: HWND) {
+    let make = |height: i32, weight: i32| {
+        CreateFontW(scale(height), 0, 0, 0, weight, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"))
+    };
+    let btn_font = make(16, FW_BOLD.0 as i32);
+    let edit_font = make(28, FW_BOLD.0 as i32);
+    let note_font = make(14, FW_NORMAL.0 as i32);
+
+    let set = |id: i32, font: HFONT| {
+        if let Ok(child) = GetDlgItem(hwnd, id) {
+            SendMessageW(child, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
+        }
+    };
+    for id in [
+        ID_EXTEND_15,
+        ID_EXTEND_30,
+        ID_EXTEND_60,
+        ID_UNLOCK_BUTTON,
+        ID_SHUTDOWN_BUTTON,
+        ID_REQUEST_TIME_BUTTON,
+    ] {
+        set(id, btn_font);
+    }
+    set(ID_PASSCODE_EDIT, edit_font);
+    set(ID_REQUEST_NOTE_EDIT, note_font);
+
+    let mut fonts = CHILD_FONTS.lock().unwrap();
+    for old in fonts.iter().filter(|&&f| f != 0) {
+        let _ = DeleteObject(HFONT(*old as *mut std::ffi::c_void));
+    }
+    *fonts = [btn_font.0 as isize, edit_font.0 as isize, note_font.0 as isize];
+}
+
+/// Position and size every child control for the overlay's current client
+/// size and DPI. Mirrors the panel geometry WM_PAINT draws - which recenters
+/// on the client rect by itself - so the two must stay in step. Called from
+/// WM_CREATE, after a display change resizes the window, and after a DPI
+/// change.
+unsafe fn layout_children(hwnd: HWND) {
+    let mut client: RECT = zeroed();
+    if GetClientRect(hwnd, &mut client).is_err() {
+        return;
+    }
+    let width = client.right;
+    let height = client.bottom;
+
+    // Panel dimensions - must match WM_PAINT
+    let panel_height = scale(660);
+    let panel_y = (height - panel_height) / 2;
+
+    let place = |id: i32, x: i32, y: i32, w: i32, h: i32| {
+        if let Ok(child) = GetDlgItem(hwnd, id) {
+            let _ = SetWindowPos(child, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    };
+
+    // Extend time buttons - below the "Extend time:" label (at scale(200))
+    let extend_btn_width = scale(90);
+    let extend_btn_height = scale(36);
+    let extend_y = panel_y + scale(220);
+    let extend_spacing = scale(15);
+    let total_extend_width = extend_btn_width * 3 + extend_spacing * 2;
+    let extend_start_x = (width - total_extend_width) / 2;
+    for (i, id) in [ID_EXTEND_15, ID_EXTEND_30, ID_EXTEND_60].into_iter().enumerate() {
+        place(
+            id,
+            extend_start_x + (extend_btn_width + extend_spacing) * i as i32,
+            extend_y,
+            extend_btn_width,
+            extend_btn_height,
+        );
+    }
+
+    // Passcode edit
+    let edit_width = scale(180);
+    let edit_height = scale(44);
+    let edit_y = panel_y + scale(310);
+    place(ID_PASSCODE_EDIT, (width - edit_width) / 2, edit_y, edit_width, edit_height);
+
+    // Unlock and shutdown buttons
+    let btn_width = scale(180);
+    let btn_height = scale(40);
+    let btn_x = (width - btn_width) / 2;
+    let btn_y = edit_y + edit_height + scale(12);
+    place(ID_UNLOCK_BUTTON, btn_x, btn_y, btn_width, btn_height);
+    place(ID_SHUTDOWN_BUTTON, btn_x, btn_y + btn_height + scale(10), btn_width, btn_height);
+
+    // "Request more time" note and button (absent when no bot is configured)
+    let request_width = scale(300);
+    let request_x = (width - request_width) / 2;
+    place(ID_REQUEST_NOTE_EDIT, request_x, panel_y + scale(508), request_width, scale(30));
+    place(ID_REQUEST_TIME_BUTTON, request_x, panel_y + scale(548), request_width, scale(38));
 }
 
 pub unsafe fn register_blocking_class(hinstance: windows::Win32::Foundation::HMODULE) {
@@ -1174,24 +1229,29 @@ unsafe fn enumerate_monitors() -> Vec<MonitorInfo> {
     monitors
 }
 
-/// Create secondary overlay windows for all non-primary monitors
+/// Create blanker windows for all non-primary monitors (hidden until the
+/// overlay is shown). Replaces any existing set.
 pub unsafe fn create_secondary_overlays(hinstance: windows::Win32::Foundation::HMODULE) {
-    let monitors = enumerate_monitors();
-    let class_name = w!("ScreenTimeSecondaryBlockingClass");
+    build_secondary_overlays(hinstance, enumerate_monitors());
+}
 
-    let mut secondary_hwnds = SECONDARY_OVERLAY_HWNDS.lock().unwrap();
-    secondary_hwnds.clear();
+unsafe fn build_secondary_overlays(
+    hinstance: windows::Win32::Foundation::HMODULE,
+    monitors: Vec<MonitorInfo>,
+) {
+    destroy_secondary_overlays();
+
+    let class_name = w!("ScreenTimeSecondaryBlockingClass");
+    let locked_title = i18n::wide("blocking.screen_locked");
+    let mut built = SecondaryOverlays { hwnds: Vec::new(), layout: Vec::new() };
 
     for monitor in monitors {
         // Skip the primary monitor (main blocking overlay handles it)
         if monitor.is_primary {
             continue;
         }
+        built.layout.push(monitor.rect);
 
-        let width = monitor.rect.right - monitor.rect.left;
-        let height = monitor.rect.bottom - monitor.rect.top;
-
-        let locked_title = i18n::wide("blocking.screen_locked");
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             class_name,
@@ -1199,42 +1259,126 @@ pub unsafe fn create_secondary_overlays(hinstance: windows::Win32::Foundation::H
             WS_POPUP,
             monitor.rect.left,
             monitor.rect.top,
-            width,
-            height,
+            monitor.rect.right - monitor.rect.left,
+            monitor.rect.bottom - monitor.rect.top,
             None,
             None,
             hinstance,
             None,
         );
-
-        if let Ok(h) = hwnd {
-            secondary_hwnds.push(h.0 as isize);
+        match hwnd {
+            Ok(h) => built.hwnds.push(h.0 as isize),
+            Err(e) => eprintln!(
+                "[Blocking] Failed to create secondary overlay for {:?}: {e}",
+                monitor.rect
+            ),
         }
+    }
+
+    *SECONDARY_OVERLAYS.lock().unwrap() = built;
+}
+
+/// Destroy the secondary blankers and forget the layout they were built for.
+unsafe fn destroy_secondary_overlays() {
+    let old = std::mem::replace(
+        &mut *SECONDARY_OVERLAYS.lock().unwrap(),
+        SecondaryOverlays { hwnds: Vec::new(), layout: Vec::new() },
+    );
+    for hwnd in old.hwnds {
+        let _ = DestroyWindow(HWND(hwnd as *mut std::ffi::c_void));
     }
 }
 
-/// Show all secondary monitor overlays
-unsafe fn show_secondary_overlays() {
-    let secondary_hwnds = SECONDARY_OVERLAY_HWNDS.lock().unwrap();
+/// The current secondary blanker handles, copied out so no lock is held
+/// across window calls.
+fn secondary_overlay_hwnds() -> Vec<HWND> {
+    SECONDARY_OVERLAYS
+        .lock()
+        .unwrap()
+        .hwnds
+        .iter()
+        .map(|&h| HWND(h as *mut std::ffi::c_void))
+        .collect()
+}
 
-    for &hwnd_ptr in secondary_hwnds.iter() {
-        let hwnd = HWND(hwnd_ptr as *mut std::ffi::c_void);
-        SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            0, 0, 0, 0,
-            SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE,
-        ).ok();
-        let _ = ShowWindow(hwnd, SW_SHOW);
+/// Bring the blocking overlays in line with the current monitor layout.
+/// Monitors are otherwise only measured once at startup, so a monitor plugged
+/// in (or a resolution/arrangement change) while the app is running would
+/// leave that screen uncovered during lockout, or covered by a wrongly-sized
+/// blanker. UI thread only - it creates and destroys windows, which then
+/// belong to the calling thread - so it's driven from WM_DISPLAYCHANGE,
+/// WM_DPICHANGED and TIMER_REASSERT_TOPMOST.
+unsafe fn sync_monitor_layout(blocking_hwnd: HWND) {
+    // Primary monitor: resize the main overlay and re-lay out its controls
+    // (WM_PAINT already draws from the client rect, so the panel recenters
+    // on its own).
+    let new_width = GetSystemMetrics(SM_CXSCREEN);
+    let new_height = GetSystemMetrics(SM_CYSCREEN);
+    let mut client: RECT = zeroed();
+    if GetClientRect(blocking_hwnd, &mut client).is_ok()
+        && (client.right != new_width || client.bottom != new_height)
+    {
+        let _ = SetWindowPos(
+            blocking_hwnd,
+            None,
+            0, 0,
+            new_width,
+            new_height,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        layout_children(blocking_hwnd);
+        let _ = InvalidateRect(blocking_hwnd, None, false);
+    }
+
+    // Secondary monitors: rebuild the blankers if the set of non-primary
+    // monitor rects no longer matches what they were built for.
+    let monitors = enumerate_monitors();
+    let current: Vec<RECT> = monitors
+        .iter()
+        .filter(|m| !m.is_primary)
+        .map(|m| m.rect)
+        .collect();
+    if SECONDARY_OVERLAYS.lock().unwrap().layout == current {
+        return;
+    }
+
+    if let Ok(hinstance) = GetModuleHandleW(None) {
+        build_secondary_overlays(hinstance, monitors);
+    }
+    show_secondary_overlays();
+}
+
+/// Push a window back to the top of the topmost band without activating it,
+/// optionally showing it as well. WS_EX_TOPMOST alone isn't enough: recent
+/// Windows 11 builds can leave a window with the topmost style still set but
+/// actually z-ordered *below* ordinary windows, so anything dragged over it
+/// hides it. The overlays therefore re-assert on a timer.
+pub(crate) unsafe fn push_to_topmost(hwnd: HWND, show: bool) {
+    let mut flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+    if show {
+        flags |= SWP_SHOWWINDOW;
+    }
+    let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+}
+
+/// Show every secondary blanker and push it back to the top of the topmost
+/// band. Runs on show and on every TIMER_REASSERT_TOPMOST tick: besides the
+/// z-order repair, blankers rebuilt mid display-mode change can end up
+/// hidden (the show is lost while the display is still switching) and
+/// nothing else would show them again. Skipped when the overlay isn't up,
+/// so a tick can't re-show blankers an unlock has just hidden.
+unsafe fn show_secondary_overlays() {
+    if !is_blocking_overlay_visible() {
+        return;
+    }
+    for hwnd in secondary_overlay_hwnds() {
+        push_to_topmost(hwnd, true);
     }
 }
 
 /// Hide all secondary monitor overlays
 unsafe fn hide_secondary_overlays() {
-    let secondary_hwnds = SECONDARY_OVERLAY_HWNDS.lock().unwrap();
-
-    for &hwnd_ptr in secondary_hwnds.iter() {
-        let hwnd = HWND(hwnd_ptr as *mut std::ffi::c_void);
+    for hwnd in secondary_overlay_hwnds() {
         let _ = ShowWindow(hwnd, SW_HIDE);
     }
 }

@@ -17,6 +17,14 @@ pub fn init_dpi() {
     CACHED_DPI.store(dpi, Ordering::SeqCst);
 }
 
+/// Replace the cached DPI, e.g. from WM_DPICHANGED on the primary monitor
+/// (GetDpiForSystem keeps reporting the logon-time value after that).
+pub fn set_dpi(dpi: u32) {
+    if dpi != 0 {
+        CACHED_DPI.store(dpi, Ordering::SeqCst);
+    }
+}
+
 /// Get the current DPI value
 pub fn get_dpi() -> u32 {
     let cached = CACHED_DPI.load(Ordering::SeqCst);
