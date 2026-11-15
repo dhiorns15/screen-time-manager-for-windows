@@ -176,10 +176,51 @@ pub fn cmd_resume() -> String {
     }
 }
 
+/// Which chat markup `cmd_weekly` formats for. The table has to be sent as
+/// a monospace block to line up, and each platform spells that differently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WeeklyMarkup {
+    /// Discord message markdown: a ``` code block.
+    DiscordMarkdown,
+    /// Telegram `ParseMode::Html`: a `<pre>` block. HTML rather than
+    /// MarkdownV2 because MarkdownV2 rejects the whole message if any of
+    /// `_*[]()~`>#+-=|{}.!` appears unescaped outside the block - which the
+    /// English header ("2-Week Usage") and usernames like "anna.b" do.
+    TelegramHtml,
+}
+
+/// Escape text for Telegram's HTML parse mode: only `&`, `<` and `>` are
+/// special there (see https://core.telegram.org/bots/api#html-style).
+pub fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Backslash-escape the characters Discord markdown would otherwise read as
+/// formatting mid-line (so a username like "max_the_great" isn't italicised).
+pub fn escape_discord_markdown(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '*' | '_' | '~' | '`' | '|') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// 14-day usage table (minutes active / paused per day) for one user, sent
 /// as a monospace code block so it lines up as an actual table in
 /// Telegram/Discord.
-fn weekly_table_for(username: &str, history: &[(String, i32, i32)]) -> String {
+fn weekly_table_for(username: &str, history: &[(String, i32, i32)], markup: WeeklyMarkup) -> String {
     let mut table = format!("{:<6}{:>8}{:>9}\n", "Date", "Used", "Paused");
     for (date, active_min, pause_min) in history {
         let short_date = date.get(5..).unwrap_or(date); // MM-DD
@@ -190,7 +231,14 @@ fn weekly_table_for(username: &str, history: &[(String, i32, i32)]) -> String {
             format_hm(pause_min * 60)
         ));
     }
-    format!("👤 {}\n```\n{}```", username, table)
+    match markup {
+        WeeklyMarkup::DiscordMarkdown => {
+            format!("👤 {}\n```\n{}```", escape_discord_markdown(username), table)
+        }
+        WeeklyMarkup::TelegramHtml => {
+            format!("👤 {}\n<pre>{}</pre>", escape_html(username), escape_html(&table))
+        }
+    }
 }
 
 /// 14-day usage table for every Windows account that's used this app on
@@ -200,20 +248,24 @@ fn weekly_table_for(username: &str, history: &[(String, i32, i32)]) -> String {
 /// local history alone if the shared registry is empty (e.g. the shared
 /// database is unavailable, or this is the first run since the per-user
 /// mirroring was added and no shared history has accumulated yet).
-pub fn cmd_weekly() -> String {
+pub fn cmd_weekly(markup: WeeklyMarkup) -> String {
     let all_users = database::get_all_users_daily_usage_history(14);
 
     let body = if all_users.is_empty() {
-        weekly_table_for(&current_windows_username(), &database::get_daily_usage_history(14))
+        weekly_table_for(&current_windows_username(), &database::get_daily_usage_history(14), markup)
     } else {
         all_users
             .iter()
-            .map(|(username, history)| weekly_table_for(username, history))
+            .map(|(username, history)| weekly_table_for(username, history, markup))
             .collect::<Vec<_>>()
             .join("\n")
     };
 
-    format!("📊 {}\n{}", i18n::t("tg.weekly.header"), body)
+    let header = match markup {
+        WeeklyMarkup::DiscordMarkdown => i18n::t("tg.weekly.header").to_string(),
+        WeeklyMarkup::TelegramHtml => escape_html(i18n::t("tg.weekly.header")),
+    };
+    format!("📊 {}\n{}", header, body)
 }
 
 pub fn cmd_history() -> String {
@@ -476,5 +528,41 @@ pub fn format_pause_reason(reason: mini_overlay::PauseBlockedReason) -> String {
             format!("{} ({})", i18n::t("pause.min_active"), format_hm(seconds_remaining))
         }
         mini_overlay::PauseBlockedReason::TimeTooLow => i18n::t("pause.time_too_low").to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn html_escaping() {
+        assert_eq!(escape_html("2-Week Usage"), "2-Week Usage");
+        assert_eq!(escape_html("a<b>&c"), "a&lt;b&gt;&amp;c");
+        assert_eq!(escape_html("anna.b_x-1"), "anna.b_x-1");
+    }
+
+    #[test]
+    fn discord_markdown_escaping() {
+        assert_eq!(escape_discord_markdown("max_the_great"), "max\\_the\\_great");
+        assert_eq!(escape_discord_markdown("a*b~c`d|e"), "a\\*b\\~c\\`d\\|e");
+        assert_eq!(escape_discord_markdown("anna.b-1"), "anna.b-1");
+    }
+
+    #[test]
+    fn weekly_table_markup() {
+        let history = vec![("2026-11-14".to_string(), 95, 10)];
+
+        let tg = weekly_table_for("anna.b_<x>", &history, WeeklyMarkup::TelegramHtml);
+        assert!(tg.starts_with("👤 anna.b_&lt;x&gt;\n<pre>"), "{tg}");
+        assert!(tg.ends_with("</pre>"), "{tg}");
+        assert!(tg.contains("11-14"), "{tg}");
+        assert!(tg.contains("1h 35m"), "{tg}");
+        assert!(!tg.contains("```"), "{tg}");
+
+        let dc = weekly_table_for("max_k", &history, WeeklyMarkup::DiscordMarkdown);
+        assert!(dc.starts_with("👤 max\\_k\n```\n"), "{dc}");
+        assert!(dc.ends_with("```"), "{dc}");
+        assert!(dc.contains("1h 35m"), "{dc}");
     }
 }

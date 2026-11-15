@@ -13,7 +13,7 @@ use crate::i18n;
 use crate::remote_commands::{
     cmd_extend, cmd_getpin, cmd_history, cmd_lock, cmd_msg, cmd_pause, cmd_reduce, cmd_reset,
     cmd_resume, cmd_rotatingpin, cmd_setlimit, cmd_setmessage, cmd_setpin, cmd_status, cmd_time,
-    cmd_unlock, cmd_update, cmd_weekly,
+    cmd_unlock, cmd_update, cmd_weekly, WeeklyMarkup,
 };
 use crate::time_request;
 
@@ -376,10 +376,10 @@ async fn handle_command(
         _ => None,
     };
 
-    // The weekly table is sent as a MarkdownV2 code block so it actually
-    // lines up as a table client-side - every other command's response is
-    // sent as plain text, so this needs to be known before `cmd` is consumed
-    // by the match below.
+    // The weekly table is sent as an HTML <pre> block so it actually lines
+    // up as a table client-side (cmd_weekly escapes everything around it) -
+    // every other command's response is sent as plain text, so this needs
+    // to be known before `cmd` is consumed by the match below.
     let is_weekly = matches!(&cmd, Command::Weekly);
 
     let response = match cmd {
@@ -391,7 +391,7 @@ async fn handle_command(
         Command::Pause => cmd_pause(),
         Command::Resume => cmd_resume(),
         Command::History => cmd_history(),
-        Command::Weekly => cmd_weekly(),
+        Command::Weekly => cmd_weekly(WeeklyMarkup::TelegramHtml),
         Command::Msg(text) => cmd_msg(&text),
         Command::Lock => cmd_lock(),
         Command::Stop => cmd_lock(),
@@ -419,7 +419,7 @@ async fn handle_command(
     }
 
     if is_weekly {
-        bot.send_message(msg.chat.id, response).parse_mode(ParseMode::MarkdownV2).await?;
+        bot.send_message(msg.chat.id, response).parse_mode(ParseMode::Html).await?;
     } else {
         bot.send_message(msg.chat.id, response).await?;
     }

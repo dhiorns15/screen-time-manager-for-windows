@@ -14,7 +14,7 @@ use crate::i18n;
 use crate::remote_commands::{
     cmd_extend, cmd_getpin, cmd_history, cmd_lock, cmd_msg, cmd_pause, cmd_reduce, cmd_reset,
     cmd_resume, cmd_rotatingpin, cmd_setlimit, cmd_setmessage, cmd_setpin, cmd_status, cmd_time,
-    cmd_unlock, cmd_update, cmd_weekly,
+    cmd_unlock, cmd_update, cmd_weekly, WeeklyMarkup,
 };
 use crate::time_request;
 
@@ -134,7 +134,7 @@ impl EventHandler for Handler {
             "pause" => cmd_pause(),
             "resume" => cmd_resume(),
             "history" => cmd_history(),
-            "weekly" => cmd_weekly(),
+            "weekly" => cmd_weekly(WeeklyMarkup::DiscordMarkdown),
             "msg" => cmd_msg(args),
             "lock" | "stop" => cmd_lock(),
             "unlock" => cmd_unlock(),
