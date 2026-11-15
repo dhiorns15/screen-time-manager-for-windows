@@ -80,7 +80,7 @@ A "Time's Up!" screen appears that blocks the entire computer.
 - **Unlock button** - Enter passcode to remove the block completely
 - **Shut Down button** - Shut down the computer (with confirmation)
 
-The screen also counts down (10 minutes by default; change it in Settings, minimum 1 minute) and then shuts the computer down. If another Windows account is signed in at the same time (Fast User Switching), it signs your child's account out instead, so nobody else's work is lost. The countdown only runs while the blocked account is the one on screen and Windows isn't locked.
+The screen also counts down (10 minutes by default; change it in Settings, from 1 minute up to 24 hours) and then shuts the computer down. If another Windows account is signed in at the same time (Fast User Switching), it signs your child's account out instead, so nobody else's work is lost. The countdown only runs while the blocked account is the one on screen and Windows isn't locked.
 
 Wrong passcodes are limited here just like in the tray menu: after five in a row, the screen shows how long to wait before the next try, and you get an alert (see [Automatic Restart & Tamper Alerts](#automatic-restart--tamper-alerts)).
 
@@ -141,7 +141,9 @@ You can monitor and control screen time from your phone using Telegram. This is 
 6. In Screen Time Manager settings, scroll to "Telegram Bot" section (or use the **Setup Wizard**, which finds the chat ID for you)
 7. Paste your bot token and chat ID, then enable the bot
 
-The bot starts as soon as you save. Once configured, only you can control the bot - it ignores messages from anyone else. If you set it up in a **group** (for example a family group, so both parents get the alerts), only the group's owner and administrators can send it commands; ordinary members, such as a child you added to the group, can't.
+The bot starts as soon as you save. Once configured, only you can control the bot - it ignores messages from anyone else. If you set it up in a **group** (for example a family group, so both parents get the alerts), only the group's owner and administrators can send it commands; ordinary members, such as a child you added to the group, can't. The bot never posts a PIN in a group, where everyone in it could read it; ask for `/getpin` in your private chat with the bot instead.
+
+The Setup Wizard takes the chat from the first message the bot receives while the wizard is waiting for it, so send that message after you reach that step - anything sent to the bot earlier is ignored.
 
 Commands are acted on only if they reach the PC within a few minutes. Anything you sent while the PC was off, asleep or offline is dropped when it comes back, rather than suddenly running then - for whichever account happens to be signed in by that time. Send the command again once the PC is on.
 
@@ -204,11 +206,12 @@ If you're worried about the passcode being watched and memorized, enable the rot
 
 If Screen Time Manager is stopped in any way other than the passcode-protected Quit option (e.g. ended via Task Manager), it's automatically relaunched within about a minute, and you'll get a Telegram/Discord alert if either is enabled. Setup turns this on for **every** Windows account on the PC, including accounts signed in at the same time via Fast User Switching. Installing an update doesn't count as tampering: the app restarts afterwards without an alert.
 
-The watchdog also notices when the app is still there but has stopped working - for example frozen, or suspended with a process tool - after a few minutes. It restarts the app and tells you once. It only does this while someone is actually using the PC, so sleep, hibernation, restarts, a locked screen, switching users and a PC left alone don't trigger it.
+The watchdog also notices when the app is still there but has stopped working - for example frozen, or suspended with a process tool - after a few minutes. It restarts the app and tells you once. It only does this while someone is actually using the PC, so sleep, hibernation, restarts, a locked screen, switching users and a PC left alone don't trigger it. If the app keeps freezing again straight after being restarted, the watchdog stops restarting it after a few times in an hour and tells you so once, so you can check the PC.
 
 Other alerts you may get:
 
-- **Wrong passcodes** - after five wrong codes in a row (on the lock screen or in the tray's passcode prompt), each further wrong code makes passcode entry wait before it accepts another try (up to 15 minutes), and you get one alert, since someone may be guessing.
+- **Wrong passcodes** - after five wrong codes in a row (on the lock screen or in the tray's passcode prompt), each further wrong code makes passcode entry wait before it accepts another try (up to 15 minutes), and you get one alert, since someone may be guessing. If it was you, a bot command clears the wait so you can try again straight away.
+- **Clock or time zone changed** - changing the PC's clock or time zone doesn't start a new day with a fresh allowance: the app stays on the day it was on, and tells you. If you changed the time zone on purpose (say, you're travelling with the laptop), open Settings and click Save to accept it.
 - **Damaged settings** - if an account's settings file can't be opened, the app doesn't stop: a damaged file is set aside and replaced with default settings (re-check the limits for that account), and if the file can't be opened at all the app runs on default settings until it can. Either way you're told. The time already used today is carried over, so this doesn't start the day's allowance over.
 
 If the PC is offline when an alert is raised, it's kept and sent once the connection is back (anything more than a day old is dropped).
