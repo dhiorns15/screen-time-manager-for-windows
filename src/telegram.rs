@@ -2,17 +2,21 @@
 //! Provides remote monitoring and control via Telegram commands
 
 use std::sync::Mutex;
+use std::time::Duration;
 use teloxide::prelude::*;
+use teloxide::dispatching::DefaultKey;
 use teloxide::error_handlers::LoggingErrorHandler;
 use teloxide::types::ParseMode;
+use teloxide::update_listeners::Polling;
 use teloxide::utils::command::BotCommands;
+use teloxide::RequestError;
 
 use crate::database;
 use crate::i18n;
 use crate::remote_commands::{
     cmd_extend, cmd_getpin, cmd_history, cmd_lock, cmd_msg, cmd_pause, cmd_reduce, cmd_reset,
     cmd_resume, cmd_rotatingpin, cmd_setlimit, cmd_setmessage, cmd_setpin, cmd_status, cmd_time,
-    cmd_unlock, cmd_update, cmd_weekly, BotLifecycle, StartAction, WeeklyMarkup,
+    cmd_unlock, cmd_update, cmd_weekly, retry_delay, BotLifecycle, StartAction, WeeklyMarkup,
 };
 use crate::time_request;
 
@@ -251,28 +255,127 @@ pub fn signal_shutdown() {
     }
 }
 
-/// Main bot loop
+/// Main bot loop. Runs until this generation is told to stop. Nothing in
+/// here may panic on a network or token problem: the release build aborts
+/// on panic, so it would take the whole app (and enforcement) down with it.
 async fn run_bot(token: String, admin_chat_id: Option<i64>) {
-    let bot = Bot::new(&token);
+    let mut failures = 0u32;
+
+    // `Bot::new` would panic if the HTTP client couldn't be built; build the
+    // identical client ourselves so a failure is just another retry.
+    let bot = loop {
+        match teloxide::net::default_reqwest_settings().build() {
+            Ok(client) => break Bot::with_client(token, client),
+            Err(e) => {
+                failures += 1;
+                eprintln!("[Telegram] Couldn't create HTTP client: {e}");
+                if !LIFECYCLE.sleep_unless_shutdown(retry_delay(failures)).await {
+                    return;
+                }
+            }
+        }
+    };
 
     // Store bot instance for notifications
     *BOT_INSTANCE.lock().unwrap() = Some(bot.clone());
 
-    // Send startup notification. This fires whenever the bot (re)connects,
-    // including a session-handoff reconnect under Fast User Switching (see
+    let mut dispatcher = build_dispatcher(bot.clone(), admin_chat_id);
+    let shutdown_token = dispatcher.shutdown_token();
+    let mut announced = false;
+
+    // Connect, and reconnect after failures until told to stop. Once
+    // connected, the polling listener rides out later network drops itself
+    // (with its own backoff), so this loop only repeats when connecting
+    // fails: no network at startup, Telegram unreachable, or a bad token.
+    while !LIFECYCLE.shutdown_requested() {
+        let outcome = {
+            let attempt =
+                connect_and_dispatch(&bot, &mut dispatcher, admin_chat_id, &mut announced, &mut failures);
+            tokio::pin!(attempt);
+            let outcome = tokio::select! {
+                res = &mut attempt => Some(res),
+                () = LIFECYCLE.wait_for_shutdown() => None,
+            };
+            if outcome.is_none() {
+                // Told to stop. If the dispatcher is running, stop it
+                // gracefully: polling then confirms the last update it
+                // handed out, so Telegram doesn't deliver it again next
+                // time, and in-flight commands finish. If it isn't running
+                // yet (still connecting), there's nothing to confirm, and
+                // dropping the attempt cancels the pending request.
+                if shutdown_token.shutdown().is_ok() {
+                    let _ = attempt.await;
+                }
+            }
+            outcome
+        };
+
+        match outcome {
+            None => break,
+            Some(Ok(())) if LIFECYCLE.shutdown_requested() => break,
+            Some(Ok(())) => {
+                failures += 1;
+                eprintln!("[Telegram] Update listener stopped unexpectedly - reconnecting");
+            }
+            Some(Err(e)) => {
+                failures += 1;
+                eprintln!("[Telegram] Couldn't connect (attempt {failures}): {e}");
+            }
+        }
+        if !LIFECYCLE.sleep_unless_shutdown(retry_delay(failures)).await {
+            break;
+        }
+    }
+}
+
+/// One connection attempt: check the token works, announce, and run the
+/// dispatcher until it's shut down. Errors only for a failed connection
+/// (`try_dispatch_with_listener` rather than `dispatch`, which panics if
+/// its initial `get_me` call fails).
+async fn connect_and_dispatch(
+    bot: &Bot,
+    dispatcher: &mut Dispatcher<Bot, RequestError, DefaultKey>,
+    admin_chat_id: Option<i64>,
+    announced: &mut bool,
+    failures: &mut u32,
+) -> Result<(), RequestError> {
+    bot.get_me().await?;
+    *failures = 0;
+
+    // Send startup notification, once per bot generation and only once
+    // actually connected. A generation starts whenever the bot (re)starts,
+    // including a session-handoff restart under Fast User Switching (see
     // session.rs) - not just a genuine app startup - so it doubles as an
     // "active user changed" notice: whichever account's session currently
     // owns the console is the one whose bot is live, and this says who that is.
-    if let Some(chat_id) = admin_chat_id {
-        let text = format!(
-            "{}\n👤 {}: {}",
-            i18n::t("tg.notify.started"),
-            i18n::t("tg.status.user"),
-            crate::remote_commands::current_windows_username(),
-        );
-        let _ = bot.send_message(ChatId(chat_id), text).await;
+    if !*announced {
+        *announced = true;
+        if let Some(chat_id) = admin_chat_id {
+            let text = format!(
+                "{}\n👤 {}: {}",
+                i18n::t("tg.notify.started"),
+                i18n::t("tg.status.user"),
+                crate::remote_commands::current_windows_username(),
+            );
+            let _ = bot.send_message(ChatId(chat_id), text).await;
+        }
     }
 
+    // Same listener `dispatch()` would build.
+    let listener = Polling::builder(bot.clone())
+        .timeout(Duration::from_secs(10))
+        .delete_webhook()
+        .await
+        .build();
+    dispatcher
+        .try_dispatch_with_listener(
+            listener,
+            LoggingErrorHandler::with_custom_text("[Telegram] Update listener error"),
+        )
+        .await
+}
+
+fn build_dispatcher(bot: Bot, admin_chat_id: Option<i64>) -> Dispatcher<Bot, RequestError, DefaultKey> {
     // Command handler
     let command_handler = Update::filter_message()
         .filter_command::<Command>()
@@ -314,24 +417,12 @@ async fn run_bot(token: String, admin_chat_id: Option<i64>) {
         .branch(fallback_handler);
 
     // Create dispatcher with default error handler that logs errors
-    let mut dispatcher = Dispatcher::builder(bot, handler)
+    Dispatcher::builder(bot, handler)
         .default_handler(|upd| async move {
             eprintln!("[Telegram] Unhandled update: {:?}", upd);
         })
         .error_handler(LoggingErrorHandler::with_custom_text("[Telegram] Error in handler"))
-        .build();
-
-    // Get shutdown token for graceful shutdown
-    let shutdown_token = dispatcher.shutdown_token();
-
-    // Spawn a task to monitor shutdown signal
-    tokio::spawn(async move {
-        LIFECYCLE.wait_for_shutdown().await;
-        shutdown_token.shutdown().ok();
-    });
-
-    // Run dispatcher
-    dispatcher.dispatch().await;
+        .build()
 }
 
 /// Handle incoming commands

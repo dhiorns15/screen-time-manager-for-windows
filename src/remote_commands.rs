@@ -537,6 +537,14 @@ pub fn format_pause_reason(reason: mini_overlay::PauseBlockedReason) -> String {
 // Bot connection lifecycle, shared by telegram.rs and discord.rs
 // ============================================================================
 
+/// How long to wait before the next connection attempt after `failures`
+/// consecutive failures (1 = the first): 2s, 4s, 8s, 16s, 32s, then once a
+/// minute. Short enough that a laptop coming back online gets its bot back
+/// within a minute, long enough not to hammer the API with a bad token.
+pub fn retry_delay(failures: u32) -> Duration {
+    Duration::from_secs((1u64 << failures.clamp(1, 6)).min(60))
+}
+
 /// What `BotLifecycle::request_start` decided.
 #[derive(Debug, PartialEq, Eq)]
 pub enum StartAction {
@@ -659,11 +667,27 @@ impl BotLifecycle {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
+
+    /// Sleep for `delay`, cut short by a stop. Returns false if stopped.
+    pub async fn sleep_unless_shutdown(&self, delay: Duration) -> bool {
+        tokio::select! {
+            () = tokio::time::sleep(delay) => true,
+            () = self.wait_for_shutdown() => false,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_delay_backs_off_to_a_minute() {
+        let secs: Vec<u64> = (1..=8).map(|n| retry_delay(n).as_secs()).collect();
+        assert_eq!(secs, [2, 4, 8, 16, 32, 60, 60, 60]);
+        assert_eq!(retry_delay(0).as_secs(), 2);
+        assert_eq!(retry_delay(u32::MAX).as_secs(), 60);
+    }
 
     #[test]
     fn html_escaping() {

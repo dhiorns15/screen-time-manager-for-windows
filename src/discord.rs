@@ -362,7 +362,18 @@ pub fn signal_shutdown() {
     }
 }
 
-/// Main bot loop
+/// Main bot loop. Runs until this generation is told to stop, or Discord
+/// refuses the configuration outright (bad token, Message Content intent
+/// not enabled) - neither of which can change without an app restart.
+///
+/// Network trouble needs no retry loop here, unlike telegram.rs: serenity
+/// keeps re-queueing the gateway connection every few seconds until it
+/// succeeds, and reconnects by itself after a drop. Building the client
+/// makes no network calls that can fail it either (`get_gateway` falls back
+/// to the default URL). What it does need is a stop that works while still
+/// offline: `shutdown_all` returns early without ending `start()` when no
+/// shard has connected yet, which used to leave this thread - and so the
+/// bot's running state - stuck until the app exited.
 async fn run_bot(settings: Settings) {
     let Settings { token, channel_id, admin_user_id } = settings;
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
@@ -382,12 +393,19 @@ async fn run_bot(settings: Settings) {
     *NOTIFY_CHANNEL_ID.lock().unwrap() = Some(channel_id);
 
     let shard_manager = client.shard_manager.clone();
-    tokio::spawn(async move {
-        LIFECYCLE.wait_for_shutdown().await;
+    let stopped = tokio::select! {
+        res = client.start() => {
+            if let Err(e) = res {
+                eprintln!("[Discord] Client error: {e}");
+            }
+            false
+        }
+        () = LIFECYCLE.wait_for_shutdown() => true,
+    };
+    if stopped {
+        // Close any connected shard cleanly. Whatever is left (a connection
+        // attempt still waiting for the network) is cancelled when this
+        // generation's runtime is dropped.
         shard_manager.shutdown_all().await;
-    });
-
-    if let Err(e) = client.start().await {
-        eprintln!("[Discord] Client error: {e}");
     }
 }
