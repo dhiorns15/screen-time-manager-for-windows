@@ -217,14 +217,18 @@ unsafe fn show_context_menu_with_pause(hwnd: HWND, hmenu: HMENU, pause_text: PCW
 
     insert_or_bail!(idx, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
     idx += 1;
-    let warning_text = i18n::wide("tray.show_warning");
-    insert_or_bail!(idx, MF_BYPOSITION | MF_STRING, IDM_SHOW_OVERLAY as usize, PCWSTR(warning_text.as_ptr()));
-    idx += 1;
-    let blocking_text = i18n::wide("tray.show_blocking");
-    insert_or_bail!(idx, MF_BYPOSITION | MF_STRING, IDM_SHOW_BLOCKING as usize, PCWSTR(blocking_text.as_ptr()));
-    idx += 1;
-    insert_or_bail!(idx, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
-    idx += 1;
+    // Test items for developers: not in release builds, where "Show
+    // Blocking Overlay" let anyone start the shutdown countdown, no passcode.
+    if cfg!(debug_assertions) {
+        let warning_text = i18n::wide("tray.show_warning");
+        insert_or_bail!(idx, MF_BYPOSITION | MF_STRING, IDM_SHOW_OVERLAY as usize, PCWSTR(warning_text.as_ptr()));
+        idx += 1;
+        let blocking_text = i18n::wide("tray.show_blocking");
+        insert_or_bail!(idx, MF_BYPOSITION | MF_STRING, IDM_SHOW_BLOCKING as usize, PCWSTR(blocking_text.as_ptr()));
+        idx += 1;
+        insert_or_bail!(idx, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
+        idx += 1;
+    }
     let about_text = i18n::wide("tray.about");
     insert_or_bail!(idx, MF_BYPOSITION | MF_STRING, IDM_ABOUT as usize, PCWSTR(about_text.as_ptr()));
     idx += 1;
@@ -294,11 +298,13 @@ pub unsafe extern "system" fn window_proc(
                         }
                     }
                 }
-                IDM_SHOW_OVERLAY => {
+                // Debug builds only, like their menu items: in release a
+                // WM_COMMAND posted by another process mustn't reach them.
+                IDM_SHOW_OVERLAY if cfg!(debug_assertions) => {
                     let (minutes, message) = get_warning_config(1);
                     show_overlay(&message, minutes);
                 }
-                IDM_SHOW_BLOCKING => {
+                IDM_SHOW_BLOCKING if cfg!(debug_assertions) => {
                     let message = get_blocking_message();
                     show_blocking_overlay(&message);
                 }
