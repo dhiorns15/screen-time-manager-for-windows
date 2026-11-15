@@ -65,7 +65,18 @@ pub unsafe fn create_overlay_window(hinstance: windows::Win32::Foundation::HMODU
     OVERLAY_HWND.store(overlay_hwnd.0, Ordering::SeqCst);
 }
 
-/// Shows the warning overlay with the specified text for a given duration
+/// Posted to the overlay window by `show_overlay` when it's called off the UI
+/// thread (the bots' `msg` command and plain-text messages), with the
+/// duration in seconds as wParam. SetTimer only works on a window the calling
+/// thread owns, so a bot thread's call used to show the banner and never
+/// hide it; ShowWindow/SetWindowPos from there were also synchronous
+/// cross-thread sends. Same pattern as the blocking overlay's
+/// WM_APP_SHOW_OVERLAY.
+const WM_APP_SHOW_WARNING: u32 = WM_APP + 1;
+
+/// Shows the warning overlay with the specified text for a given duration.
+/// Safe to call from any thread: the text is stored here, the window work
+/// runs on the UI thread.
 pub unsafe fn show_overlay(text: &str, duration_seconds: u32) {
     let overlay_hwnd = HWND(OVERLAY_HWND.load(Ordering::SeqCst));
     if overlay_hwnd.0.is_null() {
@@ -73,6 +84,21 @@ pub unsafe fn show_overlay(text: &str, duration_seconds: u32) {
     }
 
     *OVERLAY_TEXT.lock().unwrap() = Some(text.to_string());
+
+    if !crate::blocking::on_ui_thread(overlay_hwnd) {
+        let _ = PostMessageW(
+            overlay_hwnd,
+            WM_APP_SHOW_WARNING,
+            WPARAM(duration_seconds as usize),
+            LPARAM(0),
+        );
+        return;
+    }
+    apply_show_overlay(overlay_hwnd, duration_seconds);
+}
+
+/// The window side of showing the warning overlay. UI thread only.
+unsafe fn apply_show_overlay(overlay_hwnd: HWND, duration_seconds: u32) {
     let _ = InvalidateRect(overlay_hwnd, None, true);
 
     SetWindowPos(
@@ -148,6 +174,10 @@ pub unsafe extern "system" fn overlay_window_proc(
             if wparam.0 == TIMER_OVERLAY_HIDE {
                 hide_overlay();
             }
+            LRESULT(0)
+        }
+        WM_APP_SHOW_WARNING => {
+            apply_show_overlay(hwnd, wparam.0 as u32);
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),

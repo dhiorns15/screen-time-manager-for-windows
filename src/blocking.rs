@@ -216,7 +216,7 @@ pub unsafe fn show_blocking_overlay_with_time(text: &str, remaining_seconds: i32
 /// Whether the calling thread owns the given window - i.e. is the UI thread,
 /// the only one that may create, destroy, show or hide our windows without a
 /// synchronous cross-thread SendMessage underneath.
-unsafe fn on_ui_thread(hwnd: HWND) -> bool {
+pub(crate) unsafe fn on_ui_thread(hwnd: HWND) -> bool {
     GetWindowThreadProcessId(hwnd, None) == GetCurrentThreadId()
 }
 
