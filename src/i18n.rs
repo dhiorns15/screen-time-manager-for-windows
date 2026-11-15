@@ -220,7 +220,7 @@ fn en(key: &str) -> &'static str {
         "blocking.request_unavailable" => "Enable Telegram or Discord in Settings to request more time here",
 
         // ----- About Dialog -----
-        "about.text" => "Screen Time Manager v1.0.40\n\nA parental control application for managing screen time.\n\n(c) Simon Pamies",
+        "about.text" => concat!("Screen Time Manager v", env!("CARGO_PKG_VERSION"), "\n\nA parental control application for managing screen time.\n\n(c) Simon Pamies"),
 
         // ----- Pause Reasons -----
         "pause.disabled" => "Pause feature is disabled",
@@ -246,6 +246,7 @@ fn en(key: &str) -> &'static str {
         "tg.cmd.e60" => "Extend by 60 minutes",
         "tg.cmd.e120" => "Extend by 120 minutes",
         "tg.cmd.chatid" => "Get your chat ID for setup",
+        "tg.cmd.update" => "Install the latest version, if a newer one is available",
         "tg.cmd.help" => "Show this help message",
 
         // ----- Telegram Bot - Responses -----
@@ -348,6 +349,7 @@ fn en(key: &str) -> &'static str {
         "dc.cmd.setlimit" => "Set daily limit in minutes (e.g., !setlimit 90 or !setlimit saturday 180)",
         "dc.cmd.rotatingpin" => "Toggle the rotating daily PIN on/off (e.g., !rotatingpin on)",
         "dc.cmd.getpin" => "Get today's rotating PIN (if enabled)",
+        "dc.cmd.update" => "Install the latest version, if a newer one is available",
         "dc.cmd.e30" => "Extend by 30 minutes",
         "dc.cmd.e60" => "Extend by 60 minutes",
         "dc.cmd.e120" => "Extend by 120 minutes",
@@ -376,6 +378,25 @@ fn en(key: &str) -> &'static str {
         "watchdog.alert.restarted" => "and was just restarted.",
         "watchdog.alert.restart_failed" => "and the automatic restart failed - please check on it.",
         "watchdog.alert.suffix" => "If you didn't do this yourself (e.g. via Quit), this may be an attempt to bypass the time limit.",
+
+        // ----- Updates (daily check, update command, post-update notice) -----
+        "update.notify.available" => "A new version of Screen Time Manager is available:",
+        "update.notify.current" => "Installed",
+        "update.notify.how_tg" => "Send /update to install it.",
+        "update.notify.how_dc" => "Send !update to install it.",
+        "update.notify.updated" => "Screen Time Manager was updated:",
+        "update.notify.stalled" => "The update didn't complete - Screen Time Manager is still running the old version.",
+        "update.notify.target" => "Requested version",
+        "update.notify.running" => "Still running",
+        "update.notify.log" => "Updater and setup logs (admin only)",
+        "update.cmd.up_to_date" => "Already up to date",
+        "update.cmd.check_failed" => "Couldn't check for updates:",
+        "update.cmd.not_installable" => "A newer version exists but can't be installed automatically:",
+        "update.cmd.installing" => "Installing",
+        "update.cmd.installing_suffix" => "",
+        "update.cmd.restart_note" => "Screen Time Manager will restart within a couple of minutes.",
+        "update.cmd.start_failed" => "Couldn't start the updater:",
+        "update.cmd.manual" => "Install it manually from:",
 
         // ----- Clock Tamper Alert -----
         "clock_tamper.notify.header" => "the system clock was just changed on",
@@ -615,7 +636,7 @@ fn de(key: &str) -> &'static str {
         "blocking.request_unavailable" => "Aktivieren Sie Telegram oder Discord in den Einstellungen, um hier mehr Zeit anzufragen",
 
         // ----- About Dialog -----
-        "about.text" => "Bildschirmzeit Manager v1.0.40\n\nEine Kindersicherungs-App zur Verwaltung der Bildschirmzeit.\n\n(c) Simon Pamies",
+        "about.text" => concat!("Bildschirmzeit Manager v", env!("CARGO_PKG_VERSION"), "\n\nEine Kindersicherungs-App zur Verwaltung der Bildschirmzeit.\n\n(c) Simon Pamies"),
 
         // ----- Pause Reasons -----
         "pause.disabled" => "Pause-Funktion ist deaktiviert",
@@ -641,6 +662,7 @@ fn de(key: &str) -> &'static str {
         "tg.cmd.e60" => "Um 60 Minuten verlängern",
         "tg.cmd.e120" => "Um 120 Minuten verlängern",
         "tg.cmd.chatid" => "Chat-ID für Einrichtung abrufen",
+        "tg.cmd.update" => "Neueste Version installieren, falls eine neuere verfügbar ist",
         "tg.cmd.help" => "Diese Hilfe anzeigen",
 
         // ----- Telegram Bot - Responses -----
@@ -743,6 +765,7 @@ fn de(key: &str) -> &'static str {
         "dc.cmd.setlimit" => "Tageslimit in Minuten setzen (z.B. !setlimit 90 oder !setlimit saturday 180)",
         "dc.cmd.rotatingpin" => "Rotierenden Tages-Code ein-/ausschalten (z.B. !rotatingpin on)",
         "dc.cmd.getpin" => "Heutigen rotierenden Code abrufen (falls aktiviert)",
+        "dc.cmd.update" => "Neueste Version installieren, falls eine neuere verfügbar ist",
         "dc.cmd.e30" => "Um 30 Minuten verlängern",
         "dc.cmd.e60" => "Um 60 Minuten verlängern",
         "dc.cmd.e120" => "Um 120 Minuten verlängern",
@@ -771,6 +794,25 @@ fn de(key: &str) -> &'static str {
         "watchdog.alert.restarted" => "und wurde soeben neu gestartet.",
         "watchdog.alert.restart_failed" => "und der automatische Neustart ist fehlgeschlagen - bitte überprüfen.",
         "watchdog.alert.suffix" => "Wenn Sie das nicht selbst getan haben (z.B. über Beenden), könnte dies ein Versuch sein, das Zeitlimit zu umgehen.",
+
+        // ----- Updates (tägliche Prüfung, Update-Befehl, Hinweis nach dem Update) -----
+        "update.notify.available" => "Eine neue Version des Bildschirmzeit Managers ist verfügbar:",
+        "update.notify.current" => "Installiert",
+        "update.notify.how_tg" => "Senden Sie /update, um sie zu installieren.",
+        "update.notify.how_dc" => "Senden Sie !update, um sie zu installieren.",
+        "update.notify.updated" => "Bildschirmzeit Manager wurde aktualisiert:",
+        "update.notify.stalled" => "Das Update wurde nicht abgeschlossen - der Bildschirmzeit Manager läuft noch mit der alten Version.",
+        "update.notify.target" => "Angeforderte Version",
+        "update.notify.running" => "Läuft noch",
+        "update.notify.log" => "Updater- und Setup-Protokolle (nur für Admins)",
+        "update.cmd.up_to_date" => "Bereits auf dem neuesten Stand",
+        "update.cmd.check_failed" => "Konnte nicht nach Updates suchen:",
+        "update.cmd.not_installable" => "Eine neuere Version ist verfügbar, kann aber nicht automatisch installiert werden:",
+        "update.cmd.installing" => "Version",
+        "update.cmd.installing_suffix" => "wird installiert",
+        "update.cmd.restart_note" => "Der Bildschirmzeit Manager startet in ein paar Minuten neu.",
+        "update.cmd.start_failed" => "Konnte den Updater nicht starten:",
+        "update.cmd.manual" => "Manuell installieren von:",
 
         // ----- Uhrzeit-Manipulationswarnung -----
         "clock_tamper.notify.header" => "die Systemuhr wurde soeben geändert auf",

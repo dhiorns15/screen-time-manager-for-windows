@@ -14,7 +14,7 @@ use crate::i18n;
 use crate::remote_commands::{
     cmd_extend, cmd_getpin, cmd_history, cmd_lock, cmd_msg, cmd_pause, cmd_reduce, cmd_reset,
     cmd_resume, cmd_rotatingpin, cmd_setlimit, cmd_setmessage, cmd_setpin, cmd_status, cmd_time,
-    cmd_unlock, cmd_weekly,
+    cmd_unlock, cmd_update, cmd_weekly,
 };
 use crate::time_request;
 
@@ -144,6 +144,11 @@ impl EventHandler for Handler {
             "setlimit" => cmd_setlimit(args),
             "rotatingpin" => cmd_rotatingpin(args),
             "getpin" => cmd_getpin(),
+            // Talks to GitHub (and schtasks) - off this single-threaded
+            // runtime, so the gateway connection isn't stalled meanwhile.
+            "update" => tokio::task::spawn_blocking(cmd_update)
+                .await
+                .unwrap_or_else(|e| format!("❌ {e}")),
             "e30" => cmd_extend(30),
             "e60" => cmd_extend(60),
             "e120" => cmd_extend(120),
@@ -185,6 +190,7 @@ fn help_text() -> String {
         ("!setlimit <mins>", i18n::t("dc.cmd.setlimit")),
         ("!rotatingpin <on|off>", i18n::t("dc.cmd.rotatingpin")),
         ("!getpin", i18n::t("dc.cmd.getpin")),
+        ("!update", i18n::t("dc.cmd.update")),
         ("!e30", i18n::t("dc.cmd.e30")),
         ("!e60", i18n::t("dc.cmd.e60")),
         ("!e120", i18n::t("dc.cmd.e120")),
@@ -306,6 +312,12 @@ pub fn notify_admin(text: &str) {
             }
         });
     }
+}
+
+/// Whether `notify_admin` would actually send anything right now - i.e. this
+/// session's bot client is up with a channel configured.
+pub fn can_notify() -> bool {
+    BOT_HTTP.lock().is_ok_and(|h| h.is_some()) && NOTIFY_CHANNEL_ID.lock().is_ok_and(|c| c.is_some())
 }
 
 /// Signal the bot to shut down gracefully

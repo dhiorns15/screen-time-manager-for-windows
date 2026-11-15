@@ -8,6 +8,7 @@ use crate::database;
 use crate::i18n;
 use crate::mini_overlay;
 use crate::overlay;
+use crate::update;
 
 /// Windows account currently running the app - useful when the bot config is
 /// shared across multiple accounts/children, so replies say whose data it is.
@@ -425,6 +426,42 @@ pub fn cmd_unlock() -> String {
     }
 
     format!("🔓 {}", i18n::t("tg.unlock.success"))
+}
+
+/// Check GitHub and, if a newer release exists, start the SYSTEM update task
+/// (see update.rs) - which installs it and restarts the app in every
+/// session. Blocking (network + schtasks), so the bots run it off their
+/// async runtime.
+pub fn cmd_update() -> String {
+    let current = update::Version::current();
+    let release = match update::fetch_latest_release() {
+        Ok(r) => r,
+        Err(e) => return format!("❌ {} {e}", i18n::t("update.cmd.check_failed")),
+    };
+    if release.version <= current {
+        return format!("✅ {} (v{current})", i18n::t("update.cmd.up_to_date"));
+    }
+    if let Err(e) = update::installer_asset(&release) {
+        return format!(
+            "❌ v{}: {} {e}\n{} {}",
+            release.version,
+            i18n::t("update.cmd.not_installable"),
+            i18n::t("update.cmd.manual"),
+            release.page
+        );
+    }
+    match update::start_update_task() {
+        Ok(()) => {
+            update::watch_for_stalled_update(release.version);
+            update::installing_text(release.version)
+        }
+        Err(e) => format!(
+            "❌ {} {e}\n{} {}",
+            i18n::t("update.cmd.start_failed"),
+            i18n::t("update.cmd.manual"),
+            release.page
+        ),
+    }
 }
 
 /// Format pause blocked reason for display

@@ -1,5 +1,7 @@
 //! Watchdog check - invoked as `screen-time-manager.exe --watchdog-check`
-//! by a Scheduled Task that fires every minute (registered by install.ps1).
+//! by a Scheduled Task that fires every minute (`ScreenTimeManagerWatchdog`,
+//! registered by the installer - `installer/screen-time-manager.iss`, from
+//! the `installer/task-watchdog.xml` template).
 //!
 //! Each run is a brief, separate process: it checks whether the main app's
 //! single-instance mutex is currently held, and if not - and the app wasn't
@@ -26,7 +28,7 @@ pub const WATCHDOG_ARG: &str = "--watchdog-check";
 
 /// How long after this session's own logon to hold off on relaunch/alert if
 /// the app has *never once* been confirmed running yet this session. The
-/// main app task's own -AtLogOn trigger (see install.ps1) is what's actually
+/// main app task's own -AtLogOn trigger (see installer/task-main.xml) is what's actually
 /// supposed to start it on every session start (a fresh sign-in, a restart,
 /// Fast User Switching creating a brand-new session for an account that's
 /// never logged on before) - it just hasn't necessarily finished doing so
@@ -49,6 +51,26 @@ pub fn run_check() {
         if let Some(token) = logon_token {
             database::record_confirmed_running(token);
         }
+        return;
+    }
+
+    // Just installed or updated: setup stopped the app (or it never ran)
+    // and isn't what starts it again - this check is. Comes before the
+    // startup-grace logic below, which would otherwise either sit out its
+    // whole window waiting for an -AtLogOn launch that isn't coming (the
+    // session logged on before setup ran) or, past it, mistake the update
+    // for tampering.
+    if let Some(marker_age) = pending_post_install_relaunch() {
+        if database::quit_was_intentional() {
+            log(&format!(
+                "app not running - install/update finished {marker_age}s ago, but the last stop was an intentional quit, not relaunching"
+            ));
+            return;
+        }
+        let relaunched = relaunch_app();
+        log(&format!(
+            "app not running - install/update finished {marker_age}s ago, relaunched={relaunched}, no tamper alert"
+        ));
         return;
     }
 
@@ -75,6 +97,36 @@ pub fn run_check() {
     database::init_shared_database();
     log(&format!("app not running - relaunched={relaunched}, sending tamper alert"));
     send_tamper_alert(relaunched);
+}
+
+/// How long after setup touches `updating.marker` (next to the exe, see
+/// update.rs) the watchdog treats "not running" as "waiting to be started
+/// after the install/update" rather than as tampering.
+const UPDATE_MARKER_MAX_AGE_SECS: u64 = 300;
+
+/// If the app being down is explained by an install/update that just
+/// finished, the marker's age in seconds. Narrower than the marker's whole
+/// 5-minute window, so it can't be used to kill the app unnoticed:
+/// - once the app has started again since the marker (see
+///   `database::record_app_started`), a stop is a real one again - so a
+///   kill a minute after the update still alerts;
+/// - a session that logged on after the marker gets its own -AtLogOn launch,
+///   so the ordinary startup grace below applies to it instead (relaunching
+///   here too could race that launch into an "Already running" message).
+fn pending_post_install_relaunch() -> Option<u64> {
+    let marker = crate::update::update_marker_modified()?;
+    // A marker "from the future" (clock moved back) counts as stale.
+    let age = std::time::SystemTime::now().duration_since(marker).ok()?.as_secs();
+    if age >= UPDATE_MARKER_MAX_AGE_SECS {
+        return None;
+    }
+    if database::app_last_started().is_some_and(|started| started >= marker) {
+        return None;
+    }
+    if crate::session::seconds_since_logon().is_some_and(|since_logon| since_logon >= 0 && (since_logon as u64) < age) {
+        return None;
+    }
+    Some(age)
 }
 
 /// Small append-only log, since a Scheduled-Task-launched process has no
@@ -147,7 +199,8 @@ unsafe fn app_is_running() -> bool {
     }
 }
 
-/// Name of the main app's Scheduled Task, as registered by install.ps1.
+/// Name of the main app's Scheduled Task, as registered by the installer
+/// (installer/screen-time-manager.iss, from installer/task-main.xml).
 const MAIN_TASK_NAME: &str = "ScreenTimeManager";
 
 fn relaunch_app() -> bool {
@@ -162,14 +215,20 @@ fn relaunch_app() -> bool {
         return true;
     }
     // Fallback for the unlikely case the scheduled task isn't registered
-    // (e.g. install.ps1 was never run) - not ideal if this process happens
+    // (e.g. a dev build run without the installer) - not ideal if this process happens
     // to be job-limited, but better than not relaunching at all.
     relaunch_by_spawning()
 }
 
 fn relaunch_via_scheduled_task() -> bool {
+    use std::os::windows::process::CommandExt;
+    // schtasks is a console program and this process has no console -
+    // without this a console window flashes up in the user's session.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
     std::process::Command::new("schtasks")
         .args(["/Run", "/TN", MAIN_TASK_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
         .status()
         .map(|s| s.success())
         .unwrap_or(false)

@@ -208,6 +208,37 @@ pub fn set_shared_setting(key: &str, value: &str) -> bool {
     set_setting(key, value)
 }
 
+/// Set a shared setting (same fallback as `set_shared_setting`) and report
+/// what it was, but only if this call actually changed it: `Some(previous)`
+/// (`previous` being `None` if the key didn't exist), or `None` if it
+/// already held `value` or couldn't be written. Done inside one immediate
+/// transaction, so when several sessions/accounts race to claim the same
+/// change (e.g. "announce this update once"), exactly one of them sees it.
+pub fn swap_shared_setting(key: &str, value: &str) -> Option<Option<String>> {
+    if let Ok(mut guard) = SHARED_DB_CONNECTION.lock() {
+        if let Some(conn) = guard.as_mut() {
+            return swap_setting_in(conn, key, value).ok().flatten();
+        }
+    }
+    let mut guard = DB_CONNECTION.lock().ok()?;
+    swap_setting_in(guard.as_mut()?, key, value).ok().flatten()
+}
+
+fn swap_setting_in(conn: &mut Connection, key: &str, value: &str) -> rusqlite::Result<Option<Option<String>>> {
+    use rusqlite::OptionalExtension;
+
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let previous: Option<String> = tx
+        .query_row("SELECT value FROM settings WHERE key = ?1", params![key], |row| row.get(0))
+        .optional()?;
+    if previous.as_deref() == Some(value) {
+        return Ok(None);
+    }
+    tx.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)", params![key, value])?;
+    tx.commit()?;
+    Ok(Some(previous))
+}
+
 /// Path to the marker written when the app quits via the passcode-protected
 /// Quit menu item. A plain file rather than a DB row deliberately - the
 /// watchdog's check (a brand-new, short-lived process) shouldn't depend on
@@ -330,6 +361,32 @@ pub fn was_confirmed_running_this_session(logon_token: i64) -> bool {
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
         == Some(logon_token)
+}
+
+/// Path to the file the app touches on every real start (see
+/// `record_app_started`). Only its modification time matters - the watchdog
+/// compares it against the installer's `updating.marker` (see
+/// `update::update_marker_modified`) to tell "not yet restarted after an
+/// install/update" apart from "restarted since, and then stopped again".
+fn app_started_marker_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".screen-time-manager")
+        .join("app_started")
+}
+
+/// Record that the app just started (in this account).
+pub fn record_app_started() {
+    let path = app_started_marker_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, wall_clock_now_secs().to_string());
+}
+
+/// When the app last started in this account, if ever recorded.
+pub fn app_last_started() -> Option<std::time::SystemTime> {
+    std::fs::metadata(app_started_marker_path()).ok()?.modified().ok()
 }
 
 /// Get the passcode. Shared machine-wide (see `SHARED_DB_CONNECTION`) so the
@@ -530,9 +587,12 @@ fn date_n_days_before(date: &str, n: i64) -> String {
 /// How many days of per-day enforcement/usage data to keep around.
 const DAILY_DATA_RETENTION_DAYS: i64 = 14;
 
+/// One day of usage: (date, active minutes, paused minutes).
+pub type DailyUsage = (String, i32, i32);
+
 /// Usage for the last `days` calendar days (oldest first): date, minutes
 /// actively used, minutes spent paused. Used for the bot's multi-day report.
-pub fn get_daily_usage_history(days: u32) -> Vec<(String, i32, i32)> {
+pub fn get_daily_usage_history(days: u32) -> Vec<DailyUsage> {
     let today = effective_today_date();
     (0..days as i64)
         .rev()
@@ -595,7 +655,7 @@ fn mirror_shared_daily_stat(kind: &str, date: &str, seconds: i32) {
 /// active-minutes/paused-minutes) - the multi-user counterpart of
 /// `get_daily_usage_history`, built from the shared database's mirrored
 /// per-user stats rather than any single account's own local history.
-pub fn get_all_users_daily_usage_history(days: u32) -> Vec<(String, Vec<(String, i32, i32)>)> {
+pub fn get_all_users_daily_usage_history(days: u32) -> Vec<(String, Vec<DailyUsage>)> {
     let today = effective_today_date();
     let mut usernames: Vec<String> = get_shared_setting(SHARED_KNOWN_USERS_KEY)
         .unwrap_or_default()
@@ -880,11 +940,10 @@ pub fn get_current_timestamp() -> i64 {
     let days_since_epoch = (st.wYear as i64 - 1970) * 365
         + (st.wMonth as i64 - 1) * 30
         + st.wDay as i64;
-    let seconds = days_since_epoch * 86400
+    days_since_epoch * 86400
         + st.wHour as i64 * 3600
         + st.wMinute as i64 * 60
-        + st.wSecond as i64;
-    seconds
+        + st.wSecond as i64
 }
 
 /// Get the session start time used today (in seconds) - tracks when timer started today
@@ -1028,4 +1087,21 @@ pub fn set_discord_config(token: &str, channel_id: &str, admin_user_id: &str, en
     set_shared_setting(DISCORD_CHANNEL_ID, channel_id);
     set_shared_setting(DISCORD_ADMIN_USER_ID, admin_user_id);
     set_shared_setting(DISCORD_ENABLED, if enabled { "true" } else { "false" });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn swap_reports_only_actual_changes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)", []).unwrap();
+
+        assert_eq!(swap_setting_in(&mut conn, "k", "1.0.0").unwrap(), Some(None), "new key");
+        assert_eq!(swap_setting_in(&mut conn, "k", "1.0.0").unwrap(), None, "unchanged");
+        assert_eq!(swap_setting_in(&mut conn, "k", "1.1.0").unwrap(), Some(Some("1.0.0".into())));
+        let stored: String = conn.query_row("SELECT value FROM settings WHERE key = 'k'", [], |r| r.get(0)).unwrap();
+        assert_eq!(stored, "1.1.0");
+    }
 }

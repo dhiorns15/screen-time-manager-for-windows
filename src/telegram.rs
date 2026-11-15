@@ -13,7 +13,7 @@ use crate::i18n;
 use crate::remote_commands::{
     cmd_extend, cmd_getpin, cmd_history, cmd_lock, cmd_msg, cmd_pause, cmd_reduce, cmd_reset,
     cmd_resume, cmd_rotatingpin, cmd_setlimit, cmd_setmessage, cmd_setpin, cmd_status, cmd_time,
-    cmd_unlock, cmd_weekly,
+    cmd_unlock, cmd_update, cmd_weekly,
 };
 use crate::time_request;
 
@@ -88,6 +88,8 @@ enum Command {
     Rotatingpin(String),
     #[command(description = "Get today's rotating PIN (if enabled)")]
     Getpin,
+    #[command(description = "Install the latest version, if a newer one is available")]
+    Update,
     #[command(description = "Extend by 30 minutes")]
     E30,
     #[command(description = "Extend by 60 minutes")]
@@ -206,6 +208,12 @@ pub fn notify_admin(text: &str) {
             }
         });
     }
+}
+
+/// Whether `notify_admin` would actually send anything right now - i.e. this
+/// session's bot is running with an admin chat configured.
+pub fn can_notify() -> bool {
+    BOT_INSTANCE.lock().is_ok_and(|b| b.is_some()) && ADMIN_CHAT_ID.lock().is_ok_and(|c| c.is_some())
 }
 
 /// Signal the bot to shut down gracefully
@@ -394,6 +402,11 @@ async fn handle_command(
         Command::Setlimit(args) => cmd_setlimit(&args),
         Command::Rotatingpin(args) => cmd_rotatingpin(&args),
         Command::Getpin => cmd_getpin(),
+        // Talks to GitHub (and schtasks) - off this single-threaded
+        // runtime, so the bot keeps answering meanwhile.
+        Command::Update => tokio::task::spawn_blocking(cmd_update)
+            .await
+            .unwrap_or_else(|e| format!("❌ {e}")),
         Command::E30 => cmd_extend(30),
         Command::E60 => cmd_extend(60),
         Command::E120 => cmd_extend(120),

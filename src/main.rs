@@ -19,6 +19,7 @@ mod session;
 mod telegram;
 mod time_request;
 mod tray;
+mod update;
 mod watchdog;
 
 use std::mem::zeroed;
@@ -67,6 +68,14 @@ fn install_panic_hook() {
 }
 
 fn main() {
+    // The SYSTEM-side updater run by the ScreenTimeManagerUpdate task -
+    // handled before anything else (the panic hook included, which writes
+    // under the profile directory): it must only ever write under
+    // `<exe dir>\updates\`, see update.rs.
+    if std::env::args().any(|a| a == update::UPDATE_ARG) {
+        std::process::exit(update::run_update_mode());
+    }
+
     install_panic_hook();
 
     // A brief, separate invocation from the watchdog Scheduled Task - just
@@ -96,6 +105,10 @@ fn main() {
         // marker so the watchdog task's suppression only ever covers the gap
         // between a sanctioned Quit and this moment (see database.rs).
         database::clear_intentional_quit_marker();
+
+        // Lets the watchdog tell "not restarted yet after an install/update"
+        // apart from "restarted since, then stopped again" (see watchdog.rs).
+        database::record_app_started();
 
         // Initialize database
         if let Err(e) = init_database() {
@@ -216,6 +229,10 @@ fn main() {
         // repeats this call to react as the active session changes via Fast
         // User Switching - both calls are idempotent, so this isn't a race.
         session::sync_remote_bots();
+
+        // Daily update check and the one-off "updated to vN" notice, on
+        // background threads (see update.rs).
+        update::start_background_tasks();
 
         // Message loop
         let mut msg: MSG = zeroed();
