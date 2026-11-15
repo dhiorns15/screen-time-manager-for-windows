@@ -3,7 +3,7 @@
 
 use std::cell::RefCell;
 use std::mem::zeroed;
-use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 use windows::{
     core::{w, PCWSTR},
@@ -205,8 +205,26 @@ pub unsafe fn verify_passcode_for_action(parent_hwnd: HWND, action: PasscodeActi
     static mut DIALOG_EDIT_HWND: Option<HWND> = None;
     static mut DIALOG_ERROR: Option<String> = None;
     static mut DIALOG_PROMPT_KEY: &str = "passcode.subtitle";
+    /// The prompt currently open, if any.
+    static OPEN_PROMPT: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+
+    // One prompt at a time: the tray menu stays usable while a prompt is
+    // open, and a second prompt would take over the state above from the
+    // first (whose OK would then read the second's edit control, destroyed
+    // by then). Bring the open one to the front instead; the second request
+    // is simply not granted.
+    let open = HWND(OPEN_PROMPT.load(AtomicOrdering::SeqCst));
+    if !open.0.is_null() && IsWindow(open).as_bool() {
+        let _ = ShowWindow(open, SW_SHOWNORMAL);
+        let _ = SetForegroundWindow(open);
+        if let Some(edit) = DIALOG_EDIT_HWND {
+            let _ = SetFocus(edit);
+        }
+        return false;
+    }
 
     DIALOG_RESULT = None;
+    DIALOG_EDIT_HWND = None;
     DIALOG_ERROR = None;
     DIALOG_PROMPT_KEY = action.prompt_key();
 
@@ -466,10 +484,13 @@ pub unsafe fn verify_passcode_for_action(parent_hwnd: HWND, action: PasscodeActi
     );
 
     if let Ok(dlg) = dialog_hwnd {
+        OPEN_PROMPT.store(dlg.0, AtomicOrdering::SeqCst);
         let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
         run_modal_loop(dlg);
+        OPEN_PROMPT.store(std::ptr::null_mut(), AtomicOrdering::SeqCst);
     }
+    DIALOG_EDIT_HWND = None;
 
     DIALOG_RESULT.unwrap_or(false)
 }
@@ -636,6 +657,7 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                 let mut w1_min_hwnd = HWND::default();
                 if let Ok(h) = w1_min {
                     SendMessageW(h, WM_SETFONT, WPARAM(edit_font.0 as usize), LPARAM(1));
+                    SendMessageW(h, EM_SETLIMITTEXT, WPARAM(MINUTES_FIELD_MAX_CHARS), LPARAM(0));
                     let value = get_setting("warning1_minutes").unwrap_or_else(|| "10".to_string());
                     let wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
                     SetWindowTextW(h, PCWSTR(wide.as_ptr())).ok();
@@ -688,6 +710,7 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                 let mut w2_min_hwnd = HWND::default();
                 if let Ok(h) = w2_min {
                     SendMessageW(h, WM_SETFONT, WPARAM(edit_font.0 as usize), LPARAM(1));
+                    SendMessageW(h, EM_SETLIMITTEXT, WPARAM(MINUTES_FIELD_MAX_CHARS), LPARAM(0));
                     let value = get_setting("warning2_minutes").unwrap_or_else(|| "5".to_string());
                     let wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
                     SetWindowTextW(h, PCWSTR(wide.as_ptr())).ok();
@@ -1069,6 +1092,7 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                 let mut lock_timeout_hwnd = HWND::default();
                 if let Ok(h) = lock_timeout_edit {
                     SendMessageW(h, WM_SETFONT, WPARAM(edit_font.0 as usize), LPARAM(1));
+                    SendMessageW(h, EM_SETLIMITTEXT, WPARAM(MINUTES_FIELD_MAX_CHARS), LPARAM(0));
                     // Load current value (convert seconds to minutes for display)
                     let timeout_secs = crate::database::get_lock_screen_timeout();
                     let timeout_mins = timeout_secs / 60;
@@ -1263,6 +1287,29 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                             }
                         }
 
+                        // Every minutes field: empty (left as it was), or a
+                        // whole number within its range. A huge number (say
+                        // 40000000 meaning "never") used to overflow.
+                        if let Some((edit, min, max)) = first_invalid_minutes_field(handles) {
+                            let msg = i18n::t("settings.error.minutes_range")
+                                .replace("{min}", &min.to_string())
+                                .replace("{max}", &max.to_string());
+                            show_settings_field_error(hwnd, edit, &msg);
+                            return LRESULT(0);
+                        }
+
+                        // Discord IDs: empty, or a number other than 0.
+                        for (edit, error_key) in [
+                            (handles.discord_channel_id, "settings.error.discord_channel_id"),
+                            (handles.discord_admin_user_id, "settings.error.discord_user_id"),
+                        ] {
+                            let text = field_text(edit);
+                            if !text.trim().is_empty() && parse_discord_id(&text).is_none() {
+                                show_settings_field_error(hwnd, edit, i18n::t(error_key));
+                                return LRESULT(0);
+                            }
+                        }
+
                         // Handle passcode change first
                         let mut current_pass = String::new();
                         let mut new_pass = String::new();
@@ -1337,7 +1384,8 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                         // If today's limit was lowered, cap remaining time to the new limit
                         {
                             use crate::database::{get_current_weekday, get_daily_limit};
-                            let new_limit_seconds = (get_daily_limit(get_current_weekday()) * 60) as i32;
+                            let new_limit_seconds = i32::try_from(get_daily_limit(get_current_weekday()).saturating_mul(60))
+                                .unwrap_or(i32::MAX);
                             crate::blocking::cap_remaining_time(new_limit_seconds);
                         }
 
@@ -1441,18 +1489,12 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                         }
 
                         // Save lock screen timeout (convert minutes to seconds)
-                        if !handles.lock_screen_timeout.0.is_null() {
-                            let mut buffer = [0u16; 16];
-                            let len = GetWindowTextW(handles.lock_screen_timeout, &mut buffer);
-                            let value = String::from_utf16_lossy(&buffer[..len as usize]);
-                            if let Ok(minutes) = value.parse::<i32>() {
-                                // At least a minute (0 meant "shut down a
-                                // second after every block"); validated
-                                // above, and enforced again where it's read
-                                // (database::get_lock_screen_timeout).
-                                let minutes = minutes.max(crate::database::MIN_LOCK_SCREEN_TIMEOUT_MINS);
-                                set_setting("lock_screen_timeout", &(minutes * 60).to_string());
-                            }
+                        // At least a minute (0 meant "shut down a second
+                        // after every block") and at most a day; validated
+                        // above, and the minimum enforced again where it's
+                        // read (database::get_lock_screen_timeout).
+                        if let Some(secs) = read_number_field(handles.lock_screen_timeout).and_then(lock_screen_timeout_secs) {
+                            set_setting("lock_screen_timeout", &secs.to_string());
                         }
 
                         // Save idle detection settings
@@ -1671,6 +1713,81 @@ unsafe fn read_number_field(edit: HWND) -> Option<u32> {
     let mut buffer = [0u16; 16];
     let len = GetWindowTextW(edit, &mut buffer);
     String::from_utf16_lossy(&buffer[..len.max(0) as usize]).trim().parse().ok()
+}
+
+/// A short edit field's text ("" if the field doesn't exist).
+unsafe fn field_text(edit: HWND) -> String {
+    if edit.0.is_null() {
+        return String::new();
+    }
+    let mut buffer = [0u16; 64];
+    let len = GetWindowTextW(edit, &mut buffer);
+    String::from_utf16_lossy(&buffer[..len.max(0) as usize])
+}
+
+/// Characters a minutes field takes where no smaller limit is set (9999
+/// minutes at most), so a long number can't be typed in at all.
+const MINUTES_FIELD_MAX_CHARS: usize = 4;
+/// The longest lock-screen countdown Settings accepts: a day.
+const MAX_LOCK_SCREEN_TIMEOUT_MINS: u32 = 24 * 60;
+
+/// Whether a minutes field's text is acceptable: empty (the field is left
+/// as it was, or saved empty as before), or a whole number in `min..=max`.
+fn minutes_field_ok(text: &str, min: u32, max: u32) -> bool {
+    let text = text.trim();
+    text.is_empty() || text.parse::<u32>().is_ok_and(|n| (min..=max).contains(&n))
+}
+
+/// The first Settings minutes field whose text isn't acceptable, with the
+/// range it must be in.
+unsafe fn first_invalid_minutes_field(handles: &SettingsEditHandles) -> Option<(HWND, u32, u32)> {
+    let min_lock = u32::try_from(crate::database::MIN_LOCK_SCREEN_TIMEOUT_MINS).unwrap_or(1);
+    let fields = handles
+        .daily_limits
+        .iter()
+        .map(|&h| (h, 0, 9999))
+        .chain([
+            (handles.warning1_minutes, 0, 9999),
+            (handles.warning2_minutes, 0, 9999),
+            (handles.lock_screen_timeout, min_lock, MAX_LOCK_SCREEN_TIMEOUT_MINS),
+            (handles.idle_timeout_minutes, 0, 999),
+            (handles.pause_daily_budget, 0, 999),
+            (handles.pause_max_duration, 1, 999),
+            (handles.pause_cooldown, 0, 999),
+        ]);
+    for (edit, min, max) in fields {
+        if !minutes_field_ok(&field_text(edit), min, max) {
+            return Some((edit, min, max));
+        }
+    }
+    None
+}
+
+/// Refuse a Settings save: show `message` and put the cursor in `edit`
+/// with its text selected.
+unsafe fn show_settings_field_error(hwnd: HWND, edit: HWND, message: &str) {
+    let msg = i18n::to_wide(message);
+    let title = i18n::wide("settings.error");
+    MessageBoxW(hwnd, PCWSTR(msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
+    if !edit.0.is_null() {
+        let _ = SetFocus(edit);
+        SendMessageW(edit, EM_SETSEL, WPARAM(0), LPARAM(-1));
+    }
+}
+
+/// The lock-screen countdown to store for `minutes`, in seconds: at least
+/// the minimum, and `None` beyond what Settings accepts (never wrapped).
+fn lock_screen_timeout_secs(minutes: u32) -> Option<i32> {
+    if minutes > MAX_LOCK_SCREEN_TIMEOUT_MINS {
+        return None;
+    }
+    i32::try_from(minutes).ok()?.max(crate::database::MIN_LOCK_SCREEN_TIMEOUT_MINS).checked_mul(60)
+}
+
+/// A Discord channel or user ID as typed: a number other than 0 (serenity's
+/// ID types panic on 0, and this build aborts on a panic).
+fn parse_discord_id(text: &str) -> Option<std::num::NonZeroU64> {
+    text.trim().parse().ok()
 }
 
 /// Size the Settings window to its content and keep it on the monitor.
@@ -2751,7 +2868,7 @@ unsafe fn paint_step_connect(hdc: HDC, rect: &RECT) {
         SelectObject(hdc, hint_font);
         SetTextColor(hdc, COLORREF(0x00666666));
         let mut hint_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(20) };
-        DrawTextW(hdc, &mut i18n::t("wizard.connect.not_you").encode_utf16().collect::<Vec<_>>(), &mut hint_rect, DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        DrawTextW(hdc, &mut i18n::t("wizard.connect.not_you_again").encode_utf16().collect::<Vec<_>>(), &mut hint_rect, DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         SelectObject(hdc, status_font);
         let _ = DeleteObject(hint_font);
     } else {
@@ -2927,8 +3044,9 @@ unsafe fn handle_wizard_command(hwnd: HWND, id: i32) {
                 WIZARD_STEP += 1;
 
                 // Start polling on step 4, detecting afresh each time the
-                // step is entered (so after "Back" a wrong chat can be
-                // replaced by sending a new message from the right one).
+                // step is entered: only a message sent to the bot after
+                // this point counts (see wizard_poll_once), so after "Back"
+                // a wrong chat can be replaced by messaging from the right one.
                 if WIZARD_STEP == 4 {
                     set_wizard_chat(None);
                     WIZARD_POLL_GENERATION.fetch_add(1, AtomicOrdering::SeqCst);
@@ -2936,6 +3054,11 @@ unsafe fn handle_wizard_command(hwnd: HWND, id: i32) {
                 if WIZARD_STEP == 4 && !WIZARD_POLLING {
                     WIZARD_POLLING = true;
                     SetTimer(hwnd, TIMER_POLL_TELEGRAM, 2000, None);
+                }
+                if WIZARD_STEP == 4 {
+                    // Note where the updates stand right away, not at the
+                    // first timer tick.
+                    poll_telegram_for_chatid(hwnd);
                 }
 
                 // Destroy token edit when leaving step 3
@@ -2980,45 +3103,142 @@ unsafe fn poll_telegram_for_chatid(hwnd: HWND) {
         return;
     }
 
-    if let Some(ref token) = WIZARD_TOKEN {
-        // Spawn a thread to do the API call
-        let token = token.clone();
-        let generation = WIZARD_POLL_GENERATION.load(AtomicOrdering::SeqCst);
-        std::thread::spawn(move || {
-            if let Some(chat) = fetch_telegram_updates(&token) {
-                // Only if detection hasn't been restarted meanwhile.
-                if WIZARD_POLL_GENERATION.load(AtomicOrdering::SeqCst) == generation {
-                    set_wizard_chat(Some(chat));
-                    let wizard_hwnd = WIZARD_HWND.load(AtomicOrdering::SeqCst);
-                    if !wizard_hwnd.is_null() {
-                        let _ = InvalidateRect(HWND(wizard_hwnd), None, true);
-                    }
-                }
-            }
-        });
+    let wizard_token_ref = std::ptr::addr_of!(WIZARD_TOKEN);
+    if let Some(token) = (*wizard_token_ref).clone() {
+        // One request at a time, on a thread (the API call blocks).
+        if !WIZARD_POLL_IN_FLIGHT.swap(true, AtomicOrdering::SeqCst) {
+            let generation = WIZARD_POLL_GENERATION.load(AtomicOrdering::SeqCst);
+            std::thread::spawn(move || {
+                wizard_poll_once(&token, generation);
+                WIZARD_POLL_IN_FLIGHT.store(false, AtomicOrdering::SeqCst);
+            });
+        }
     }
 
     // Trigger repaint for animation
     let _ = InvalidateRect(hwnd, None, true);
 }
 
-/// Ask Telegram for the most recent message sent to the bot and return
-/// that message's chat, with a display name.
-fn fetch_telegram_updates(token: &str) -> Option<DetectedChat> {
-    // offset=-1 returns only the newest pending update (and drops older
-    // ones). It used to take the oldest pending update, which could be
-    // anyone's chat that had messaged the bot earlier.
-    let url = format!("https://api.telegram.org/bot{}/getUpdates?offset=-1&limit=1&timeout=0", token);
+/// A poll request is under way (see `poll_telegram_for_chatid`).
+static WIZARD_POLL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// Where the bot's updates stood when detection (re)started, for the
+/// detection generation it was taken in: the newest update id then (`None`
+/// if there were none). Only updates after it are taken as the parent's.
+static WIZARD_BASELINE: Mutex<Option<(u32, Option<i64>)>> = Mutex::new(None);
 
-    let response = ureq::get(&url).timeout(std::time::Duration::from_secs(3)).call().ok()?;
-    let body = response.into_string().ok()?;
-    parse_latest_chat(&body)
+/// One step of chat detection for detection generation `generation`: the
+/// first successful request only notes where the bot's updates stand (so a
+/// message that was already waiting - from anyone, or the wrong chat picked
+/// up before "Back" - is never taken); later ones look for a newer one.
+fn wizard_poll_once(token: &str, generation: u32) {
+    let current = || WIZARD_POLL_GENERATION.load(AtomicOrdering::SeqCst) == generation;
+    let baseline = WIZARD_BASELINE
+        .lock()
+        .ok()
+        .and_then(|b| *b)
+        .filter(|(g, _)| *g == generation)
+        .map(|(_, newest)| newest);
+    match baseline {
+        None => {
+            if let Some(newest) = fetch_newest_update_id(token) {
+                if current() {
+                    if let Ok(mut b) = WIZARD_BASELINE.lock() {
+                        *b = Some((generation, newest));
+                    }
+                }
+            }
+        }
+        Some(after) => {
+            if let Some(chat) = fetch_chat_after(token, after) {
+                if current() {
+                    set_wizard_chat(Some(chat));
+                    let wizard_hwnd = WIZARD_HWND.load(AtomicOrdering::SeqCst);
+                    if !wizard_hwnd.is_null() {
+                        let _ = unsafe { InvalidateRect(HWND(wizard_hwnd), None, true) };
+                    }
+                }
+            }
+        }
+    }
 }
 
-/// The chat of the newest update in a `getUpdates` response, if any.
-fn parse_latest_chat(body: &str) -> Option<DetectedChat> {
+/// Most updates one `getUpdates` call returns (Telegram's default limit).
+const TELEGRAM_UPDATES_PAGE: usize = 100;
+
+fn telegram_get_updates(token: &str, query: &str) -> Option<Vec<TelegramUpdate>> {
+    let url = format!("https://api.telegram.org/bot{token}/getUpdates?timeout=0{query}");
+    let response = ureq::get(&url).timeout(std::time::Duration::from_secs(3)).call().ok()?;
+    parse_updates(&response.into_string().ok()?)
+}
+
+/// The newest update id waiting for the bot (`Some(None)` if none), or
+/// `None` if Telegram couldn't be asked. Read without an offset, which
+/// leaves the updates for whoever else reads them (an already-running bot
+/// with this token); only if a full page is waiting - nobody is reading
+/// them - is the newest one asked for directly, which drops the rest.
+fn fetch_newest_update_id(token: &str) -> Option<Option<i64>> {
+    let updates = telegram_get_updates(token, "")?;
+    if updates.len() < TELEGRAM_UPDATES_PAGE {
+        return Some(newest_update_id(&updates));
+    }
+    Some(newest_update_id(&telegram_get_updates(token, "&offset=-1&limit=1")?))
+}
+
+/// The chat of the newest update after `after` (any update if `None`).
+/// Read without an offset like `fetch_newest_update_id`; only if a full
+/// page of older updates hides newer ones are those older ones (all
+/// waiting since before detection started) skipped with an offset.
+fn fetch_chat_after(token: &str, after: Option<i64>) -> Option<DetectedChat> {
+    let updates = telegram_get_updates(token, "")?;
+    if let Some(chat) = latest_chat_after(&updates, after) {
+        return Some(chat);
+    }
+    let after_id = after?;
+    if updates.len() < TELEGRAM_UPDATES_PAGE {
+        return None;
+    }
+    let newer = telegram_get_updates(token, &format!("&offset={}", after_id.saturating_add(1)))?;
+    latest_chat_after(&newer, after)
+}
+
+/// One update from a `getUpdates` response: its id and, if it came from a
+/// chat, that chat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TelegramUpdate {
+    id: i64,
+    chat: Option<DetectedChat>,
+}
+
+/// The updates in a `getUpdates` response; `None` if it isn't one (an
+/// error reply, or not JSON).
+fn parse_updates(body: &str) -> Option<Vec<TelegramUpdate>> {
     let json: serde_json::Value = serde_json::from_str(body).ok()?;
-    let update = json.get("result")?.as_array()?.last()?;
+    let updates = json.get("result")?.as_array()?;
+    Some(
+        updates
+            .iter()
+            .filter_map(|u| Some(TelegramUpdate { id: u.get("update_id")?.as_i64()?, chat: parse_update_chat(u) }))
+            .collect(),
+    )
+}
+
+fn newest_update_id(updates: &[TelegramUpdate]) -> Option<i64> {
+    updates.iter().map(|u| u.id).max()
+}
+
+/// The chat of the newest update with an id greater than `after` (any id
+/// if `None`) that came from a chat.
+fn latest_chat_after(updates: &[TelegramUpdate], after: Option<i64>) -> Option<DetectedChat> {
+    updates
+        .iter()
+        .filter(|u| after.is_none_or(|a| u.id > a))
+        .filter(|u| u.chat.is_some())
+        .max_by_key(|u| u.id)
+        .and_then(|u| u.chat.clone())
+}
+
+/// The chat an update came from, with a display name.
+fn parse_update_chat(update: &serde_json::Value) -> Option<DetectedChat> {
     let chat = ["message", "edited_message", "channel_post", "edited_channel_post", "my_chat_member"]
         .iter()
         .find_map(|kind| update.get(kind)?.get("chat"))?;
@@ -3710,16 +3930,16 @@ unsafe fn update_dc_wizard_buttons(hwnd: HWND) {
         };
         SetWindowTextW(next_btn, PCWSTR(next_text.as_ptr())).ok();
 
-        // Disable next on step 3 if token invalid, step 4 if IDs not valid numbers
+        // Disable next on step 3 if token invalid, step 4 until both IDs
+        // are filled in (Next then checks them and says what's wrong)
         let dc_wizard_token_ref = std::ptr::addr_of!(DC_WIZARD_TOKEN);
         let dc_wizard_channel_ref = std::ptr::addr_of!(DC_WIZARD_CHANNEL_ID);
         let dc_wizard_user_ref = std::ptr::addr_of!(DC_WIZARD_USER_ID);
         let can_proceed = match DC_WIZARD_STEP {
             3 => (*dc_wizard_token_ref).as_ref().map(|t| is_valid_discord_token_format(t)).unwrap_or(false),
             4 => {
-                let channel_ok = (*dc_wizard_channel_ref).as_ref().map(|c| c.parse::<u64>().is_ok()).unwrap_or(false);
-                let user_ok = (*dc_wizard_user_ref).as_ref().map(|u| u.parse::<u64>().is_ok()).unwrap_or(false);
-                channel_ok && user_ok
+                let filled = |id: &Option<String>| id.as_deref().is_some_and(|s| !s.trim().is_empty());
+                filled(&*dc_wizard_channel_ref) && filled(&*dc_wizard_user_ref)
             }
             _ => true,
         };
@@ -3780,6 +4000,20 @@ unsafe fn handle_dc_wizard_command(hwnd: HWND, id: i32) {
                     let mut buffer = [0u16; 32];
                     let len = GetWindowTextW(us_edit, &mut buffer);
                     DC_WIZARD_USER_ID = Some(String::from_utf16_lossy(&buffer[..len as usize]).trim().to_string());
+                }
+
+                // Both must be real IDs (a number other than 0) before going on.
+                let dc_wizard_channel_ref = std::ptr::addr_of!(DC_WIZARD_CHANNEL_ID);
+                let dc_wizard_user_ref = std::ptr::addr_of!(DC_WIZARD_USER_ID);
+                for (value, edit_id, error_key) in [
+                    (&*dc_wizard_channel_ref, ID_DC_WIZARD_CHANNEL_EDIT, "settings.error.discord_channel_id"),
+                    (&*dc_wizard_user_ref, ID_DC_WIZARD_USER_EDIT, "settings.error.discord_user_id"),
+                ] {
+                    if value.as_deref().and_then(parse_discord_id).is_none() {
+                        let edit = GetDlgItem(hwnd, edit_id).unwrap_or_default();
+                        show_settings_field_error(hwnd, edit, i18n::t(error_key));
+                        return;
+                    }
                 }
             }
 
@@ -3854,7 +4088,7 @@ unsafe fn save_dc_wizard_config() {
         crate::database::set_discord_config(token, channel_id, user_id, true);
         DC_WIZARD_SAVED = true;
 
-        if let Ok(channel_id_num) = channel_id.parse::<u64>() {
+        if let Some(channel_id_num) = parse_discord_id(channel_id) {
             let token = token.clone();
             std::thread::spawn(move || {
                 send_discord_test_message(&token, channel_id_num);
@@ -3864,7 +4098,7 @@ unsafe fn save_dc_wizard_config() {
 }
 
 /// Send a test message to confirm setup
-fn send_discord_test_message(token: &str, channel_id: u64) {
+fn send_discord_test_message(token: &str, channel_id: std::num::NonZeroU64) {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(_) => return,
@@ -3872,13 +4106,80 @@ fn send_discord_test_message(token: &str, channel_id: u64) {
     rt.block_on(async {
         let http = serenity::http::Http::new(token);
         let message = format!("✅ {} - Screen Time Manager", crate::i18n::t("wizard.dc.success.title"));
-        let _ = serenity::model::id::ChannelId::new(channel_id).say(&http, message).await;
+        let _ = serenity::model::id::ChannelId::from(channel_id).say(&http, message).await;
     });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The newest chat in a `getUpdates` body, whatever its id.
+    fn parse_latest_chat(body: &str) -> Option<DetectedChat> {
+        latest_chat_after(&parse_updates(body)?, None)
+    }
+
+    #[test]
+    fn only_a_message_after_the_step_was_entered_is_taken() {
+        let body = r#"{"ok":true,"result":[
+            {"update_id":10,"message":{"chat":{"id":1,"first_name":"Stranger","type":"private"}}},
+            {"update_id":11,"message":{"chat":{"id":2,"first_name":"Wrong","type":"private"}}}]}"#;
+        let updates = parse_updates(body).unwrap();
+        // Entering the step notes update 11 as the newest...
+        assert_eq!(newest_update_id(&updates), Some(11));
+        // ...so neither waiting message is taken, on entry or after "Back".
+        assert_eq!(latest_chat_after(&updates, Some(11)), None);
+        // The parent's own message afterwards is.
+        let later = r#"{"ok":true,"result":[
+            {"update_id":10,"message":{"chat":{"id":1,"first_name":"Stranger","type":"private"}}},
+            {"update_id":11,"message":{"chat":{"id":2,"first_name":"Wrong","type":"private"}}},
+            {"update_id":12,"message":{"chat":{"id":3,"first_name":"Parent","type":"private"}}}]}"#;
+        assert_eq!(
+            latest_chat_after(&parse_updates(later).unwrap(), Some(11)),
+            Some(DetectedChat { id: 3, name: "Parent".into() })
+        );
+        // Nothing waiting when the step was entered: anything later counts.
+        assert_eq!(newest_update_id(&parse_updates(r#"{"ok":true,"result":[]}"#).unwrap()), None);
+        assert_eq!(latest_chat_after(&updates, None).map(|c| c.id), Some(2));
+        // An error reply is not "no updates".
+        assert_eq!(parse_updates(r#"{"ok":false,"error_code":409}"#), None);
+    }
+
+    #[test]
+    fn minutes_fields_take_whole_numbers_in_range_or_nothing() {
+        assert!(minutes_field_ok("", 1, 1440));
+        assert!(minutes_field_ok("  ", 1, 1440));
+        assert!(minutes_field_ok("1", 1, 1440));
+        assert!(minutes_field_ok("1440", 1, 1440));
+        assert!(!minutes_field_ok("1441", 1, 1440));
+        assert!(!minutes_field_ok("0", 1, 1440));
+        assert!(!minutes_field_ok("40000000", 1, 1440), "'never' as a huge number");
+        assert!(!minutes_field_ok("99999999999999999999", 0, 9999));
+        assert!(!minutes_field_ok("-5", 0, 9999));
+        assert!(!minutes_field_ok("ten", 0, 9999));
+    }
+
+    #[test]
+    fn lock_screen_timeout_is_stored_in_seconds_without_overflow() {
+        assert_eq!(lock_screen_timeout_secs(10), Some(600));
+        assert_eq!(lock_screen_timeout_secs(0), Some(60), "at least a minute");
+        assert_eq!(lock_screen_timeout_secs(MAX_LOCK_SCREEN_TIMEOUT_MINS), Some(86_400));
+        assert_eq!(lock_screen_timeout_secs(MAX_LOCK_SCREEN_TIMEOUT_MINS + 1), None);
+        assert_eq!(lock_screen_timeout_secs(40_000_000), None, "used to wrap to a negative value");
+        assert_eq!(lock_screen_timeout_secs(u32::MAX), None);
+    }
+
+    #[test]
+    fn discord_ids_must_be_numbers_other_than_zero() {
+        assert_eq!(parse_discord_id("123456789012345678").map(|n| n.get()), Some(123_456_789_012_345_678));
+        assert_eq!(parse_discord_id(" 42 ").map(|n| n.get()), Some(42));
+        assert_eq!(parse_discord_id("0"), None);
+        assert_eq!(parse_discord_id("000"), None);
+        assert_eq!(parse_discord_id(""), None);
+        assert_eq!(parse_discord_id("abc"), None);
+        assert_eq!(parse_discord_id("-1"), None);
+        assert_eq!(parse_discord_id("99999999999999999999"), None, "beyond u64");
+    }
 
     #[test]
     fn newest_update_names_the_chat() {
