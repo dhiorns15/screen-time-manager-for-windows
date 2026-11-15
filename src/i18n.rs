@@ -516,6 +516,11 @@ fn en(key: &str) -> &'static str {
         "wizard.dc.success.cmd3" => "!lock - Lock the screen",
         "wizard.dc.success.cmd4" => "!help - See all commands",
 
+        // ----- Discord: keeping PINs out of the shared channel -----
+        "dc.setpin.not_deleted" => "Couldn't delete your !setpin message - the bot needs the Manage Messages permission in this channel. Please delete it yourself so others can't read the passcode.",
+        "dc.getpin.sent_dm" => "Sent today's code to you by direct message.",
+        "dc.getpin.dm_failed" => "Couldn't send you a direct message, so the code isn't posted here. Allow direct messages from members of this server in your Discord privacy settings, then try again.",
+
         // Fallback - return empty string for unknown keys (should not happen in practice)
         _ => "",
     }
@@ -933,6 +938,11 @@ fn de(key: &str) -> &'static str {
         "wizard.dc.success.cmd2" => "!extend 30 - 30 Minuten hinzufügen",
         "wizard.dc.success.cmd3" => "!lock - Bildschirm sperren",
         "wizard.dc.success.cmd4" => "!help - Alle Befehle anzeigen",
+
+        // ----- Discord: Codes nicht im gemeinsamen Kanal zeigen -----
+        "dc.setpin.not_deleted" => "Ihre !setpin-Nachricht konnte nicht gelöscht werden - der Bot benötigt in diesem Kanal die Berechtigung \"Nachrichten verwalten\". Bitte löschen Sie sie selbst, damit andere den Code nicht lesen können.",
+        "dc.getpin.sent_dm" => "Der heutige Code wurde Ihnen per Direktnachricht geschickt.",
+        "dc.getpin.dm_failed" => "Direktnachricht konnte nicht gesendet werden, daher wird der Code hier nicht angezeigt. Erlauben Sie in Ihren Discord-Datenschutzeinstellungen Direktnachrichten von Mitgliedern dieses Servers und versuchen Sie es erneut.",
 
         // Fallback to English
         _ => en(key),

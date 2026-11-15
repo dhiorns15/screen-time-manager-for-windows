@@ -4,7 +4,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serenity::all::{ChannelId, GatewayIntents, Http, Message, Ready};
+use serenity::all::{ChannelId, CreateMessage, GatewayIntents, Http, Message, Ready};
 use serenity::async_trait;
 use serenity::client::{Client, Context, EventHandler};
 
@@ -136,10 +136,10 @@ impl EventHandler for Handler {
             "unlock" => cmd_unlock(),
             "reset" => cmd_reset(),
             "setmessage" => cmd_setmessage(args),
-            "setpin" => cmd_setpin(args),
+            "setpin" => setpin_and_delete(&ctx, &msg, args).await,
             "setlimit" => cmd_setlimit(args),
             "rotatingpin" => cmd_rotatingpin(args),
-            "getpin" => cmd_getpin(),
+            "getpin" => getpin_by_dm(&ctx, &msg).await,
             // Talks to GitHub (and schtasks) - off this single-threaded
             // runtime, so the gateway connection isn't stalled meanwhile.
             "update" => tokio::task::spawn_blocking(cmd_update)
@@ -157,6 +157,43 @@ impl EventHandler for Handler {
         }
 
         let _ = msg.channel_id.say(&ctx.http, response).await;
+    }
+}
+
+/// `!setpin`: the new passcode is in the admin's own message, which everyone
+/// in the channel can read, so delete it first. That needs the Manage
+/// Messages permission in the channel, which the setup wizard doesn't ask
+/// for - if it's missing, say so, so the admin can delete it by hand.
+async fn setpin_and_delete(ctx: &Context, msg: &Message, args: &str) -> String {
+    let deleted = match msg.delete(ctx).await {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("[Discord] Couldn't delete the !setpin message: {e}");
+            false
+        }
+    };
+    let mut response = cmd_setpin(args);
+    if !deleted {
+        response.push_str("\n⚠️ ");
+        response.push_str(i18n::t("dc.setpin.not_deleted"));
+    }
+    response
+}
+
+/// `!getpin`: today's rotating PIN goes to the admin by direct message, not
+/// into the shared channel. Only a short note is posted in the channel. If
+/// the rotating PIN is off, the reply has no code in it and is posted as
+/// before.
+async fn getpin_by_dm(ctx: &Context, msg: &Message) -> String {
+    if !database::is_rotating_pin_enabled() {
+        return cmd_getpin();
+    }
+    match msg.author.direct_message(ctx, CreateMessage::new().content(cmd_getpin())).await {
+        Ok(_) => format!("📬 {}", i18n::t("dc.getpin.sent_dm")),
+        Err(e) => {
+            eprintln!("[Discord] Couldn't send the PIN by direct message: {e}");
+            format!("❌ {}", i18n::t("dc.getpin.dm_failed"))
+        }
     }
 }
 
