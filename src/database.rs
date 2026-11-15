@@ -947,10 +947,12 @@ pub fn get_lock_screen_timeout() -> i32 {
     clamp_lock_screen_timeout(secs)
 }
 
-/// The shortest lock-screen timeout, in seconds. Settings used to accept 0
-/// minutes, which shut the PC down a second after every block (including at
-/// each logon with no time left); anything shorter that is already stored -
-/// or negative, which the app never writes - is read as one minute.
+/// The shortest lock-screen timeout. Settings used to accept 0 minutes, which
+/// shut the PC down a second after every block (including at each logon with
+/// no time left); anything shorter that is already stored is read as one
+/// minute - negative values too (the app never writes one), so there is no
+/// "never shut down" value: the lock screen's countdown treats a negative
+/// count as "no countdown running", and always starts from this function.
 pub const MIN_LOCK_SCREEN_TIMEOUT_MINS: i32 = 1;
 const MIN_LOCK_SCREEN_TIMEOUT_SECS: i32 = MIN_LOCK_SCREEN_TIMEOUT_MINS * 60;
 
@@ -1800,7 +1802,17 @@ pub fn clear_inflight_pause() {
     }
 }
 
+/// Longest in-flight pause that's believed: a day. A pause can't really run
+/// longer than its configured maximum; anything bigger is an edited value.
+const MAX_INFLIGHT_PAUSE_SECS: i32 = 24 * 60 * 60;
+
+/// Latest believable save time: 9999-12-31 23:59:59 UTC. Bounding it keeps
+/// the arithmetic on it from overflowing (an edited value used to panic in a
+/// debug build and wrap in release).
+const MAX_INFLIGHT_SAVED_AT: i64 = 253_402_300_799;
+
 /// Parse a `PAUSE_INFLIGHT_KEY` value: (date, seconds, saved-at epoch secs).
+/// `None` for anything malformed or out of range.
 fn parse_inflight_pause(value: &str) -> Option<(String, i32, i64)> {
     let mut parts = value.splitn(3, '|');
     let date = parts.next()?;
@@ -1808,7 +1820,15 @@ fn parse_inflight_pause(value: &str) -> Option<(String, i32, i64)> {
     let saved_at: i64 = parts.next()?.parse().ok()?;
     let date_ok = date.len() == 10
         && date.bytes().enumerate().all(|(i, b)| if i == 4 || i == 7 { b == b'-' } else { b.is_ascii_digit() });
-    (date_ok && seconds > 0).then(|| (date.to_string(), seconds, saved_at))
+    let seconds_ok = (1..=MAX_INFLIGHT_PAUSE_SECS).contains(&seconds);
+    let saved_at_ok = (0..=MAX_INFLIGHT_SAVED_AT).contains(&saved_at);
+    (date_ok && seconds_ok && saved_at_ok).then(|| (date.to_string(), seconds, saved_at))
+}
+
+/// Seconds into the local day at epoch second `epoch_secs`, for a UTC offset
+/// in minutes.
+fn local_secs_of_day(epoch_secs: i64, offset_mins: i64) -> i64 {
+    epoch_secs.saturating_add(offset_mins.saturating_mul(60)).rem_euclid(86400)
 }
 
 /// Fold a pause left over from a previous run (the app stopped mid-pause) into
@@ -1828,7 +1848,7 @@ pub fn recover_inflight_pause() -> Option<i32> {
     mirror_shared_daily_stat("pause", &date, total);
 
     // Same "HH:MM:SS:<n>s" entry log_pause_event writes, timed at the save.
-    let local = (saved_at + current_utc_offset_mins() * 60).rem_euclid(86400);
+    let local = local_secs_of_day(saved_at, current_utc_offset_mins());
     let entry = format!("{:02}:{:02}:{:02}:{}s", local / 3600, (local % 3600) / 60, local % 60, seconds);
     let log_key = format!("pause_log_{}", date);
     let existing = get_setting(&log_key).unwrap_or_default();
@@ -2093,7 +2113,23 @@ mod timekeeping_tests {
     }
 
     #[test]
+    fn pause_log_time_never_overflows() {
+        assert_eq!(local_secs_of_day(civil_to_secs(2026, 11, 15, 23, 30, 0), 60), 30 * 60);
+        assert_eq!(local_secs_of_day(civil_to_secs(2026, 11, 15, 1, 0, 0), -120), 23 * 3600);
+        // Bounded by the parser, but saturating anyway
+        let _ = local_secs_of_day(i64::MAX, 840);
+        let _ = local_secs_of_day(i64::MIN, -840);
+    }
+
+    #[test]
     fn inflight_pause_parses_only_valid_values() {
+        assert_eq!(parse_inflight_pause("2026-11-15|130|9223372036854775807"), None, "saved in year 292 billion");
+        assert_eq!(parse_inflight_pause("2026-11-15|130|-1"), None);
+        assert_eq!(parse_inflight_pause("2026-11-15|2147483647|1794750000"), None, "68 years of pause");
+        assert_eq!(
+            parse_inflight_pause("2026-11-15|86400|1794750000"),
+            Some(("2026-11-15".to_string(), 86400, 1794750000))
+        );
         assert_eq!(
             parse_inflight_pause("2026-11-15|130|1794750000"),
             Some(("2026-11-15".to_string(), 130, 1794750000))
@@ -2172,6 +2208,8 @@ mod tests {
         assert_eq!(clamp_lock_screen_timeout(600), 600);
         assert_eq!(clamp_lock_screen_timeout(-1), 60);
         assert_eq!(clamp_lock_screen_timeout(-600), 60);
+        assert_eq!(clamp_lock_screen_timeout(i32::MIN), 60, "negative never means \"never\"");
+        assert_eq!(clamp_lock_screen_timeout(i32::MAX), i32::MAX);
     }
 
     #[test]

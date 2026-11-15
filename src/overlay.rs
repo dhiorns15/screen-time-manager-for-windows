@@ -110,7 +110,19 @@ unsafe fn apply_show_overlay(overlay_hwnd: HWND, duration_seconds: u32) {
 
     let _ = ShowWindow(overlay_hwnd, SW_SHOWNOACTIVATE);
     let _ = PlaySoundW(w!("SystemExclamation"), None, SND_ALIAS | SND_ASYNC);
-    let _ = SetTimer(overlay_hwnd, TIMER_OVERLAY_HIDE, duration_seconds * 1000, None);
+    let _ = SetTimer(overlay_hwnd, TIMER_OVERLAY_HIDE, hide_after_ms(duration_seconds), None);
+}
+
+/// Longest the warning banner stays up. Callers ask for 10 seconds; the
+/// duration also arrives as a posted message's wParam, which any process in
+/// the session can send.
+const MAX_OVERLAY_SECONDS: u32 = 60 * 60;
+
+/// Milliseconds until the banner hides: `duration_seconds` limited to 1 s to
+/// MAX_OVERLAY_SECONDS, so the multiplication can't overflow (that panicked
+/// in a debug build and wrapped in release).
+fn hide_after_ms(duration_seconds: u32) -> u32 {
+    duration_seconds.clamp(1, MAX_OVERLAY_SECONDS) * 1000
 }
 
 pub unsafe fn hide_overlay() {
@@ -197,5 +209,19 @@ pub unsafe fn register_overlay_class(hinstance: windows::Win32::Foundation::HMOD
 
     if RegisterClassW(&overlay_wnd_class) == 0 {
         panic!("Failed to register overlay window class");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn banner_duration_is_bounded() {
+        assert_eq!(hide_after_ms(10), 10_000);
+        assert_eq!(hide_after_ms(0), 1_000);
+        assert_eq!(hide_after_ms(MAX_OVERLAY_SECONDS), 3_600_000);
+        assert_eq!(hide_after_ms(u32::MAX), 3_600_000, "a posted wParam");
+        assert_eq!(hide_after_ms(4_294_968), 3_600_000, "just past u32 overflow");
     }
 }
