@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!--
+  The ScreenTimeManagerUpdate scheduled task: runs the exe's updater (the Arguments below) as SYSTEM, on
+  demand only (no triggers). The app starts it with `schtasks /Run /TN ScreenTimeManagerUpdate`
+  from a standard user's session; the SYSTEM process downloads the latest release's setup into
+  <install dir>\updates and runs it silently. Setup substitutes @INSTALL_DIR@ as for task-main.xml.
+
+  SecurityDescriptor: Administrators and SYSTEM get full access; BUILTIN\Users get read and execute
+  (FRFX) only. Task Scheduler needs read access to open a task and execute access to run it, and
+  write/delete access to change, disable or delete it, so a standard user can start an update but
+  can't point the task elsewhere, disable it or remove it. Setup passes the same string to
+  RegisterTask as well, since a descriptor given there supersedes this one.
+
+  IgnoreNew: one update at a time. The time limit is generous for a slow download plus setup.
+
+  Version is this definition's revision: bump it whenever this file changes. Setup may itself be
+  running inside this task (the app's updater starts it from here), so while the task is running
+  setup only replaces it if the revision or the install folder differ (see RegisterTasks).
+-->
+<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Version>1</Version>
+    <Description>Screen Time Manager - installs the latest release when the app asks for an update</Description>
+    <URI>\ScreenTimeManagerUpdate</URI>
+    <SecurityDescriptor>D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FRFX;;;BU)</SecurityDescriptor>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="LocalSystem">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <ExecutionTimeLimit>PT2H</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="LocalSystem">
+    <Exec>
+      <Command>@INSTALL_DIR@\screen-time-manager.exe</Command>
+      <Arguments>--update</Arguments>
+    </Exec>
+  </Actions>
+</Task>

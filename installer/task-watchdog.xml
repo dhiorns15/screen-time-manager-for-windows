@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!--
+  The ScreenTimeManagerWatchdog scheduled task: every minute, and shortly after each sign-in, runs
+  the exe's watchdog check (the Arguments below), which relaunches the app (through the
+  ScreenTimeManager task) and sends a tamper alert if it was stopped outside the passcode-protected
+  Quit (see src/watchdog.rs). Setup substitutes @INSTALL_DIR@ as for task-main.xml.
+
+  Registered by the elevated setup with the default security descriptor, so it's owned by
+  Administrators: a standard user can't disable or delete it, which is what keeps it from being
+  turned off the same way the app itself can be killed.
+
+  The repetition has no Duration, which means it repeats indefinitely. The StartBoundary is a fixed
+  date in the past; StartWhenAvailable makes the first check happen right after registration.
+
+  The logon trigger is delayed 2 minutes so it doesn't race the main task's own logon trigger: both
+  fire at logon with no ordering guarantee, and the watchdog's mutex check is fast enough to run
+  before the app has started and taken its mutex, which caused a false "app was killed" tamper
+  alert on every ordinary sign-in.
+
+  Same BUILTIN\Users group principal as the main task: the watchdog has to run in every user's
+  session, not just the installer's. Parallel, not IgnoreNew: with two sessions signed in, the
+  per-minute trigger fires for both at the same tick, and IgnoreNew (tracked per task definition,
+  not per session) would silently drop one session's check on every collision, leaving that user
+  unmonitored. Each check is a short-lived process, so 5 minutes is a generous limit.
+-->
+<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Screen Time Manager - relaunches the app if it's stopped outside of the passcode-protected Quit option</Description>
+    <URI>\ScreenTimeManagerWatchdog</URI>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Users">
+      <GroupId>S-1-5-32-545</GroupId>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Triggers>
+    <TimeTrigger>
+      <Enabled>true</Enabled>
+      <StartBoundary>2020-01-01T00:00:00</StartBoundary>
+      <Repetition>
+        <Interval>PT1M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </TimeTrigger>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT2M</Delay>
+    </LogonTrigger>
+  </Triggers>
+  <Settings>
+    <MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Users">
+    <Exec>
+      <Command>@INSTALL_DIR@\screen-time-manager.exe</Command>
+      <Arguments>--watchdog-check</Arguments>
+    </Exec>
+  </Actions>
+</Task>

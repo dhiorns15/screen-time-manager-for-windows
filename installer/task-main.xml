@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!--
+  The ScreenTimeManager scheduled task: starts the app when anyone signs in.
+  Setup registers it with ITaskFolder::RegisterTask, replacing @INSTALL_DIR@ with the install
+  folder (XML-escaped). The declaration says UTF-16 because the text reaches Task Scheduler as an
+  in-memory UTF-16 string, not as this file.
+
+  GroupId (not UserId) BUILTIN\Users, by SID so it also resolves on non-English Windows: the task
+  runs for *any* account that signs in, in that account's own session, not just for whoever
+  installed it. With a UserId principal other Windows accounts are never started at all.
+
+  MultipleInstancesPolicy Parallel: the default IgnoreNew is tracked per task definition, not per
+  session, so a second account signing in (e.g. Fast User Switching) while the first account's
+  instance is still running would have its logon trigger silently dropped and never get the app.
+  Parallel lets each session's trigger start its own instance; the app's per-session mutex (see
+  constants.rs) still prevents duplicates within one session.
+
+  ExecutionTimeLimit PT0S means no limit: the app runs for the whole session. RestartOnFailure
+  brings it back after a crash; the watchdog task covers it being killed.
+-->
+<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Screen Time Manager - Manages daily computer time limits</Description>
+    <URI>\ScreenTimeManager</URI>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="Users">
+      <GroupId>S-1-5-32-545</GroupId>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Triggers>
+    <!-- No UserId: fires at the sign-in of any user. -->
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+    </LogonTrigger>
+  </Triggers>
+  <Settings>
+    <MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <RestartOnFailure>
+      <Interval>PT1M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Users">
+    <Exec>
+      <Command>@INSTALL_DIR@\screen-time-manager.exe</Command>
+    </Exec>
+  </Actions>
+</Task>
