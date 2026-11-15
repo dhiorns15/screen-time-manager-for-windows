@@ -80,6 +80,10 @@ A "Time's Up!" screen appears that blocks the entire computer.
 - **Unlock button** - Enter passcode to remove the block completely
 - **Shut Down button** - Shut down the computer (with confirmation)
 
+The screen also counts down (10 minutes by default; change it in Settings, minimum 1 minute) and then shuts the computer down. If another Windows account is signed in at the same time (Fast User Switching), it signs your child's account out instead, so nobody else's work is lost. The countdown only runs while the blocked account is the one on screen and Windows isn't locked.
+
+Wrong passcodes are limited here just like in the tray menu: after five in a row, the screen shows how long to wait before the next try, and you get an alert (see [Automatic Restart & Tamper Alerts](#automatic-restart--tamper-alerts)).
+
 ---
 
 ## The Pause Feature
@@ -91,7 +95,9 @@ Your child can pause the timer for meals, homework, or breaks without needing yo
 - Each pause auto-resumes after 20 minutes
 - Must wait 15 minutes between pauses
 
-You can change all three in Settings, under "Pause Timer". Set the daily pause to 0 to turn pausing off.
+You can change all three in Settings, under "Pause Timer". Set the daily pause to 0 to turn pausing off (a pause that's running then ends straight away).
+
+**Auto-pause when idle** stops the timer after a few minutes without keyboard or mouse input. It's off by default on new installs, because playing with a controller or watching a video doesn't count as input either; turn it on in Settings, under "Idle Detection", if you want it.
 
 You can view pause usage in "Today's Stats..." from the tray menu.
 
@@ -132,10 +138,12 @@ You can monitor and control screen time from your phone using Telegram. This is 
 3. Copy the **bot token** you receive
 4. Start a chat with your new bot and send `/start`
 5. Note your **chat ID** shown in the reply
-6. In Screen Time Manager settings, scroll to "Telegram Bot" section
+6. In Screen Time Manager settings, scroll to "Telegram Bot" section (or use the **Setup Wizard**, which finds the chat ID for you)
 7. Paste your bot token and chat ID, then enable the bot
 
-Once configured, only you can control the bot - it ignores messages from anyone else.
+The bot starts as soon as you save. Once configured, only you can control the bot - it ignores messages from anyone else. If you set it up in a **group** (for example a family group, so both parents get the alerts), only the group's owner and administrators can send it commands; ordinary members, such as a child you added to the group, can't.
+
+Commands are acted on only if they reach the PC within a few minutes. Anything you sent while the PC was off, asleep or offline is dropped when it comes back, rather than suddenly running then - for whichever account happens to be signed in by that time. Send the command again once the PC is on.
 
 **Note:** the bot token/chat ID - like the passcode and rotating PIN - are stored machine-wide (shared across every Windows account on the PC, unlike time limits, which are per-account) - set it up once and it works no matter which child's account is running the app. Setup gives every account access to the shared settings folder; a copy of the app that wasn't installed with setup silently falls back to per-account storage instead.
 
@@ -164,13 +172,13 @@ You can also monitor and control screen time from a Discord channel, using a Dis
 
 1. Go to [discord.com/developers/applications](https://discord.com/developers/applications) and click **New Application**
 2. Open the **Bot** tab, enable **Message Content Intent**, click **Reset Token**, and copy it
-3. Under **OAuth2 > URL Generator**, check the **bot** scope plus the **Send Messages**, **View Channels**, and **Read Message History** permissions, then open the generated URL to invite the bot to your server
+3. Under **OAuth2 > URL Generator**, check the **bot** scope plus the **Send Messages**, **View Channels**, **Read Message History** and **Manage Messages** permissions, then open the generated URL to invite the bot to your server (Manage Messages lets the bot delete your `!setpin` messages - see below)
 4. In Discord, enable **Developer Mode** (User Settings > Advanced), then right-click the channel you want to use and choose **Copy Channel ID**, and right-click your own username and choose **Copy User ID**
 5. In Screen Time Manager settings, scroll to the "Discord Bot" section (or use the **Setup Wizard**) and paste your bot token, channel ID, and user ID, then enable the bot
 
-Once configured, only you can control the bot in that channel - it ignores commands from anyone else.
+The bot starts as soon as you save. Once configured, only you can control the bot in that channel - it ignores commands from anyone else.
 
-**Use a channel only parents can see.** Anyone who can read the channel sees everything the bot posts there: alerts, your commands and its replies, including today's rotating PIN if you use `!getpin`. Don't use a channel your child (or their friends) can open.
+**Use a channel only parents can see.** Anyone who can read the channel sees everything the bot posts there: alerts, your commands and its replies. Codes are kept out of it where possible: `!getpin` sends today's rotating PIN to you by direct message (allow direct messages from server members if it says it couldn't), and the bot deletes your `!setpin` message so the new passcode doesn't stay in the channel (if it can't, because it lacks the Manage Messages permission, it tells you to delete it yourself). Still, don't use a channel your child (or their friends) can open.
 
 **Note:** the bot token/channel/user ID - like the passcode and rotating PIN - are stored machine-wide (shared across every Windows account on the PC, unlike time limits, which are per-account) - set it up once and it works no matter which child's account is running the app. Setup gives every account access to the shared settings folder; a copy of the app that wasn't installed with setup silently falls back to per-account storage instead. Since the config is shared, `!status`/`!history` (and their Telegram equivalents) show which Windows account is currently logged in, so you can tell whose stats you're looking at. If more than one of your kids' accounts is signed in at once (e.g. via Fast User Switching), only the one currently in the foreground answers bot commands, so you're never talking to two accounts' bots at the same time.
 
@@ -196,12 +204,12 @@ If you're worried about the passcode being watched and memorized, enable the rot
 
 If Screen Time Manager is stopped in any way other than the passcode-protected Quit option (e.g. ended via Task Manager), it's automatically relaunched within about a minute, and you'll get a Telegram/Discord alert if either is enabled. Setup turns this on for **every** Windows account on the PC, including accounts signed in at the same time via Fast User Switching. Installing an update doesn't count as tampering: the app restarts afterwards without an alert.
 
-The watchdog also notices when the app is still there but has stopped working - for example frozen, or suspended with a process tool - after a few minutes. It restarts the app and tells you once. Sleep, hibernation, restarts and switching users don't trigger this.
+The watchdog also notices when the app is still there but has stopped working - for example frozen, or suspended with a process tool - after a few minutes. It restarts the app and tells you once. It only does this while someone is actually using the PC, so sleep, hibernation, restarts, a locked screen, switching users and a PC left alone don't trigger it.
 
 Other alerts you may get:
 
-- **Wrong passcodes** - after five wrong codes in a row, each further wrong code makes the passcode prompt wait before it accepts another try (up to 15 minutes), and you get one alert, since someone may be guessing.
-- **Damaged settings** - if an account's settings file can't be opened, the app doesn't stop: a damaged file is set aside and replaced with default settings (re-check the limits for that account), and if the file can't be opened at all the app runs on default settings until it can. Either way you're told.
+- **Wrong passcodes** - after five wrong codes in a row (on the lock screen or in the tray's passcode prompt), each further wrong code makes passcode entry wait before it accepts another try (up to 15 minutes), and you get one alert, since someone may be guessing.
+- **Damaged settings** - if an account's settings file can't be opened, the app doesn't stop: a damaged file is set aside and replaced with default settings (re-check the limits for that account), and if the file can't be opened at all the app runs on default settings until it can. Either way you're told. The time already used today is carried over, so this doesn't start the day's allowance over.
 
 If the PC is offline when an alert is raised, it's kept and sent once the connection is back (anything more than a day old is dropped).
 
