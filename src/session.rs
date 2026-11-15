@@ -7,9 +7,9 @@
 use windows::core::PWSTR;
 use windows::Win32::System::RemoteDesktop::{
     ProcessIdToSessionId, WTSEnumerateSessionsW, WTSFreeMemory, WTSGetActiveConsoleSessionId,
-    WTSQuerySessionInformationW, WTSSessionInfo, WTSSessionInfoEx, WTSUserName, WTSINFOEXW,
-    WTSINFOW, WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK,
-    WTS_SESSIONSTATE_UNLOCK, WTS_SESSION_INFOW,
+    WTSActive, WTSDisconnected, WTSQuerySessionInformationW, WTSSessionInfo, WTSSessionInfoEx,
+    WTSUserName, WTSINFOEXW, WTSINFOW, WTS_CONNECTSTATE_CLASS, WTS_CURRENT_SERVER_HANDLE,
+    WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK, WTS_SESSIONSTATE_UNLOCK, WTS_SESSION_INFOW,
 };
 use windows::Win32::System::Threading::GetCurrentProcessId;
 
@@ -92,10 +92,28 @@ pub fn verified_lock_state(message_says_locked: bool, wts: Option<bool>, is_cons
     }
 }
 
-/// Whether any session other than `own` has a signed-in user, from
-/// (session id, has a user name) pairs.
-fn any_other_user(own: u32, sessions: &[(u32, bool)]) -> bool {
-    sessions.iter().any(|&(id, has_user)| id != own && has_user)
+/// One session as `other_users_logged_on` sees it: its id, whether it has a
+/// user name (`None` if the name couldn't be read) and its connection state.
+type SessionSummary = (u32, Option<bool>, WTS_CONNECTSTATE_CLASS);
+
+/// Whether a session other than `own` has a signed-in user. A session whose
+/// user name couldn't be read counts as having one unless it's session 0
+/// (services) or not active or disconnected (a listener, say) - a failed
+/// query must tip the lock-screen countdown towards signing this session
+/// out, not towards shutting down under a switched-away user.
+fn is_other_user(own: u32, (id, has_name, state): SessionSummary) -> bool {
+    if id == own {
+        return false;
+    }
+    match has_name {
+        Some(has_name) => has_name,
+        None => id != 0 && (state == WTSActive || state == WTSDisconnected),
+    }
+}
+
+/// Whether any session other than `own` has a signed-in user.
+fn any_other_user(own: u32, sessions: &[SessionSummary]) -> bool {
+    sessions.iter().any(|&session| is_other_user(own, session))
 }
 
 /// Whether another Windows account is signed in on this machine (in any
@@ -112,17 +130,18 @@ pub fn other_users_logged_on() -> bool {
         {
             return true;
         }
-        let sessions: Vec<(u32, bool)> = std::slice::from_raw_parts(list, count as usize)
+        let sessions: Vec<SessionSummary> = std::slice::from_raw_parts(list, count as usize)
             .iter()
-            .map(|s| (s.SessionId, session_has_user(s.SessionId)))
+            .map(|s| (s.SessionId, session_has_user(s.SessionId), s.State))
             .collect();
         WTSFreeMemory(list.cast());
         any_other_user(own, &sessions)
     }
 }
 
-/// Whether a session has a signed-in user (a non-empty WTSUserName).
-unsafe fn session_has_user(session_id: u32) -> bool {
+/// Whether a session has a signed-in user (a non-empty WTSUserName), or
+/// `None` if Windows won't say.
+unsafe fn session_has_user(session_id: u32) -> Option<bool> {
     let mut buffer = PWSTR::null();
     let mut bytes_returned: u32 = 0;
     if WTSQuerySessionInformationW(
@@ -135,11 +154,11 @@ unsafe fn session_has_user(session_id: u32) -> bool {
     .is_err()
         || buffer.is_null()
     {
-        return false;
+        return None;
     }
     let has_user = bytes_returned >= 4 && *buffer.0 != 0;
     WTSFreeMemory(buffer.0.cast());
-    has_user
+    Some(has_user)
 }
 
 /// This session's raw WTS LogonTime and the query's CurrentTime - both
@@ -277,11 +296,25 @@ mod tests {
         assert!(verified_lock_state(false, Some(true), true));
     }
 
+    const LISTEN: WTS_CONNECTSTATE_CLASS = WTS_CONNECTSTATE_CLASS(6); // WTSListen
+
     #[test]
     fn other_users_ignore_own_and_userless_sessions() {
         // Services session 0 (no user), our session 3, listener 65536
-        assert!(!any_other_user(3, &[(0, false), (3, true), (65536, false)]));
-        assert!(any_other_user(3, &[(0, false), (3, true), (5, true)]));
+        let base = [(0, Some(false), WTSDisconnected), (3, Some(true), WTSActive), (65536, Some(false), LISTEN)];
+        assert!(!any_other_user(3, &base));
+        let mut with_other = base.to_vec();
+        with_other.push((5, Some(true), WTSDisconnected));
+        assert!(any_other_user(3, &with_other));
         assert!(!any_other_user(3, &[]));
+    }
+
+    #[test]
+    fn a_session_whose_user_name_cannot_be_read_counts_as_a_user() {
+        // A switched-away parent's session, name query failed: sign out, don't shut down
+        assert!(any_other_user(3, &[(3, Some(true), WTSActive), (2, None, WTSDisconnected)]));
+        assert!(any_other_user(3, &[(3, Some(true), WTSActive), (2, None, WTSActive)]));
+        // ...but not session 0, a listener, or our own session
+        assert!(!any_other_user(3, &[(0, None, WTSDisconnected), (65536, None, LISTEN), (3, None, WTSActive)]));
     }
 }
