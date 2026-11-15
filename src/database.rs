@@ -929,21 +929,13 @@ pub fn save_last_pause_end(timestamp: i64) {
     set_setting("pause_last_end_timestamp", &timestamp.to_string());
 }
 
-/// Get current Unix timestamp
+/// Current Unix timestamp (real seconds since 1970-01-01 UTC), used for the
+/// pause cooldown. Used to be a local-time approximation counting every
+/// month as 30 days, which made the 31st and the 1st collide; values stored
+/// in that old format are always more than a week behind real epoch time, so
+/// they read as a long-expired cooldown (see `mini_overlay::cooldown_remaining_secs`).
 pub fn get_current_timestamp() -> i64 {
-    use windows::Win32::System::SystemInformation::GetLocalTime;
-
-    let st = unsafe { GetLocalTime() };
-
-    // Simple conversion - just need relative timestamps for cooldown
-    // This is approximate but sufficient for our purposes
-    let days_since_epoch = (st.wYear as i64 - 1970) * 365
-        + (st.wMonth as i64 - 1) * 30
-        + st.wDay as i64;
-    days_since_epoch * 86400
-        + st.wHour as i64 * 3600
-        + st.wMinute as i64 * 60
-        + st.wSecond as i64
+    wall_clock_now_secs()
 }
 
 /// Get the session start time used today (in seconds) - tracks when timer started today

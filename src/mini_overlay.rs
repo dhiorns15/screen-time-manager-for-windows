@@ -223,15 +223,14 @@ pub fn can_pause() -> Result<(), PauseBlockedReason> {
     }
 
     // Check cooldown
-    let last_pause_end = database::get_last_pause_end();
-    let current_time = database::get_current_timestamp();
-    let cooldown_seconds = (config.cooldown_minutes * 60) as i64;
-    let time_since_last_pause = current_time - last_pause_end;
-
-    if last_pause_end > 0 && time_since_last_pause < cooldown_seconds {
-        let remaining_cooldown = (cooldown_seconds - time_since_last_pause) as i32;
+    let remaining_cooldown = cooldown_remaining_secs(
+        database::get_current_timestamp(),
+        database::get_last_pause_end(),
+        (config.cooldown_minutes * 60) as i64,
+    );
+    if remaining_cooldown > 0 {
         return Err(PauseBlockedReason::CooldownActive {
-            seconds_remaining: remaining_cooldown,
+            seconds_remaining: remaining_cooldown as i32,
         });
     }
 
@@ -247,6 +246,28 @@ pub fn can_pause() -> Result<(), PauseBlockedReason> {
     }
 
     Ok(())
+}
+
+/// How far ahead of now a stored pause-end time may be and still be taken at
+/// face value (ordinary clock corrections).
+const MAX_FUTURE_PAUSE_END_SECS: i64 = 60;
+
+/// Seconds of pause cooldown left, from real epoch seconds. A last-pause-end
+/// time of 0 (never paused) or further in the future than any clock
+/// correction explains can't be a real end time from this clock, so it
+/// doesn't hold pause back - it must never lock pause out. Values saved by
+/// older versions (a 30-days-per-month approximation) are always more than a
+/// week behind epoch time, so they read as an expired cooldown. The result is
+/// never more than one full cooldown.
+fn cooldown_remaining_secs(now: i64, last_pause_end: i64, cooldown_secs: i64) -> i64 {
+    if last_pause_end <= 0 || cooldown_secs <= 0 {
+        return 0;
+    }
+    let elapsed = now - last_pause_end;
+    if elapsed < -MAX_FUTURE_PAUSE_END_SECS {
+        return 0;
+    }
+    (cooldown_secs - elapsed.max(0)).clamp(0, cooldown_secs)
 }
 
 /// Get remaining pause budget in seconds
