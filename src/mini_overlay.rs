@@ -2,7 +2,7 @@
 //! Small, always-visible display showing remaining time
 
 use std::mem::zeroed;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use windows::{
     core::w,
@@ -13,7 +13,7 @@ use windows::{
             InvalidateRect, SelectObject, SetBkMode, SetTextColor, DrawTextW,
             DT_CENTER, DT_SINGLELINE, DT_VCENTER, FW_BOLD, PAINTSTRUCT, TRANSPARENT,
         },
-        System::SystemInformation::GetTickCount,
+        System::SystemInformation::{GetTickCount, GetTickCount64},
         UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO},
         UI::WindowsAndMessaging::*,
     },
@@ -43,11 +43,39 @@ pub static IS_IDLE_PAUSED: AtomicBool = AtomicBool::new(false);
 /// use, not just that nobody's touched the keyboard/mouse recently). Set
 /// directly from `tray::window_proc`'s WM_WTSSESSION_CHANGE handler, not
 /// polled every tick the way idle detection is - the OS tells us the exact
-/// moment this changes, so there's no reason to guess at it.
+/// moment this changes, so there's no reason to guess at it - though the
+/// message is checked against `session::query_session_locked` first, since
+/// any process in the session can post it (see `on_session_lock_message`).
 pub static IS_LOCK_PAUSED: AtomicBool = AtomicBool::new(false);
 
-/// Timer ID for updating the mini overlay
-pub const TIMER_MINI_UPDATE: usize = 10;
+/// Timer ID of the always-on accounting tick, owned by the hidden main window
+/// (handled in `tray::window_proc`). It drives the countdown, pause accrual,
+/// day rollover, idle detection, bot hand-off and the mini overlay's redraw,
+/// whether or not the mini overlay or the lock overlay is showing. (This used
+/// to be the mini overlay's own timer, which the lock overlay killed when it
+/// hid the mini overlay - stopping rollover and bot hand-off while locked.)
+pub const TIMER_ACCOUNTING_TICK: usize = 30;
+const TICK_INTERVAL_MS: u32 = 1000;
+
+/// A gap between ticks up to this long is credited in full (a UI-thread
+/// stall must not be free time). A longer gap means the process wasn't
+/// running - sleep, hibernate, or suspended - and is credited as a single
+/// one-second tick, exactly as the one-second-per-tick accounting always did.
+const MAX_CREDITED_GAP_MS: u64 = 5000;
+
+/// Save remaining/active time and persist the clock anchor this often (ticks).
+const PERIODIC_SAVE_TICKS: u32 = 30;
+/// While paused, save the pause so far this often (seconds of pause).
+const PAUSE_PERSIST_SECS: i32 = 10;
+/// While lock-paused, re-ask Windows whether we're still locked this often.
+const LOCK_RECHECK_TICKS: u32 = 5;
+
+/// `GetTickCount64` at the previous tick, the not-yet-credited milliseconds,
+/// a tick counter, and whether counted time is waiting to be saved. UI thread.
+static LAST_TICK_MS: AtomicU64 = AtomicU64::new(0);
+static CREDIT_CARRY_MS: AtomicU64 = AtomicU64::new(0);
+static TICK_COUNT: AtomicU32 = AtomicU32::new(0);
+static ACCOUNTING_DIRTY: AtomicBool = AtomicBool::new(false);
 
 /// Mini overlay base dimensions (at 96 DPI / 100% scaling)
 const MINI_WIDTH_BASE: i32 = 140;
@@ -89,7 +117,7 @@ pub unsafe fn create_mini_overlay(hinstance: windows::Win32::Foundation::HMODULE
     MINI_OVERLAY_HWND.store(hwnd.0, Ordering::SeqCst);
 }
 
-/// Show the mini overlay and start the update timer
+/// Show the mini overlay (redrawn by the accounting tick while visible)
 pub unsafe fn show_mini_overlay() {
     let hwnd = HWND(MINI_OVERLAY_HWND.load(Ordering::SeqCst));
     if hwnd.0.is_null() {
@@ -108,9 +136,6 @@ pub unsafe fn show_mini_overlay() {
         x, y, 0, 0,
         SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
     );
-
-    // Update every second
-    let _ = SetTimer(hwnd, TIMER_MINI_UPDATE, 1000, None);
 }
 
 /// Hide the mini overlay
@@ -122,7 +147,6 @@ pub unsafe fn hide_mini_overlay() {
 
     MINI_OVERLAY_VISIBLE.store(false, Ordering::SeqCst);
 
-    let _ = KillTimer(hwnd, TIMER_MINI_UPDATE);
     let _ = ShowWindow(hwnd, SW_HIDE);
 }
 
@@ -316,9 +340,14 @@ fn pause_timer() {
     }
 }
 
-/// Resume the timer (end pause)
+/// Resume the timer (end pause). Only the caller that actually flips
+/// IS_PAUSED off records the pause, so a bot's resume racing the tick's
+/// auto-resume can't count it twice.
 fn resume_timer() {
-    let pause_duration = CURRENT_PAUSE_DURATION.load(Ordering::SeqCst);
+    if !IS_PAUSED.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let pause_duration = CURRENT_PAUSE_DURATION.swap(0, Ordering::SeqCst);
 
     // Update total pause used today
     let total_used = database::get_pause_used_today() + pause_duration;
@@ -331,10 +360,13 @@ fn resume_timer() {
     let timestamp = database::get_current_timestamp();
     database::save_last_pause_end(timestamp);
 
+    // Now counted in today's usage - drop the crash-safety copy (see
+    // `accrue_pause`). Done after the save above: a kill in between counts
+    // the pause twice rather than not at all.
+    database::clear_inflight_pause();
+
     // Reset pause state
-    IS_PAUSED.store(false, Ordering::SeqCst);
     PAUSE_START_TIMESTAMP.store(0, Ordering::SeqCst);
-    CURRENT_PAUSE_DURATION.store(0, Ordering::SeqCst);
 
     // Update display immediately
     unsafe {
@@ -376,10 +408,29 @@ fn get_idle_seconds() -> u32 {
 /// the old day's numbers instead of getting a fresh daily allowance.
 static CURRENT_TRACKED_DATE: Mutex<Option<String>> = Mutex::new(None);
 
+/// The raw local date (`database::local_today_date`) at the previous check -
+/// polled every tick without touching the database, so the authoritative
+/// (and database-writing) `effective_today_date` only runs when the local
+/// date changed, or when `force` asks for it.
+static LAST_LOCAL_DATE: Mutex<Option<String>> = Mutex::new(None);
+
 /// Detect the day changing under a still-running process and reset the
 /// countdown/session-active counters for the new day, mirroring what
-/// `main.rs` already does at a fresh startup.
-unsafe fn check_day_rollover() {
+/// `main.rs` already does at a fresh startup. `force` re-checks the
+/// authoritative date (and persists the clock anchor) even if the local date
+/// looks unchanged - the accounting tick does this every 30 seconds.
+unsafe fn check_day_rollover(force: bool) {
+    let local = database::local_today_date();
+    {
+        let mut last = LAST_LOCAL_DATE.lock().unwrap();
+        let changed = last.as_deref() != Some(local.as_str());
+        if changed {
+            *last = Some(local);
+        } else if !force {
+            return;
+        }
+    }
+
     let today = database::effective_today_date();
     let mut tracked = CURRENT_TRACKED_DATE.lock().unwrap();
 
@@ -455,6 +506,255 @@ pub unsafe fn set_session_locked(locked: bool) {
     let remaining = REMAINING_SECONDS.load(Ordering::SeqCst);
     crate::time_request::notify_session_lock(locked, remaining);
     update_mini_overlay();
+}
+
+/// Handle a WM_WTSSESSION_CHANGE lock/unlock message. Any process in this
+/// session can post that message to our window, so a lock is checked
+/// against what Windows itself reports first (see
+/// `session::verified_lock_state`) - otherwise a posted fake lock would
+/// freeze the countdown.
+pub unsafe fn on_session_lock_message(message_says_locked: bool) {
+    let locked = crate::session::verified_lock_state(
+        message_says_locked,
+        crate::session::query_session_locked(),
+        crate::session::is_active_console_session(),
+    );
+    set_session_locked(locked);
+}
+
+/// While lock-paused, unpause if Windows now says this session, at the
+/// console, is unlocked (a missed unlock, or a lock that couldn't be checked
+/// when it arrived).
+unsafe fn recheck_session_lock() {
+    if crate::session::query_session_locked() == Some(false)
+        && crate::session::is_active_console_session()
+    {
+        set_session_locked(false);
+    }
+}
+
+// ============================================================================
+// Accounting tick (always on, owned by the hidden main window)
+// ============================================================================
+
+/// Start the accounting tick on the hidden main window. Call once at startup,
+/// after the remaining/active time have been loaded: also folds a pause the
+/// previous run was in the middle of into that day's usage, and starts
+/// lock-paused if the session is already locked (no lock event would come).
+pub unsafe fn start_accounting(main_hwnd: HWND) {
+    if let Some(seconds) = database::recover_inflight_pause() {
+        eprintln!("[Accounting] Counted {seconds}s of pause left over from the previous run");
+    }
+    if crate::session::query_session_locked() == Some(true) {
+        IS_LOCK_PAUSED.store(true, Ordering::SeqCst);
+    }
+    LAST_TICK_MS.store(GetTickCount64(), Ordering::SeqCst);
+    if SetTimer(main_hwnd, TIMER_ACCOUNTING_TICK, TICK_INTERVAL_MS, None) == 0 {
+        eprintln!("[Accounting] SetTimer failed - time will not be counted");
+    }
+}
+
+/// End a pause in progress so it's counted now. For WM_DESTROY (sign-out,
+/// shutdown, Quit), since a restarted app never resumes a pause.
+pub fn flush_on_exit() {
+    if IS_PAUSED.load(Ordering::SeqCst) {
+        resume_timer();
+    }
+}
+
+/// What a tick does with the time that passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TickMode {
+    /// Nothing counts: the lock overlay is up, or (not manually paused) the
+    /// session is idle or locked.
+    Frozen,
+    /// Manually paused: the time counts against the pause.
+    Pause,
+    /// Running: the time counts down the remaining allowance.
+    Countdown,
+}
+
+fn tick_mode(blocked: bool, paused: bool, idle_paused: bool, locked: bool) -> TickMode {
+    if blocked {
+        // The lock overlay always froze both: it used to stop this timer.
+        TickMode::Frozen
+    } else if paused {
+        TickMode::Pause
+    } else if idle_paused || locked {
+        TickMode::Frozen
+    } else {
+        TickMode::Countdown
+    }
+}
+
+/// Milliseconds to credit for the gap since the previous tick - see
+/// MAX_CREDITED_GAP_MS.
+fn tick_credit_ms(gap_ms: u64) -> u64 {
+    if gap_ms > MAX_CREDITED_GAP_MS {
+        TICK_INTERVAL_MS as u64
+    } else {
+        gap_ms
+    }
+}
+
+/// Split credited milliseconds into whole seconds to count now and the
+/// remainder to carry to the next tick.
+fn split_whole_seconds(carry_ms: u64) -> (i32, u64) {
+    ((carry_ms / 1000) as i32, carry_ms % 1000)
+}
+
+/// Whether counting down from `prev` to `new` passed a warning threshold.
+/// Equivalent to the old "landed exactly on it" check when counting one
+/// second at a time, but can't be skipped over by a multi-second step.
+fn crossed_threshold(prev: i32, new: i32, threshold: i32) -> bool {
+    prev > threshold && new <= threshold
+}
+
+/// Whether the lock overlay has to come up: no time left and not already
+/// locked. Checked every tick, not just when a countdown step reaches zero,
+/// so a limit cut to 0 (bot or Settings), a reset to a 0-minute day, or a
+/// rollover onto one locks too. Negative remaining means "no limit".
+fn zero_time_lock_due(remaining: i32, blocked: bool) -> bool {
+    remaining == 0 && !blocked
+}
+
+/// The pause duration after counting `secs` more, and whether the pause has
+/// hit its maximum and must end. On ending it's capped at the maximum, so a
+/// multi-second step can't overshoot, but never below what was already
+/// counted.
+fn pause_step(prev: i32, secs: i32, max: i32) -> (i32, bool) {
+    let new = prev + secs;
+    if new >= max {
+        (new.min(max).max(prev), true)
+    } else {
+        (new, false)
+    }
+}
+
+/// The tick itself (WM_TIMER TIMER_ACCOUNTING_TICK on the main window).
+pub unsafe fn on_accounting_tick() {
+    let now = GetTickCount64();
+    let last = LAST_TICK_MS.swap(now, Ordering::SeqCst);
+    let credit = tick_credit_ms(now.saturating_sub(last));
+    let tick = TICK_COUNT.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+    let periodic = tick.is_multiple_of(PERIODIC_SAVE_TICKS);
+
+    check_day_rollover(periodic);
+
+    if IS_LOCK_PAUSED.load(Ordering::SeqCst) && tick.is_multiple_of(LOCK_RECHECK_TICKS) {
+        recheck_session_lock();
+    }
+
+    let mode = tick_mode(
+        crate::blocking::is_blocking_overlay_visible(),
+        IS_PAUSED.load(Ordering::SeqCst),
+        IS_IDLE_PAUSED.load(Ordering::SeqCst),
+        IS_LOCK_PAUSED.load(Ordering::SeqCst),
+    );
+    let secs = if mode == TickMode::Frozen {
+        CREDIT_CARRY_MS.store(0, Ordering::SeqCst);
+        0
+    } else {
+        let (secs, rest) = split_whole_seconds(CREDIT_CARRY_MS.load(Ordering::SeqCst) + credit);
+        CREDIT_CARRY_MS.store(rest, Ordering::SeqCst);
+        secs
+    };
+    match mode {
+        TickMode::Pause => accrue_pause(secs),
+        TickMode::Countdown => count_down(secs),
+        TickMode::Frozen => {}
+    }
+
+    enforce_zero_time();
+    check_idle_state();
+    crate::session::sync_remote_bots();
+
+    if periodic {
+        periodic_save();
+    }
+
+    let mini = HWND(MINI_OVERLAY_HWND.load(Ordering::SeqCst));
+    if !mini.0.is_null() && MINI_OVERLAY_VISIBLE.load(Ordering::SeqCst) {
+        crate::blocking::push_to_topmost(mini, false);
+        let _ = InvalidateRect(mini, None, true);
+    }
+}
+
+/// Count `secs` of manual pause; end the pause at its maximum. The pause so
+/// far is saved every PAUSE_PERSIST_SECS, so a sign-out, crash, kill or update
+/// mid-pause can't refund it (`database::recover_inflight_pause` counts it at
+/// the next start).
+fn accrue_pause(secs: i32) {
+    if secs <= 0 {
+        return;
+    }
+    let prev = CURRENT_PAUSE_DURATION.load(Ordering::SeqCst);
+    let (duration, ends) = pause_step(prev, secs, get_max_pause_duration());
+    CURRENT_PAUSE_DURATION.store(duration, Ordering::SeqCst);
+
+    if ends {
+        // Auto-resume
+        force_resume();
+    } else if prev / PAUSE_PERSIST_SECS != duration / PAUSE_PERSIST_SECS
+        && IS_PAUSED.load(Ordering::SeqCst)
+    {
+        database::save_inflight_pause(duration);
+    }
+}
+
+/// Count `secs` off the remaining allowance, and fire the warnings it passes.
+/// One atomic update, so an extension from a bot thread can't be lost
+/// between reading and writing the remaining time.
+unsafe fn count_down(secs: i32) {
+    if secs <= 0 {
+        return;
+    }
+    let Ok(prev) = REMAINING_SECONDS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+        (current > 0).then(|| (current - secs).max(0))
+    }) else {
+        return;
+    };
+    let new_time = (prev - secs).max(0);
+
+    // Increment session active time
+    SESSION_ACTIVE_SECONDS.fetch_add(prev - new_time, Ordering::SeqCst);
+    ACCOUNTING_DIRTY.store(true, Ordering::SeqCst);
+
+    // Warnings 1 and 2 (e.g. 10 and 5 minutes remaining)
+    for warning in 1..=2 {
+        let (warn_mins, warn_msg) = database::get_warning_config(warning);
+        if crossed_threshold(prev, new_time, (warn_mins * 60) as i32) {
+            crate::overlay::show_overlay(&warn_msg, 10);
+            crate::time_request::notify_low_time(warn_mins, new_time);
+        }
+    }
+}
+
+/// Bring up the lock overlay if there's no time left (see `zero_time_lock_due`).
+/// A manual pause in progress ends here and is counted.
+unsafe fn enforce_zero_time() {
+    let remaining = REMAINING_SECONDS.load(Ordering::SeqCst);
+    if !zero_time_lock_due(remaining, crate::blocking::is_blocking_overlay_visible()) {
+        return;
+    }
+    resume_timer(); // no-op unless paused
+    database::save_remaining_time(remaining);
+    let msg = database::get_blocking_message();
+    crate::blocking::show_blocking_overlay(&msg);
+    crate::time_request::notify_out_of_time();
+}
+
+/// Every PERIODIC_SAVE_TICKS: save counted time (the save also persists the
+/// clock anchor), and send a clock-tamper alert if one is pending - whether
+/// or not time is currently being counted.
+fn periodic_save() {
+    if ACCOUNTING_DIRTY.swap(false, Ordering::SeqCst) {
+        database::save_remaining_time(REMAINING_SECONDS.load(Ordering::SeqCst));
+        database::save_session_active_time(SESSION_ACTIVE_SECONDS.load(Ordering::SeqCst));
+    }
+    if let Some(drift) = database::take_pending_clock_tamper_alert() {
+        crate::time_request::notify_clock_tamper(drift);
+    }
 }
 
 /// Window procedure for the mini overlay
@@ -546,89 +846,6 @@ pub unsafe extern "system" fn mini_overlay_proc(
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
-        WM_TIMER => {
-            if wparam.0 == TIMER_MINI_UPDATE {
-                let paused = IS_PAUSED.load(Ordering::SeqCst);
-                let idle_paused = IS_IDLE_PAUSED.load(Ordering::SeqCst);
-                let locked = IS_LOCK_PAUSED.load(Ordering::SeqCst);
-
-                if paused {
-                    // Timer is manually paused - increment pause duration instead
-                    let duration = CURRENT_PAUSE_DURATION.fetch_add(1, Ordering::SeqCst) + 1;
-                    let max_duration = get_max_pause_duration();
-
-                    // Check if max pause duration reached
-                    if duration >= max_duration {
-                        // Auto-resume
-                        force_resume();
-                    }
-                } else if idle_paused || locked {
-                    // Timer is idle-paused or the session is locked - don't
-                    // decrement time, don't track session time. Locked takes
-                    // this same no-op branch regardless of the idle-detection
-                    // setting (see IS_LOCK_PAUSED) - a locked screen means the
-                    // account genuinely can't be in use, not a discretionary
-                    // "no recent input" call. Just redraw to keep the display
-                    // updated.
-                } else {
-                    // Timer is running normally
-                    let current = REMAINING_SECONDS.load(Ordering::SeqCst);
-                    if current > 0 {
-                        let new_time = current - 1;
-                        REMAINING_SECONDS.store(new_time, Ordering::SeqCst);
-
-                        // Increment session active time
-                        SESSION_ACTIVE_SECONDS.fetch_add(1, Ordering::SeqCst);
-
-                        // Save to database periodically (every 30 seconds)
-                        if new_time % 30 == 0 {
-                            database::save_remaining_time(new_time);
-                            // Also save session active time
-                            let active = SESSION_ACTIVE_SECONDS.load(Ordering::SeqCst);
-                            database::save_session_active_time(active);
-
-                            if let Some(drift) = database::take_pending_clock_tamper_alert() {
-                                crate::time_request::notify_clock_tamper(drift);
-                            }
-                        }
-
-                        // Check for warning 1 (e.g., 10 minutes remaining)
-                        let (warn1_mins, warn1_msg) = database::get_warning_config(1);
-                        if new_time == (warn1_mins * 60) as i32 {
-                            crate::overlay::show_overlay(&warn1_msg, 10);
-                            crate::time_request::notify_low_time(warn1_mins, new_time);
-                        }
-
-                        // Check for warning 2 (e.g., 5 minutes remaining)
-                        let (warn2_mins, warn2_msg) = database::get_warning_config(2);
-                        if new_time == (warn2_mins * 60) as i32 {
-                            crate::overlay::show_overlay(&warn2_msg, 10);
-                            crate::time_request::notify_low_time(warn2_mins, new_time);
-                        }
-
-                        // Trigger blocking overlay when time reaches 0
-                        if new_time == 0 {
-                            let msg = database::get_blocking_message();
-                            crate::blocking::show_blocking_overlay(&msg);
-                            crate::time_request::notify_out_of_time();
-                        }
-                    }
-                }
-
-                // Always check for the day rolling over, idle state, and
-                // which session currently owns the console (even during
-                // manual pause, to keep tracking these transitions)
-                check_day_rollover();
-                check_idle_state();
-                crate::session::sync_remote_bots();
-
-                if MINI_OVERLAY_VISIBLE.load(Ordering::SeqCst) {
-                    crate::blocking::push_to_topmost(hwnd, false);
-                }
-                let _ = InvalidateRect(hwnd, None, true);
-            }
-            LRESULT(0)
-        }
         WM_DISPLAYCHANGE => {
             // Keep to the top-right corner of the (possibly resized) primary
             let (x, y) = mini_overlay_position();
@@ -653,5 +870,153 @@ pub unsafe fn register_mini_overlay_class(hinstance: windows::Win32::Foundation:
 
     if RegisterClassW(&wnd_class) == 0 {
         panic!("Failed to register mini overlay window class");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_overlay_freezes_everything() {
+        assert_eq!(tick_mode(true, false, false, false), TickMode::Frozen);
+        assert_eq!(tick_mode(true, true, false, false), TickMode::Frozen);
+    }
+
+    #[test]
+    fn manual_pause_accrues_even_when_idle_or_locked() {
+        assert_eq!(tick_mode(false, true, false, false), TickMode::Pause);
+        assert_eq!(tick_mode(false, true, true, true), TickMode::Pause);
+    }
+
+    #[test]
+    fn idle_and_session_lock_freeze_the_countdown() {
+        assert_eq!(tick_mode(false, false, true, false), TickMode::Frozen);
+        assert_eq!(tick_mode(false, false, false, true), TickMode::Frozen);
+        assert_eq!(tick_mode(false, false, false, false), TickMode::Countdown);
+    }
+
+    #[test]
+    fn short_stalls_are_credited_in_full() {
+        assert_eq!(tick_credit_ms(1000), 1000);
+        assert_eq!(tick_credit_ms(1016), 1016);
+        assert_eq!(tick_credit_ms(4200), 4200);
+        assert_eq!(tick_credit_ms(MAX_CREDITED_GAP_MS), MAX_CREDITED_GAP_MS);
+    }
+
+    #[test]
+    fn sleep_and_suspension_count_as_one_tick() {
+        // Overnight sleep or hibernate: no more than the old one second
+        assert_eq!(tick_credit_ms(8 * 3600 * 1000), 1000);
+        assert_eq!(tick_credit_ms(MAX_CREDITED_GAP_MS + 1), 1000);
+        assert_eq!(tick_credit_ms(0), 0);
+    }
+
+    #[test]
+    fn credit_carries_fractions() {
+        assert_eq!(split_whole_seconds(999), (0, 999));
+        assert_eq!(split_whole_seconds(1000), (1, 0));
+        assert_eq!(split_whole_seconds(2015), (2, 15));
+        // Sixty 1016 ms ticks add up to the real 60.96 s, not 60 x 1 s
+        let mut carry = 0;
+        let mut total = 0;
+        for _ in 0..60 {
+            let (s, rest) = split_whole_seconds(carry + 1016);
+            total += s;
+            carry = rest;
+        }
+        assert_eq!((total, carry), (60, 960));
+    }
+
+    #[test]
+    fn warnings_fire_once_when_crossed() {
+        assert!(crossed_threshold(601, 600, 600));
+        assert!(crossed_threshold(603, 599, 600), "multi-second step");
+        assert!(!crossed_threshold(600, 599, 600), "already past");
+        assert!(!crossed_threshold(700, 650, 600));
+        // A threshold of 0 behaves as before: fires on reaching zero
+        assert!(crossed_threshold(1, 0, 0));
+    }
+
+    #[test]
+    fn zero_time_locks_whenever_not_locked_already() {
+        assert!(zero_time_lock_due(0, false));
+        assert!(!zero_time_lock_due(0, true));
+        assert!(!zero_time_lock_due(1, false));
+        assert!(!zero_time_lock_due(-1, false), "negative means no limit");
+    }
+
+    #[test]
+    fn pause_ends_at_its_maximum() {
+        assert_eq!(pause_step(10, 1, 1200), (11, false));
+        assert_eq!(pause_step(1199, 1, 1200), (1200, true));
+        assert_eq!(pause_step(1198, 4, 1200), (1200, true), "capped, no overshoot");
+        // Budget shrank below what's already counted: end, keep what was counted
+        assert_eq!(pause_step(500, 1, 300), (500, true));
+    }
+
+    /// The pre-fix `get_current_timestamp`: every month 30 days, local time.
+    fn old_fake_timestamp(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) -> i64 {
+        ((y - 1970) * 365 + (mo - 1) * 30 + d) * 86400 + h * 3600 + mi * 60 + s
+    }
+
+    /// Real epoch seconds (Hinnant's days_from_civil, as in database.rs).
+    fn epoch(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) -> i64 {
+        let yy = if mo <= 2 { y - 1 } else { y };
+        let era = yy.div_euclid(400);
+        let yoe = yy - era * 400;
+        let mp = (mo + 9) % 12;
+        let doy = (153 * mp + 2) / 5 + d - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        (era * 146097 + doe - 719468) * 86400 + h * 3600 + mi * 60 + s
+    }
+
+    #[test]
+    fn epoch_helper_is_right() {
+        assert_eq!(epoch(1970, 1, 1, 0, 0, 0), 0);
+        assert_eq!(epoch(2000, 3, 1, 0, 0, 0), 951868800);
+    }
+
+    #[test]
+    fn cooldown_from_real_timestamps() {
+        let now = epoch(2026, 11, 15, 12, 0, 0);
+        assert_eq!(cooldown_remaining_secs(now, 0, 900), 0, "never paused");
+        assert_eq!(cooldown_remaining_secs(now, now - 100, 900), 800);
+        assert_eq!(cooldown_remaining_secs(now, now - 900, 900), 0);
+        assert_eq!(cooldown_remaining_secs(now, now - 5000, 900), 0);
+        assert_eq!(cooldown_remaining_secs(now, now - 100, 0), 0, "no cooldown configured");
+    }
+
+    #[test]
+    fn cooldown_spans_month_ends() {
+        // Pause ended 23:55 on the 31st; 00:05 on the 1st is ten minutes later
+        let end = epoch(2026, 10, 31, 23, 55, 0);
+        let now = epoch(2026, 11, 1, 0, 5, 0);
+        assert_eq!(cooldown_remaining_secs(now, end, 900), 300);
+    }
+
+    #[test]
+    fn future_pause_end_never_locks_pause_out() {
+        let now = epoch(2026, 11, 15, 12, 0, 0);
+        // A small clock correction: at most one full cooldown
+        assert_eq!(cooldown_remaining_secs(now, now + 30, 900), 900);
+        // Far in the future: not a real end time, ignored
+        assert_eq!(cooldown_remaining_secs(now, now + 86400, 900), 0);
+        assert_eq!(cooldown_remaining_secs(now, i64::MAX / 2, 900), 0);
+    }
+
+    #[test]
+    fn old_format_pause_end_reads_as_expired() {
+        // A value saved by the old code at any time up to the update must not
+        // hold pause back afterwards.
+        for y in 2026..=2032 {
+            for mo in 1..=12 {
+                for d in 1..=28 {
+                    let saved = old_fake_timestamp(y, mo, d, 23, 59, 59);
+                    let now = epoch(y, mo, d, 0, 0, 0);
+                    assert_eq!(cooldown_remaining_secs(now, saved, 3600), 0, "{y}-{mo}-{d}");
+                }
+            }
+        }
     }
 }

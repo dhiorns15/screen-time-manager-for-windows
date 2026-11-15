@@ -401,15 +401,27 @@ pub unsafe extern "system" fn window_proc(
             // connect/disconnect, session logon/logoff) are already covered
             // by other mechanisms (WM_QUERYENDSESSION, the per-session
             // mutex) or don't apply to this always-local single-session app.
+            // Any process in this session can post this message, so the
+            // reported state is checked with Windows first.
             match wparam.0 as u32 {
-                WTS_SESSION_LOCK => crate::mini_overlay::set_session_locked(true),
-                WTS_SESSION_UNLOCK => crate::mini_overlay::set_session_locked(false),
+                WTS_SESSION_LOCK => crate::mini_overlay::on_session_lock_message(true),
+                WTS_SESSION_UNLOCK => crate::mini_overlay::on_session_lock_message(false),
                 _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            if wparam.0 == crate::mini_overlay::TIMER_ACCOUNTING_TICK {
+                crate::mini_overlay::on_accounting_tick();
             }
             LRESULT(0)
         }
         WM_DESTROY => {
             let _ = WTSUnRegisterSessionNotification(hwnd);
+
+            // Count a pause in progress now (this is also the WM_ENDSESSION
+            // path) - the next start never resumes it.
+            crate::mini_overlay::flush_on_exit();
 
             // Signal Telegram bot to shut down (sends shutdown notification)
             telegram::signal_shutdown();

@@ -201,6 +201,9 @@ fn main() {
         let session_active = database::get_session_active_time();
         mini_overlay::SESSION_ACTIVE_SECONDS.store(session_active, Ordering::SeqCst);
 
+        // The always-on per-second tick (countdown, rollover, idle, bots)
+        mini_overlay::start_accounting(hwnd);
+
         // Show the mini overlay with remaining time
         show_mini_overlay();
 
@@ -225,7 +228,7 @@ fn main() {
         // unconditionally starting its own bot connection makes commands get
         // answered twice (or, for Telegram's single-poller getUpdates, fought
         // over). Called here for a fast start on the common single-session
-        // case; the mini overlay's per-second timer (see mini_overlay.rs)
+        // case; the per-second accounting tick (see mini_overlay.rs)
         // repeats this call to react as the active session changes via Fast
         // User Switching - both calls are idempotent, so this isn't a race.
         session::sync_remote_bots();

@@ -7,9 +7,9 @@
 use windows::core::PWSTR;
 use windows::Win32::System::RemoteDesktop::{
     ProcessIdToSessionId, WTSEnumerateSessionsW, WTSFreeMemory, WTSGetActiveConsoleSessionId,
-    WTSQuerySessionInformationW, WTSSessionInfo, WTSUserName,
-    WTSINFOW, WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION,
-    WTS_SESSION_INFOW,
+    WTSQuerySessionInformationW, WTSSessionInfo, WTSSessionInfoEx, WTSUserName, WTSINFOEXW,
+    WTSINFOW, WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK,
+    WTS_SESSIONSTATE_UNLOCK, WTS_SESSION_INFOW,
 };
 use windows::Win32::System::Threading::GetCurrentProcessId;
 
@@ -31,6 +31,65 @@ pub fn is_active_console_session() -> bool {
     // silencing the bots on an ordinary single-user machine where this check
     // should never actually fail.
     own_session_id().is_none_or(|id| unsafe { WTSGetActiveConsoleSessionId() } == id)
+}
+
+/// Map WTSINFOEX_LEVEL1's SessionFlags to locked (true) / unlocked (false),
+/// or `None` for WTS_SESSIONSTATE_UNKNOWN or anything else. (Windows 7 and
+/// Server 2008 R2 report these two flags swapped; the app needs Windows 10+.)
+fn lock_state_from_flags(flags: i32) -> Option<bool> {
+    match flags as u32 {
+        WTS_SESSIONSTATE_LOCK => Some(true),
+        WTS_SESSIONSTATE_UNLOCK => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether this session is locked right now, asked of Windows directly rather
+/// than taken from a WM_WTSSESSION_CHANGE message (which any process in the
+/// session can post to our window). `None` if Windows won't say.
+pub fn query_session_locked() -> Option<bool> {
+    unsafe {
+        let mut buffer = PWSTR::null();
+        let mut bytes_returned: u32 = 0;
+        WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            WTS_CURRENT_SESSION,
+            WTSSessionInfoEx,
+            &mut buffer,
+            &mut bytes_returned,
+        )
+        .ok()?;
+        if buffer.is_null() {
+            return None;
+        }
+        let state = if bytes_returned as usize >= std::mem::size_of::<WTSINFOEXW>() {
+            let info = *(buffer.0 as *const WTSINFOEXW);
+            if info.Level == 1 {
+                lock_state_from_flags(info.Data.WTSInfoExLevel1.SessionFlags)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        WTSFreeMemory(buffer.0.cast());
+        state
+    }
+}
+
+/// Decide the lock state from a WM_WTSSESSION_CHANGE lock/unlock message,
+/// given what Windows reports (`wts`, see `query_session_locked`) and whether
+/// this session owns the console. A lock message is only refused when Windows
+/// positively says this session, sitting at the console, is unlocked - that's
+/// a posted fake meant to freeze the countdown. A switched-away session can't
+/// be in use, so its lock is always believed. When Windows can't say, the
+/// message is believed, as before.
+pub fn verified_lock_state(message_says_locked: bool, wts: Option<bool>, is_console: bool) -> bool {
+    if message_says_locked {
+        !(wts == Some(false) && is_console)
+    } else {
+        wts == Some(true)
+    }
 }
 
 /// Whether any session other than `own` has a signed-in user, from
@@ -142,7 +201,8 @@ static WAS_ACTIVE: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
 /// every tick: start_bot_thread/stop_bot_thread join the *previous* bot-
 /// thread generation before doing anything (see discord.rs/telegram.rs), so
 /// an unconditional per-second call would mean the UI thread - this runs on
-/// the mini overlay's WM_TIMER handler - briefly blocks waiting on that join
+/// the main window's always-on accounting tick (`mini_overlay::on_accounting_tick`,
+/// which keeps running while the lock overlay is up) - briefly blocks waiting on that join
 /// every single tick. Only calling on a real transition keeps that (rare,
 /// at most a few hundred ms) blocking to genuine Fast-User-Switching
 /// hand-offs instead of every tick.
@@ -167,6 +227,33 @@ pub fn sync_remote_bots() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lock_flags_map_to_states() {
+        assert_eq!(lock_state_from_flags(0), Some(true));
+        assert_eq!(lock_state_from_flags(1), Some(false));
+        assert_eq!(lock_state_from_flags(-1), None, "WTS_SESSIONSTATE_UNKNOWN");
+    }
+
+    #[test]
+    fn posted_fake_lock_is_refused_at_the_console() {
+        assert!(!verified_lock_state(true, Some(false), true));
+    }
+
+    #[test]
+    fn real_and_unverifiable_locks_are_believed() {
+        assert!(verified_lock_state(true, Some(true), true));
+        assert!(verified_lock_state(true, None, true));
+        // Switched away under Fast User Switching: can't be in use
+        assert!(verified_lock_state(true, Some(false), false));
+    }
+
+    #[test]
+    fn unlock_only_when_windows_does_not_say_locked() {
+        assert!(!verified_lock_state(false, Some(false), true));
+        assert!(!verified_lock_state(false, None, true));
+        assert!(verified_lock_state(false, Some(true), true));
+    }
 
     #[test]
     fn other_users_ignore_own_and_userless_sessions() {

@@ -1092,7 +1092,7 @@ pub fn set_discord_config(token: &str, channel_id: &str, admin_user_id: &str, en
 }
 
 // ============================================================================
-// Time-zone tamper detection
+// Time-zone tamper detection, local date, and in-flight pause persistence
 // ============================================================================
 
 /// The UTC offset (local minus UTC, minutes) in effect when the clock anchor
@@ -1158,6 +1158,76 @@ fn utc_offset_tamper_secs() -> Option<i64> {
     }
 }
 
+/// Today's date by the local clock, without the clock-tamper gate or any
+/// database access - cheap enough to poll every second to notice that the
+/// date may have changed, before asking `effective_today_date` for the
+/// authoritative answer.
+pub fn local_today_date() -> String {
+    get_today_date()
+}
+
+/// The in-progress pause, saved periodically while paused so that a sign-out,
+/// crash, kill or update mid-pause can't refund it: "<date>|<seconds>|<epoch
+/// seconds when saved>". Cleared when the pause ends normally.
+const PAUSE_INFLIGHT_KEY: &str = "pause_inflight";
+
+/// Record how long the current pause has run so far.
+pub fn save_inflight_pause(seconds: i32) {
+    let value = format!("{}|{}|{}", effective_today_date(), seconds, wall_clock_now_secs());
+    set_setting(PAUSE_INFLIGHT_KEY, &value);
+}
+
+/// Forget the in-progress pause (it ended and was added to the day's usage).
+pub fn clear_inflight_pause() {
+    if let Ok(guard) = DB_CONNECTION.lock() {
+        if let Some(conn) = guard.as_ref() {
+            let _ = conn.execute("DELETE FROM settings WHERE key = ?1", params![PAUSE_INFLIGHT_KEY]);
+        }
+    }
+}
+
+/// Parse a `PAUSE_INFLIGHT_KEY` value: (date, seconds, saved-at epoch secs).
+fn parse_inflight_pause(value: &str) -> Option<(String, i32, i64)> {
+    let mut parts = value.splitn(3, '|');
+    let date = parts.next()?;
+    let seconds: i32 = parts.next()?.parse().ok()?;
+    let saved_at: i64 = parts.next()?.parse().ok()?;
+    let date_ok = date.len() == 10
+        && date.bytes().enumerate().all(|(i, b)| if i == 4 || i == 7 { b == b'-' } else { b.is_ascii_digit() });
+    (date_ok && seconds > 0).then(|| (date.to_string(), seconds, saved_at))
+}
+
+/// Fold a pause left over from a previous run (the app stopped mid-pause) into
+/// that day's pause usage and pause log, and start the cooldown from when it
+/// was last saved. Returns the seconds recovered. Call once at startup.
+pub fn recover_inflight_pause() -> Option<i32> {
+    let raw = get_setting(PAUSE_INFLIGHT_KEY)?;
+    let Some((date, seconds, saved_at)) = parse_inflight_pause(&raw) else {
+        clear_inflight_pause();
+        return None;
+    };
+
+    let used_key = format!("pause_used_{}", date);
+    let used: i32 = get_setting(&used_key).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let total = used.saturating_add(seconds);
+    set_setting(&used_key, &total.to_string());
+    mirror_shared_daily_stat("pause", &date, total);
+
+    // Same "HH:MM:SS:<n>s" entry log_pause_event writes, timed at the save.
+    let local = (saved_at + current_utc_offset_mins() * 60).rem_euclid(86400);
+    let entry = format!("{:02}:{:02}:{:02}:{}s", local / 3600, (local % 3600) / 60, local % 60, seconds);
+    let log_key = format!("pause_log_{}", date);
+    let existing = get_setting(&log_key).unwrap_or_default();
+    let updated = if existing.is_empty() { entry } else { format!("{},{}", existing, entry) };
+    set_setting(&log_key, &updated);
+
+    if saved_at > get_last_pause_end() {
+        save_last_pause_end(saved_at);
+    }
+    clear_inflight_pause();
+    Some(seconds)
+}
+
 #[cfg(test)]
 mod timekeeping_tests {
     use super::*;
@@ -1203,6 +1273,20 @@ mod timekeeping_tests {
         // Just past a DST step, or a DST step on top of a zone change
         assert_eq!(utc_offset_shift_beyond_dst(60, 180), Some(120));
         assert_eq!(utc_offset_shift_beyond_dst(60, 135), Some(75));
+    }
+
+    #[test]
+    fn inflight_pause_parses_only_valid_values() {
+        assert_eq!(
+            parse_inflight_pause("2026-11-15|130|1794750000"),
+            Some(("2026-11-15".to_string(), 130, 1794750000))
+        );
+        assert_eq!(parse_inflight_pause("2026-11-15|0|1794750000"), None, "nothing to fold");
+        assert_eq!(parse_inflight_pause("2026-11-15|-5|1794750000"), None);
+        assert_eq!(parse_inflight_pause("2026-11-15|abc|1794750000"), None);
+        assert_eq!(parse_inflight_pause("2026-11-15|130"), None);
+        assert_eq!(parse_inflight_pause("garbage|130|1794750000"), None);
+        assert_eq!(parse_inflight_pause(""), None);
     }
 }
 
