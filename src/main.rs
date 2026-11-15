@@ -14,6 +14,7 @@ mod dpi;
 mod i18n;
 mod mini_overlay;
 mod overlay;
+mod passcode_guard;
 mod remote_commands;
 mod session;
 mod telegram;

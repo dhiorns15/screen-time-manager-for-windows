@@ -102,6 +102,30 @@ pub fn notify_passcode_extend(source_key: &str, minutes: i32, remaining_seconds:
     }
 }
 
+/// Called once per run of wrong passcodes, when it reaches the point where
+/// entry starts being locked (see `passcode_guard`) - someone may be
+/// guessing.
+pub fn notify_passcode_lockout(failures: u32) {
+    let username = current_windows_username();
+    let text = format!(
+        "🔐 {} {} {}\n{}",
+        username,
+        i18n::t("passcode_guard.notify.header"),
+        failures,
+        i18n::t("passcode_guard.notify.suffix"),
+    );
+
+    let tg = database::get_telegram_config();
+    let dc = database::get_discord_config();
+
+    if tg.enabled {
+        telegram::notify_admin(&text);
+    }
+    if dc.enabled {
+        discord::notify_admin(&text);
+    }
+}
+
 /// Called whenever idle detection flips the timer between paused and running
 /// (see `mini_overlay::check_idle_state`), so the parent can see activity
 /// without having to poll the `status` bot command themselves.

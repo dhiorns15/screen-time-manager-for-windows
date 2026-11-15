@@ -1,16 +1,21 @@
 //! Dialogs module for Screen Time Manager
 //! Contains passcode verification and settings dialog implementations
 
+use std::cell::RefCell;
 use std::mem::zeroed;
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering as AtomicOrdering};
+use std::sync::Mutex;
 use windows::{
     core::{w, PCWSTR},
     Win32::{
         Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::Gdi::{
             BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject,
-            DrawTextW, Ellipse, EndPaint, FillRect, InvalidateRect, LineTo, MoveToEx, SelectObject,
-            SetBkMode, SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK,
-            FW_BOLD, FW_NORMAL, HDC, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
+            DrawTextW, Ellipse, EndPaint, FillRect, GetMonitorInfoW, GetStockObject, GetSysColorBrush,
+            InvalidateRect, LineTo, MonitorFromWindow, MoveToEx, SelectObject, SetBkColor,
+            SetBkMode, SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER,
+            DT_WORDBREAK, FW_BOLD, FW_NORMAL, GetSysColor, HDC, HGDIOBJ, MONITORINFO, COLOR_BTNFACE,
+            MONITOR_DEFAULTTOPRIMARY, PAINTSTRUCT, PS_SOLID, SYSTEM_FONT, TRANSPARENT,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
@@ -22,9 +27,101 @@ use windows::{
 };
 
 use crate::constants::*;
-use crate::database::{get_passcode, get_setting, set_setting, set_telegram_config, get_telegram_config, set_discord_config, get_discord_config, WEEKDAY_KEYS, get_pause_used_today, get_pause_config, get_pause_log_today, is_pause_enabled, is_idle_enabled, get_idle_timeout_minutes};
+use crate::database::{get_setting, set_setting, set_telegram_config, get_telegram_config, set_discord_config, get_discord_config, WEEKDAY_KEYS, get_pause_used_today, get_pause_config, get_pause_log_today, is_pause_enabled, is_idle_enabled, get_idle_timeout_minutes};
 use crate::dpi::scale;
 use crate::i18n::{self, Language};
+use crate::passcode_guard::{self, Attempt};
+
+// ============================================================================
+// Shared dialog plumbing
+// ============================================================================
+
+thread_local! {
+    /// Fonts (and other GDI objects) a dialog created for its own controls,
+    /// by owning window, deleted when that window is gone (WM_NCDESTROY) -
+    /// they used to be leaked on every open.
+    static DIALOG_GDI: RefCell<Vec<(usize, HGDIOBJ)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Remember `obj` for deletion when `owner` is destroyed; returns it.
+fn track_gdi<T: Copy + Into<HGDIOBJ>>(owner: HWND, obj: T) -> T {
+    let handle: HGDIOBJ = obj.into();
+    if !handle.is_invalid() {
+        DIALOG_GDI.with(|v| v.borrow_mut().push((owner.0 as usize, handle)));
+    }
+    obj
+}
+
+/// Delete everything `track_gdi` recorded for `owner`. Call from
+/// WM_NCDESTROY, which comes after the child controls using the fonts are
+/// destroyed.
+unsafe fn release_gdi(owner: HWND) {
+    let objects: Vec<HGDIOBJ> = DIALOG_GDI.with(|v| {
+        let mut v = v.borrow_mut();
+        let (mine, rest): (Vec<_>, Vec<_>) = v.drain(..).partition(|(o, _)| *o == owner.0 as usize);
+        *v = rest;
+        mine.into_iter().map(|(_, obj)| obj).collect()
+    });
+    for obj in objects {
+        let _ = DeleteObject(obj);
+    }
+}
+
+/// Select a stock font into `hdc`, so the fonts a paint function created
+/// can actually be deleted - DeleteObject fails on a font that is still
+/// selected, and the wizard pages used to leak one that way on every repaint
+/// (every 2 seconds while waiting for the Telegram message).
+unsafe fn deselect_font(hdc: HDC) {
+    SelectObject(hdc, GetStockObject(SYSTEM_FONT));
+}
+
+/// Register a dialog window class with a solid background. The class (and
+/// its brush) is registered once per process; on later opens registration
+/// fails because the class exists, and the brush made for that attempt is
+/// deleted instead of leaked.
+unsafe fn register_dialog_class(class_name: PCWSTR, proc: WNDPROC, background: u32) {
+    let hinstance = GetModuleHandleW(None).unwrap_or_default();
+    let brush = CreateSolidBrush(COLORREF(background));
+    let wnd_class = WNDCLASSW {
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc: proc,
+        hInstance: hinstance.into(),
+        lpszClassName: class_name,
+        hbrBackground: brush,
+        hCursor: LoadCursorW(None, IDC_ARROW).ok().unwrap_or_default(),
+        ..zeroed()
+    };
+    if RegisterClassW(&wnd_class) == 0 {
+        let _ = DeleteObject(brush);
+    }
+}
+
+/// Run a nested message loop until `dlg` is destroyed.
+///
+/// The dialogs used to end their loop with PostQuitMessage, and the setup
+/// wizards posted it on WM_CLOSE without destroying the window, so each
+/// click on a wizard's X ended one more loop: the wizard's, then Settings',
+/// then the app's main loop - and the app exited without its quit marker,
+/// which the watchdog reported as tampering. Now a dialog's loop ends only
+/// when its own window is gone, and a WM_QUIT that arrives meanwhile (a real
+/// shutdown of the app) is handed on to the enclosing loop instead of being
+/// swallowed.
+unsafe fn run_modal_loop(dlg: HWND) {
+    let mut msg: MSG = zeroed();
+    while IsWindow(dlg).as_bool() {
+        match GetMessageW(&mut msg, None, 0, 0).0 {
+            0 => {
+                PostQuitMessage(msg.wParam.0 as i32);
+                break;
+            }
+            -1 => break,
+            _ => {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+}
 
 // Control IDs for settings dialog
 const ID_SETTINGS_BASE: i32 = 2000;
@@ -67,23 +164,61 @@ struct SettingsEditHandles {
     idle_timeout_minutes: HWND,
     // Language setting
     language: HWND,
+    // Pause settings
+    pause_daily_budget: HWND,
+    pause_max_duration: HWND,
+    pause_cooldown: HWND,
+}
+
+/// What a passcode prompt is for, so the dialog can say so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// Only `Generic` is used until tray.rs passes the specific action (see
+// `verify_passcode_for_action`).
+#[allow(dead_code)]
+pub enum PasscodeAction {
+    /// No specific action named ("Enter 4-digit code to continue").
+    Generic,
+    Stats,
+    Settings,
+    Extend15,
+    Extend45,
+    Quit,
+}
+
+impl PasscodeAction {
+    fn prompt_key(self) -> &'static str {
+        match self {
+            PasscodeAction::Generic => "passcode.subtitle",
+            PasscodeAction::Stats => "passcode.action.stats",
+            PasscodeAction::Settings => "passcode.action.settings",
+            PasscodeAction::Extend15 => "passcode.action.extend_15",
+            PasscodeAction::Extend45 => "passcode.action.extend_45",
+            PasscodeAction::Quit => "passcode.action.quit",
+        }
+    }
 }
 
 /// Verify passcode before allowing sensitive operations
 pub unsafe fn verify_passcode_for_quit(parent_hwnd: HWND) -> bool {
-    if get_passcode().is_none() {
-        return true;
-    }
+    verify_passcode_for_action(parent_hwnd, PasscodeAction::Generic)
+}
 
+/// Ask for the passcode, naming the action it will allow. Fails closed: if
+/// the passcode can't be read the dialog says so and nothing is allowed
+/// (it used to let everything through when the read failed). Attempts are
+/// limited by `passcode_guard`.
+pub unsafe fn verify_passcode_for_action(parent_hwnd: HWND, action: PasscodeAction) -> bool {
     let dialog_class = w!("ScreenTimePasscodeDialogNice");
     let hinstance = GetModuleHandleW(None).expect("Failed to get module handle");
 
     static mut DIALOG_RESULT: Option<bool> = None;
     static mut DIALOG_EDIT_HWND: Option<HWND> = None;
-    static mut DIALOG_ERROR: bool = false;
+    static mut DIALOG_ERROR: Option<String> = None;
+    static mut DIALOG_PROMPT_KEY: &str = "passcode.subtitle";
 
     DIALOG_RESULT = None;
-    DIALOG_ERROR = false;
+    DIALOG_ERROR = None;
+    DIALOG_PROMPT_KEY = action.prompt_key();
 
     // A plain WS_CHILD EDIT control owns keyboard focus once created, so
     // WM_KEYDOWN never reaches this dialog's own window proc below (Win32
@@ -134,12 +269,12 @@ pub unsafe fn verify_passcode_for_quit(parent_hwnd: HWND) -> bool {
                     DIALOG_EDIT_HWND = Some(e);
                     SendMessageW(e, EM_SETLIMITTEXT, WPARAM(4), LPARAM(0));
 
-                    let hfont = CreateFontW(
+                    let hfont = track_gdi(hwnd, CreateFontW(
                         scale(28), 0, 0, 0,
                         FW_BOLD.0 as i32,
                         0, 0, 0, 0, 0, 0, 5, 0,
                         w!("Segoe UI"),
-                    );
+                    ));
                     SendMessageW(e, WM_SETFONT, WPARAM(hfont.0 as usize), LPARAM(1));
                     let orig = SetWindowLongPtrW(e, GWLP_WNDPROC, edit_subclass_proc as *const () as isize);
                     SetWindowLongPtrW(e, GWLP_USERDATA, orig);
@@ -147,12 +282,12 @@ pub unsafe fn verify_passcode_for_quit(parent_hwnd: HWND) -> bool {
                 }
 
                 // Button font
-                let btn_font = CreateFontW(
+                let btn_font = track_gdi(hwnd, CreateFontW(
                     scale(14), 0, 0, 0,
                     FW_NORMAL.0 as i32,
                     0, 0, 0, 0, 0, 0, 5, 0,
                     w!("Segoe UI"),
-                );
+                ));
 
                 // OK Button
                 let ok_btn_text = i18n::wide("button.ok");
@@ -225,24 +360,26 @@ pub unsafe fn verify_passcode_for_quit(parent_hwnd: HWND) -> bool {
                 SelectObject(hdc, sub_font);
                 SetTextColor(hdc, COLORREF(0x00666666));
 
+                // Names the action being authorised (or the generic prompt).
                 let mut sub_rect = RECT { left: 0, top: scale(55), right: rect.right, bottom: scale(80) };
-                let sub_text: Vec<u16> = i18n::t("passcode.subtitle").encode_utf16().collect();
+                let sub_text: Vec<u16> = i18n::t(DIALOG_PROMPT_KEY).encode_utf16().collect();
                 DrawTextW(
                     hdc,
                     &mut sub_text.clone(),
                     &mut sub_rect,
-                    DT_CENTER | DT_SINGLELINE,
+                    DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
                 );
 
-                if DIALOG_ERROR {
+                let error_ref = std::ptr::addr_of!(DIALOG_ERROR);
+                if let Some(error) = (*error_ref).as_deref() {
                     SetTextColor(hdc, COLORREF(COLOR_ERROR));
                     let mut err_rect = RECT { left: 0, top: scale(150), right: rect.right, bottom: scale(170) };
-                    let err_text: Vec<u16> = i18n::t("passcode.incorrect").encode_utf16().collect();
+                    let mut err_text: Vec<u16> = error.encode_utf16().collect();
                     DrawTextW(
                         hdc,
-                        &mut err_text.clone(),
+                        &mut err_text,
                         &mut err_rect,
-                        DT_CENTER | DT_SINGLELINE,
+                        DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
                     );
                 }
 
@@ -262,11 +399,24 @@ pub unsafe fn verify_passcode_for_quit(parent_hwnd: HWND) -> bool {
                             let len = GetWindowTextW(edit_hwnd, &mut buffer);
                             let entered: String = String::from_utf16_lossy(&buffer[..len as usize]);
 
-                            if crate::database::verify_passcode(&entered) {
+                            let error = match passcode_guard::attempt(&entered) {
+                                Attempt::Correct => None,
+                                Attempt::Wrong { locked_for_secs: 0 } => {
+                                    Some(i18n::t("passcode.incorrect").to_string())
+                                }
+                                Attempt::Wrong { locked_for_secs: secs }
+                                | Attempt::LockedOut { secs_remaining: secs } => Some(format!(
+                                    "{} {}",
+                                    i18n::t("passcode.locked"),
+                                    passcode_guard::format_wait(secs)
+                                )),
+                                Attempt::Unavailable => Some(i18n::t("passcode.unavailable").to_string()),
+                            };
+                            if error.is_none() {
                                 DIALOG_RESULT = Some(true);
                                 DestroyWindow(hwnd).ok();
                             } else {
-                                DIALOG_ERROR = true;
+                                DIALOG_ERROR = error;
                                 let _ = InvalidateRect(hwnd, None, true);
                                 SetWindowTextW(edit_hwnd, w!("")).ok();
                                 let _ = SetFocus(edit_hwnd);
@@ -295,24 +445,15 @@ pub unsafe fn verify_passcode_for_quit(parent_hwnd: HWND) -> bool {
                 DestroyWindow(hwnd).ok();
                 LRESULT(0)
             }
-            WM_DESTROY => {
-                PostQuitMessage(0);
-                LRESULT(0)
+            WM_NCDESTROY => {
+                release_gdi(hwnd);
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     }
 
-    let wnd_class = WNDCLASSW {
-        style: CS_HREDRAW | CS_VREDRAW,
-        lpfnWndProc: Some(dialog_proc),
-        hInstance: hinstance.into(),
-        lpszClassName: dialog_class,
-        hbrBackground: CreateSolidBrush(COLORREF(0x00F0F0F0)),
-        hCursor: LoadCursorW(None, IDC_ARROW).ok().unwrap_or_default(),
-        ..zeroed()
-    };
-    RegisterClassW(&wnd_class);
+    register_dialog_class(dialog_class, Some(dialog_proc), 0x00F0F0F0);
 
     let screen_width = GetSystemMetrics(SM_CXSCREEN);
     let screen_height = GetSystemMetrics(SM_CYSCREEN);
@@ -337,12 +478,7 @@ pub unsafe fn verify_passcode_for_quit(parent_hwnd: HWND) -> bool {
     if let Ok(dlg) = dialog_hwnd {
         let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
-
-        let mut msg: MSG = zeroed();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        run_modal_loop(dlg);
     }
 
     DIALOG_RESULT.unwrap_or(false)
@@ -371,15 +507,18 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                 let hinstance = GetModuleHandleW(None).unwrap();
 
                 // Font quality: 5 = CLEARTYPE_QUALITY for crisp rendering
-                let label_font = CreateFontW(
+                let label_font = track_gdi(hwnd, CreateFontW(
                     scale(14), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"),
-                );
-                let title_font = CreateFontW(
+                ));
+                let title_font = track_gdi(hwnd, CreateFontW(
                     scale(16), 0, 0, 0, FW_BOLD.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"),
-                );
-                let edit_font = CreateFontW(
+                ));
+                let edit_font = track_gdi(hwnd, CreateFontW(
                     scale(14), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"),
-                );
+                ));
+
+                SETTINGS_SCROLL_POS = 0;
+                SETTINGS_DEFAULT_PASSCODE_WARNING = HWND::default();
 
                 let mut y_pos = scale(10);
 
@@ -621,6 +760,21 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                 );
                 if let Ok(h) = title5 { SendMessageW(h, WM_SETFONT, WPARAM(title_font.0 as usize), LPARAM(1)); }
                 y_pos += scale(20);
+
+                // Still the factory passcode: say so, in red (see
+                // WM_CTLCOLORSTATIC). This row only exists in that case.
+                if crate::database::passcode_is_default() {
+                    let warning_text = i18n::wide("settings.passcode_default_warning");
+                    let warning = CreateWindowExW(
+                        WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR(warning_text.as_ptr()),
+                        WS_CHILD | WS_VISIBLE, scale(25), y_pos, scale(350), scale(20), hwnd, HMENU::default(), hinstance, None,
+                    );
+                    if let Ok(h) = warning {
+                        SendMessageW(h, WM_SETFONT, WPARAM(label_font.0 as usize), LPARAM(1));
+                        SETTINGS_DEFAULT_PASSCODE_WARNING = h;
+                    }
+                    y_pos += scale(20);
+                }
 
                 let curr_label_text = i18n::wide("settings.current");
                 let curr_label = CreateWindowExW(
@@ -933,6 +1087,12 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                     SetWindowTextW(h, PCWSTR(wide.as_ptr())).ok();
                     lock_timeout_hwnd = h;
                 }
+                let shutdown_hint_text = i18n::wide("settings.shutdown_timeout_hint");
+                let shutdown_hint = CreateWindowExW(
+                    WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR(shutdown_hint_text.as_ptr()),
+                    WS_CHILD | WS_VISIBLE, scale(250), y_pos + scale(2), scale(125), scale(20), hwnd, HMENU::default(), hinstance, None,
+                );
+                if let Ok(h) = shutdown_hint { SendMessageW(h, WM_SETFONT, WPARAM(label_font.0 as usize), LPARAM(1)); }
                 y_pos += scale(24);
 
                 // ===== Idle Detection Section =====
@@ -983,12 +1143,66 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                     SetWindowTextW(h, PCWSTR(wide.as_ptr())).ok();
                     idle_timeout_hwnd = h;
                 }
-                y_pos += scale(28);
+                y_pos += scale(24);
+
+                // ===== Pause Section =====
+                // Three numeric rows built exactly like "Idle timeout" above
+                // (label at 25, edit at 180), plus a short hint to the right
+                // of the edit where one is needed.
+                y_pos += scale(10);
+                let title_pause_text = i18n::wide("settings.pause");
+                let title_pause = CreateWindowExW(
+                    WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR(title_pause_text.as_ptr()),
+                    WS_CHILD | WS_VISIBLE, scale(15), y_pos, scale(360), scale(20), hwnd, HMENU::default(), hinstance, None,
+                );
+                if let Ok(h) = title_pause { SendMessageW(h, WM_SETFONT, WPARAM(title_font.0 as usize), LPARAM(1)); }
+                y_pos += scale(20);
+
+                let pause_config = get_pause_config();
+                // Pausing switched off shows as a budget of 0 (and saving 0
+                // switches it off - see the Save handler).
+                let budget_value = if is_pause_enabled() { pause_config.daily_budget_minutes } else { 0 };
+                let pause_rows = [
+                    ("settings.pause_budget", Some("settings.pause_budget_hint"), budget_value),
+                    ("settings.pause_max", Some("settings.pause_max_hint"), pause_config.max_duration_minutes),
+                    ("settings.pause_cooldown", None, pause_config.cooldown_minutes),
+                ];
+                let mut pause_hwnds = [HWND::default(); 3];
+                for (i, (label_key, hint_key, value)) in pause_rows.into_iter().enumerate() {
+                    let label_text = i18n::wide(label_key);
+                    let label = CreateWindowExW(
+                        WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR(label_text.as_ptr()),
+                        WS_CHILD | WS_VISIBLE, scale(25), y_pos + scale(2), scale(150), scale(20), hwnd, HMENU::default(), hinstance, None,
+                    );
+                    if let Ok(h) = label { SendMessageW(h, WM_SETFONT, WPARAM(label_font.0 as usize), LPARAM(1)); }
+                    let edit = CreateWindowExW(
+                        WINDOW_EX_STYLE(0x200), w!("EDIT"), w!(""),
+                        WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_NUMBER as u32 | ES_CENTER as u32),
+                        scale(180), y_pos, scale(50), scale(22), hwnd, HMENU::default(), hinstance, None,
+                    );
+                    if let Ok(h) = edit {
+                        SendMessageW(h, WM_SETFONT, WPARAM(edit_font.0 as usize), LPARAM(1));
+                        SendMessageW(h, EM_SETLIMITTEXT, WPARAM(3), LPARAM(0));
+                        let wide: Vec<u16> = value.to_string().encode_utf16().chain(std::iter::once(0)).collect();
+                        SetWindowTextW(h, PCWSTR(wide.as_ptr())).ok();
+                        pause_hwnds[i] = h;
+                    }
+                    if let Some(hint_key) = hint_key {
+                        let hint_text = i18n::wide(hint_key);
+                        let hint = CreateWindowExW(
+                            WINDOW_EX_STYLE(0), w!("STATIC"), PCWSTR(hint_text.as_ptr()),
+                            WS_CHILD | WS_VISIBLE, scale(240), y_pos + scale(2), scale(135), scale(20), hwnd, HMENU::default(), hinstance, None,
+                        );
+                        if let Ok(h) = hint { SendMessageW(h, WM_SETFONT, WPARAM(label_font.0 as usize), LPARAM(1)); }
+                    }
+                    y_pos += scale(24);
+                }
+                y_pos += scale(4);
 
                 // ===== Buttons =====
-                let btn_font = CreateFontW(
+                let btn_font = track_gdi(hwnd, CreateFontW(
                     scale(14), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"),
-                );
+                ));
 
                 let save_btn_text = i18n::wide("button.save");
                 let save_btn = CreateWindowExW(
@@ -1005,6 +1219,9 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                     scale(200), y_pos, scale(90), scale(30), hwnd, HMENU(ID_SETTINGS_CANCEL as _), hinstance, None,
                 );
                 if let Ok(h) = cancel_btn { SendMessageW(h, WM_SETFONT, WPARAM(btn_font.0 as usize), LPARAM(1)); }
+
+                // Client height the controls need: buttons plus a margin.
+                SETTINGS_CONTENT_HEIGHT = y_pos + scale(30) + scale(12);
 
                 SETTINGS_EDIT_HANDLES = Some(SettingsEditHandles {
                     daily_limits: daily_handles,
@@ -1028,6 +1245,9 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                     idle_enabled: idle_enabled_hwnd,
                     idle_timeout_minutes: idle_timeout_hwnd,
                     language: lang_combo_hwnd,
+                    pause_daily_budget: pause_hwnds[0],
+                    pause_max_duration: pause_hwnds[1],
+                    pause_cooldown: pause_hwnds[2],
                 });
 
                 LRESULT(0)
@@ -1037,6 +1257,22 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
 
                 if id == ID_SETTINGS_SAVE {
                     if let Some(ref handles) = SETTINGS_EDIT_HANDLES {
+                        // Minute fields that must be at least 1: refuse to
+                        // save (nothing is written yet) and put 1 in the field.
+                        for (edit, error_key) in [
+                            (handles.lock_screen_timeout, "settings.error.shutdown_min"),
+                            (handles.pause_max_duration, "settings.error.pause_max_min"),
+                        ] {
+                            if read_number_field(edit) == Some(0) {
+                                SetWindowTextW(edit, w!("1")).ok();
+                                let msg = i18n::wide(error_key);
+                                let title = i18n::wide("settings.error");
+                                MessageBoxW(hwnd, PCWSTR(msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
+                                let _ = SetFocus(edit);
+                                return LRESULT(0);
+                            }
+                        }
+
                         // Handle passcode change first
                         let mut current_pass = String::new();
                         let mut new_pass = String::new();
@@ -1060,9 +1296,10 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
 
                         // Check if user wants to change passcode
                         if !new_pass.is_empty() || !confirm_pass.is_empty() {
-                            // Verify current passcode
-                            let stored = get_passcode().unwrap_or_else(|| "0000".to_string());
-                            if current_pass != stored {
+                            // Verify current passcode (an unreadable one
+                            // matches nothing)
+                            let stored = crate::database::effective_passcode();
+                            if stored.as_deref() != Some(current_pass.as_str()) {
                                 let msg = i18n::wide("settings.error.current_incorrect");
                                 let title = i18n::wide("settings.error");
                                 MessageBoxW(hwnd, PCWSTR(msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
@@ -1221,7 +1458,9 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                             let len = GetWindowTextW(handles.lock_screen_timeout, &mut buffer);
                             let value = String::from_utf16_lossy(&buffer[..len as usize]);
                             if let Ok(minutes) = value.parse::<i32>() {
-                                let seconds = minutes * 60;
+                                // At least a minute (0 meant "shut down a
+                                // second after every block"); validated above.
+                                let seconds = minutes.max(1) * 60;
                                 set_setting("lock_screen_timeout", &seconds.to_string());
                             }
                         }
@@ -1239,6 +1478,20 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                                 let clamped = mins.max(1);
                                 set_setting("idle_timeout_minutes", &clamped.to_string());
                             }
+                        }
+
+                        // Save pause settings (same pattern as the idle
+                        // timeout; an empty field leaves the value as it was).
+                        // A daily budget of 0 switches pausing off.
+                        if let Some(budget) = read_number_field(handles.pause_daily_budget) {
+                            set_setting("pause_daily_budget", &budget.to_string());
+                            set_setting("pause_enabled", if budget > 0 { "1" } else { "0" });
+                        }
+                        if let Some(max) = read_number_field(handles.pause_max_duration) {
+                            set_setting("pause_max_duration", &max.max(1).to_string());
+                        }
+                        if let Some(cooldown) = read_number_field(handles.pause_cooldown) {
+                            set_setting("pause_cooldown", &cooldown.to_string());
                         }
 
                         // Save language setting
@@ -1272,6 +1525,47 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
 
                 LRESULT(0)
             }
+            WM_CTLCOLORSTATIC => {
+                // The default-passcode warning in red; every other label
+                // keeps the default colours.
+                let warning = SETTINGS_DEFAULT_PASSCODE_WARNING;
+                if !warning.0.is_null() && lparam.0 == warning.0 as isize {
+                    let hdc = HDC(wparam.0 as _);
+                    SetTextColor(hdc, COLORREF(COLOR_ERROR));
+                    SetBkColor(hdc, COLORREF(GetSysColor(COLOR_BTNFACE)));
+                    return LRESULT(GetSysColorBrush(COLOR_BTNFACE).0 as isize);
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_VSCROLL => {
+                let mut info = SCROLLINFO {
+                    cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+                    fMask: SIF_ALL,
+                    ..zeroed()
+                };
+                let _ = GetScrollInfo(hwnd, SB_VERT, &mut info);
+                let page = info.nPage as i32;
+                let target = match SCROLLBAR_COMMAND((wparam.0 & 0xFFFF) as i32) {
+                    SB_LINEUP => SETTINGS_SCROLL_POS - scale(24),
+                    SB_LINEDOWN => SETTINGS_SCROLL_POS + scale(24),
+                    SB_PAGEUP => SETTINGS_SCROLL_POS - page,
+                    SB_PAGEDOWN => SETTINGS_SCROLL_POS + page,
+                    SB_THUMBTRACK | SB_THUMBPOSITION => info.nTrackPos,
+                    SB_TOP => 0,
+                    SB_BOTTOM => i32::MAX,
+                    _ => SETTINGS_SCROLL_POS,
+                };
+                settings_scroll_to(hwnd, target);
+                LRESULT(0)
+            }
+            WM_MOUSEWHEEL => {
+                if SETTINGS_SCROLLABLE {
+                    let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+                    settings_scroll_to(hwnd, SETTINGS_SCROLL_POS - delta * scale(72) / 120);
+                    return LRESULT(0);
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_CLOSE => {
                 DestroyWindow(hwnd).ok();
                 LRESULT(0)
@@ -1279,28 +1573,25 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
             WM_DESTROY => {
                 SETTINGS_EDIT_HANDLES = None;
                 SETTINGS_DIALOG_OPEN = false;
-                PostQuitMessage(0);
+                SETTINGS_DEFAULT_PASSCODE_WARNING = HWND::default();
                 LRESULT(0)
+            }
+            WM_NCDESTROY => {
+                release_gdi(hwnd);
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     }
 
-    let wnd_class = WNDCLASSW {
-        style: CS_HREDRAW | CS_VREDRAW,
-        lpfnWndProc: Some(settings_dialog_proc),
-        hInstance: hinstance.into(),
-        lpszClassName: dialog_class,
-        hbrBackground: CreateSolidBrush(COLORREF(0x00F5F5F5)),
-        hCursor: LoadCursorW(None, IDC_ARROW).ok().unwrap_or_default(),
-        ..zeroed()
-    };
-    RegisterClassW(&wnd_class);
+    register_dialog_class(dialog_class, Some(settings_dialog_proc), 0x00F5F5F5);
 
     let screen_width = GetSystemMetrics(SM_CXSCREEN);
     let screen_height = GetSystemMetrics(SM_CYSCREEN);
     let dialog_width = scale(400);
     let dialog_height = scale(970);
+    SETTINGS_CONTENT_HEIGHT = 0;
+    SETTINGS_SCROLLABLE = false;
 
     let dialog_hwnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
@@ -1318,17 +1609,147 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
     );
 
     if let Ok(dlg) = dialog_hwnd {
+        fit_settings_dialog(dlg);
         let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
-
-        let mut msg: MSG = zeroed();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        run_modal_loop(dlg);
     }
 
     SETTINGS_DIALOG_OPEN = false;
+}
+
+/// Client height the Settings controls need (set at the end of WM_CREATE).
+static mut SETTINGS_CONTENT_HEIGHT: i32 = 0;
+/// How far the Settings content is scrolled up, in pixels.
+static mut SETTINGS_SCROLL_POS: i32 = 0;
+/// Whether `fit_settings_dialog` had to add a scroll bar.
+static mut SETTINGS_SCROLLABLE: bool = false;
+/// The red "still the default passcode" label, if shown.
+static mut SETTINGS_DEFAULT_PASSCODE_WARNING: HWND = HWND(std::ptr::null_mut());
+
+/// The parsed value of a numeric edit field, `None` if empty or not a
+/// number (or the field doesn't exist).
+unsafe fn read_number_field(edit: HWND) -> Option<u32> {
+    if edit.0.is_null() {
+        return None;
+    }
+    let mut buffer = [0u16; 16];
+    let len = GetWindowTextW(edit, &mut buffer);
+    String::from_utf16_lossy(&buffer[..len.max(0) as usize]).trim().parse().ok()
+}
+
+/// Size the Settings window to its content and keep it on the monitor.
+///
+/// If the content fits the work area (the usual case at 1080p and 100%),
+/// the window is simply sized to the content and centred in the work area.
+/// If not (e.g. 1366x768, or 1080p at 125%), the window is made as tall as
+/// the work area, gets a vertical scroll bar (and is widened by the bar's
+/// width so no control is covered), and the content scrolls - so Save is
+/// always reachable.
+unsafe fn fit_settings_dialog(dlg: HWND) {
+    let content_height = SETTINGS_CONTENT_HEIGHT;
+    if content_height <= 0 {
+        return; // WM_CREATE didn't finish; leave the window as created.
+    }
+
+    let mut client: RECT = zeroed();
+    let mut window: RECT = zeroed();
+    if GetClientRect(dlg, &mut client).is_err() || GetWindowRect(dlg, &mut window).is_err() {
+        return;
+    }
+    // Non-client size (caption, borders) as Windows actually drew it.
+    let frame_width = (window.right - window.left) - client.right;
+    let frame_height = (window.bottom - window.top) - client.bottom;
+
+    let mut monitor_info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..zeroed() };
+    let monitor = MonitorFromWindow(dlg, MONITOR_DEFAULTTOPRIMARY);
+    if !GetMonitorInfoW(monitor, &mut monitor_info).as_bool() {
+        return;
+    }
+    let work = monitor_info.rcWork;
+    let work_width = work.right - work.left;
+    let work_height = work.bottom - work.top;
+
+    let layout = settings_window_layout(client.right, content_height, frame_width, frame_height, work_height, GetSystemMetrics(SM_CXVSCROLL));
+    let x = work.left + ((work_width - layout.width) / 2).max(0);
+    let y = work.top + ((work_height - layout.height) / 2).max(0);
+
+    if layout.scroll {
+        SETTINGS_SCROLLABLE = true;
+        let style = GetWindowLongPtrW(dlg, GWL_STYLE);
+        SetWindowLongPtrW(dlg, GWL_STYLE, style | WS_VSCROLL.0 as isize);
+    }
+    let _ = SetWindowPos(dlg, None, x, y, layout.width, layout.height, SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+
+    if layout.scroll {
+        let mut client_after: RECT = zeroed();
+        let _ = GetClientRect(dlg, &mut client_after);
+        let info = SCROLLINFO {
+            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+            fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+            nMin: 0,
+            nMax: content_height - 1,
+            nPage: client_after.bottom.max(1) as u32,
+            nPos: 0,
+            nTrackPos: 0,
+        };
+        SetScrollInfo(dlg, SB_VERT, &info, true);
+    }
+}
+
+/// Outer size of the Settings window, and whether it scrolls.
+#[derive(Debug, PartialEq, Eq)]
+struct SettingsWindowLayout {
+    width: i32,
+    height: i32,
+    scroll: bool,
+}
+
+/// Pure part of `fit_settings_dialog`: size the window to `content_height`
+/// of client area, or, when that won't fit in `work_height`, to the work
+/// area's height with a scroll bar (widening the window by its width).
+fn settings_window_layout(
+    client_width: i32,
+    content_height: i32,
+    frame_width: i32,
+    frame_height: i32,
+    work_height: i32,
+    scrollbar_width: i32,
+) -> SettingsWindowLayout {
+    let wanted_height = content_height + frame_height;
+    if wanted_height <= work_height {
+        SettingsWindowLayout { width: client_width + frame_width, height: wanted_height, scroll: false }
+    } else {
+        SettingsWindowLayout {
+            width: client_width + frame_width + scrollbar_width,
+            height: work_height,
+            scroll: true,
+        }
+    }
+}
+
+/// Scroll the Settings content so that `target` (clamped) is at the top.
+unsafe fn settings_scroll_to(hwnd: HWND, target: i32) {
+    if !SETTINGS_SCROLLABLE {
+        return;
+    }
+    let mut client: RECT = zeroed();
+    let _ = GetClientRect(hwnd, &mut client);
+    let max_pos = (SETTINGS_CONTENT_HEIGHT - client.bottom).max(0);
+    let new_pos = target.clamp(0, max_pos);
+    let dy = SETTINGS_SCROLL_POS - new_pos;
+    if dy == 0 {
+        return;
+    }
+    SETTINGS_SCROLL_POS = new_pos;
+    ScrollWindowEx(hwnd, 0, dy, None, None, None, None, SW_SCROLLCHILDREN | SW_INVALIDATE | SW_ERASE);
+    let info = SCROLLINFO {
+        cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+        fMask: SIF_POS,
+        nPos: new_pos,
+        ..zeroed()
+    };
+    SetScrollInfo(hwnd, SB_VERT, &info, true);
 }
 
 /// Show today's stats dialog
@@ -1361,9 +1782,9 @@ pub unsafe fn show_stats_dialog(parent_hwnd: HWND) {
             WM_CREATE => {
                 let hinstance = GetModuleHandleW(None).unwrap();
 
-                let btn_font = CreateFontW(
+                let btn_font = track_gdi(hwnd, CreateFontW(
                     scale(14), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"),
-                );
+                ));
 
                 // Reset Timer button
                 let reset_btn_text = i18n::wide("button.reset_timer");
@@ -1639,23 +2060,17 @@ pub unsafe fn show_stats_dialog(parent_hwnd: HWND) {
             }
             WM_DESTROY => {
                 STATS_DIALOG_OPEN = false;
-                PostQuitMessage(0);
                 LRESULT(0)
+            }
+            WM_NCDESTROY => {
+                release_gdi(hwnd);
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     }
 
-    let wnd_class = WNDCLASSW {
-        style: CS_HREDRAW | CS_VREDRAW,
-        lpfnWndProc: Some(stats_dialog_proc),
-        hInstance: hinstance.into(),
-        lpszClassName: dialog_class,
-        hbrBackground: CreateSolidBrush(COLORREF(0x00F5F5F5)),
-        hCursor: LoadCursorW(None, IDC_ARROW).ok().unwrap_or_default(),
-        ..zeroed()
-    };
-    RegisterClassW(&wnd_class);
+    register_dialog_class(dialog_class, Some(stats_dialog_proc), 0x00F5F5F5);
 
     let screen_width = GetSystemMetrics(SM_CXSCREEN);
     let screen_height = GetSystemMetrics(SM_CYSCREEN);
@@ -1681,12 +2096,7 @@ pub unsafe fn show_stats_dialog(parent_hwnd: HWND) {
     if let Ok(dlg) = dialog_hwnd {
         let _ = ShowWindow(dlg, SW_SHOW);
         let _ = SetForegroundWindow(dlg);
-
-        let mut msg: MSG = zeroed();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        run_modal_loop(dlg);
     }
 
     STATS_DIALOG_OPEN = false;
@@ -1705,34 +2115,49 @@ const ID_WIZARD_TOKEN_EDIT: i32 = 3004;
 // Wizard state
 static mut WIZARD_STEP: i32 = 1;
 static mut WIZARD_TOKEN: Option<String> = None;
-static mut WIZARD_CHAT_ID: Option<i64> = None;
 static mut WIZARD_POLLING: bool = false;
-static mut WIZARD_HWND: Option<HWND> = None;
+/// The wizard window, read by the polling thread to request a repaint.
+static WIZARD_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+/// The chat the bot most recently heard from (written by the polling
+/// thread, read on the UI thread).
+static WIZARD_CHAT: Mutex<Option<DetectedChat>> = Mutex::new(None);
+/// Bumped each time detection (re)starts, so a reply to an older poll can't
+/// overwrite a newer detection.
+static WIZARD_POLL_GENERATION: AtomicU32 = AtomicU32::new(0);
 const WIZARD_TOTAL_STEPS: i32 = 5;
 const TIMER_POLL_TELEGRAM: usize = 100;
+
+/// A Telegram chat found by the wizard, with a name so the parent can see
+/// whose chat is about to become the admin chat.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DetectedChat {
+    id: i64,
+    name: String,
+}
+
+fn wizard_chat() -> Option<DetectedChat> {
+    WIZARD_CHAT.lock().ok().and_then(|c| c.clone())
+}
+
+fn set_wizard_chat(chat: Option<DetectedChat>) {
+    if let Ok(mut c) = WIZARD_CHAT.lock() {
+        *c = chat;
+    }
+}
 
 /// Show the Telegram setup wizard
 pub unsafe fn show_telegram_wizard(parent_hwnd: HWND) {
     // Reset wizard state
     WIZARD_STEP = 1;
     WIZARD_TOKEN = None;
-    WIZARD_CHAT_ID = None;
+    set_wizard_chat(None);
     WIZARD_POLLING = false;
 
     let hinstance = GetModuleHandleW(None).unwrap();
     let wizard_class = w!("ScreenTimeTelegramWizard");
 
     // Register wizard window class
-    let wc = WNDCLASSW {
-        style: CS_HREDRAW | CS_VREDRAW,
-        lpfnWndProc: Some(wizard_proc),
-        hInstance: hinstance.into(),
-        lpszClassName: wizard_class,
-        hbrBackground: CreateSolidBrush(COLORREF(0x00FFFFFF)),
-        hCursor: LoadCursorW(None, IDC_ARROW).ok().unwrap_or_default(),
-        ..zeroed()
-    };
-    RegisterClassW(&wc);
+    register_dialog_class(wizard_class, Some(wizard_proc), 0x00FFFFFF);
 
     let screen_width = GetSystemMetrics(SM_CXSCREEN);
     let screen_height = GetSystemMetrics(SM_CYSCREEN);
@@ -1756,18 +2181,13 @@ pub unsafe fn show_telegram_wizard(parent_hwnd: HWND) {
     );
 
     if let Ok(hwnd) = wizard_hwnd {
-        WIZARD_HWND = Some(hwnd);
+        WIZARD_HWND.store(hwnd.0, AtomicOrdering::SeqCst);
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
-
-        let mut msg: MSG = zeroed();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        run_modal_loop(hwnd);
     }
 
-    WIZARD_HWND = None;
+    WIZARD_HWND.store(std::ptr::null_mut(), AtomicOrdering::SeqCst);
 }
 
 /// Wizard window procedure
@@ -1797,11 +2217,19 @@ unsafe extern "system" fn wizard_proc(
             }
             LRESULT(0)
         }
-        WM_CLOSE | WM_DESTROY => {
+        WM_CLOSE => {
+            // Close only this wizard (see run_modal_loop).
+            DestroyWindow(hwnd).ok();
+            LRESULT(0)
+        }
+        WM_DESTROY => {
             KillTimer(hwnd, TIMER_POLL_TELEGRAM).ok();
             WIZARD_POLLING = false;
-            PostQuitMessage(0);
             LRESULT(0)
+        }
+        WM_NCDESTROY => {
+            release_gdi(hwnd);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
@@ -1822,12 +2250,12 @@ unsafe fn create_wizard_buttons(hwnd: HWND) {
     let margin = scale(20);
 
     // Button font
-    let btn_font = CreateFontW(
+    let btn_font = track_gdi(hwnd, CreateFontW(
         scale(15), 0, 0, 0,
         FW_NORMAL.0 as i32,
         0, 0, 0, 0, 0, 0, 5, 0,
         w!("Segoe UI"),
-    );
+    ));
 
     // Cancel button (left)
     let cancel_text = i18n::wide("wizard.cancel");
@@ -2067,6 +2495,7 @@ unsafe fn paint_step_welcome(hdc: HDC, rect: &RECT) {
     let mut ready_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(25) };
     DrawTextW(hdc, &mut i18n::t("wizard.welcome.ready").encode_utf16().collect::<Vec<_>>(), &mut ready_rect, DT_CENTER | DT_SINGLELINE);
 
+    deselect_font(hdc);
     let _ = DeleteObject(title_font);
     let _ = DeleteObject(desc_font);
     let _ = DeleteObject(icon_font);
@@ -2126,6 +2555,7 @@ unsafe fn paint_step_botfather(hdc: HDC, rect: &RECT) {
     let mut hint_text_rect = RECT { left: rect.left + scale(10), top: y + scale(10), right: rect.right - scale(10), bottom: y + scale(35) };
     DrawTextW(hdc, &mut i18n::t("wizard.bot.hint").encode_utf16().collect::<Vec<_>>(), &mut hint_text_rect, DT_CENTER | DT_SINGLELINE);
 
+    deselect_font(hdc);
     let _ = DeleteObject(title_font);
     let _ = DeleteObject(step_font);
     let _ = DeleteObject(icon_font);
@@ -2183,7 +2613,7 @@ unsafe fn paint_step_token(hdc: HDC, hwnd: HWND, rect: &RECT) {
             None,
         );
 
-        let edit_font = CreateFontW(scale(14), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Consolas"));
+        let edit_font = track_gdi(hwnd, CreateFontW(scale(14), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Consolas")));
         let new_edit = GetDlgItem(hwnd, ID_WIZARD_TOKEN_EDIT).unwrap_or_default();
         if !new_edit.0.is_null() {
             SendMessageW(new_edit, WM_SETFONT, WPARAM(edit_font.0 as usize), LPARAM(1));
@@ -2212,6 +2642,7 @@ unsafe fn paint_step_token(hdc: HDC, hwnd: HWND, rect: &RECT) {
         DrawTextW(hdc, &mut status_text.encode_utf16().collect::<Vec<_>>(), &mut status_rect, DT_CENTER | DT_SINGLELINE);
     }
 
+    deselect_font(hdc);
     let _ = DeleteObject(title_font);
     let _ = DeleteObject(label_font);
     let _ = DeleteObject(icon_font);
@@ -2259,7 +2690,7 @@ unsafe fn paint_step_connect(hdc: HDC, rect: &RECT) {
 
     // Status
     SelectObject(hdc, status_font);
-    if let Some(chat_id) = WIZARD_CHAT_ID {
+    if let Some(chat) = wizard_chat() {
         // Connected!
         SetTextColor(hdc, COLORREF(0x004CAF50));
         let detected = format!("✓ {}", i18n::t("wizard.connect.detected"));
@@ -2267,10 +2698,22 @@ unsafe fn paint_step_connect(hdc: HDC, rect: &RECT) {
         DrawTextW(hdc, &mut detected.encode_utf16().collect::<Vec<_>>(), &mut status_rect, DT_CENTER | DT_SINGLELINE);
         y += scale(30);
 
+        // Whose chat it is, so the parent can tell it's their own before
+        // it becomes the admin chat.
+        SelectObject(hdc, step_font);
+        SetTextColor(hdc, COLORREF(0x00333333));
+        let chat_text = format!("{} {}  ({} {})", i18n::t("wizard.connect.chat"), chat.name, i18n::t("wizard.connect.id"), chat.id);
+        let mut chat_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(22) };
+        DrawTextW(hdc, &mut chat_text.encode_utf16().collect::<Vec<_>>(), &mut chat_rect, DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        y += scale(26);
+
+        let hint_font = CreateFontW(scale(13), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"));
+        SelectObject(hdc, hint_font);
         SetTextColor(hdc, COLORREF(0x00666666));
-        let chatid_text = format!("{} {}", i18n::t("wizard.connect.chatid"), chat_id);
-        let mut chatid_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(22) };
-        DrawTextW(hdc, &mut chatid_text.encode_utf16().collect::<Vec<_>>(), &mut chatid_rect, DT_CENTER | DT_SINGLELINE);
+        let mut hint_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(20) };
+        DrawTextW(hdc, &mut i18n::t("wizard.connect.not_you").encode_utf16().collect::<Vec<_>>(), &mut hint_rect, DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        SelectObject(hdc, status_font);
+        let _ = DeleteObject(hint_font);
     } else {
         // Waiting...
         SetTextColor(hdc, COLORREF(0x00FF9800));
@@ -2285,6 +2728,7 @@ unsafe fn paint_step_connect(hdc: HDC, rect: &RECT) {
         DrawTextW(hdc, &mut waiting_text.encode_utf16().collect::<Vec<_>>(), &mut status_rect, DT_CENTER | DT_SINGLELINE);
     }
 
+    deselect_font(hdc);
     let _ = DeleteObject(title_font);
     let _ = DeleteObject(step_font);
     let _ = DeleteObject(icon_font);
@@ -2351,6 +2795,7 @@ unsafe fn paint_step_success(hdc: HDC, rect: &RECT) {
     }
     let _ = DeleteObject(cmd_bg);
 
+    deselect_font(hdc);
     let _ = DeleteObject(title_font);
     let _ = DeleteObject(desc_font);
     let _ = DeleteObject(cmd_font);
@@ -2393,10 +2838,9 @@ unsafe fn update_wizard_buttons(hwnd: HWND) {
 
         // Disable next on step 3 if token invalid, step 4 if not connected
         let wizard_token_ref = std::ptr::addr_of!(WIZARD_TOKEN);
-        let wizard_chat_id_ref = std::ptr::addr_of!(WIZARD_CHAT_ID);
         let can_proceed = match WIZARD_STEP {
             3 => (*wizard_token_ref).as_ref().map(|t| is_valid_token_format(t)).unwrap_or(false),
-            4 => (*wizard_chat_id_ref).is_some(),
+            4 => wizard_chat().is_some(),
             _ => true,
         };
         let _ = EnableWindow(next_btn, can_proceed);
@@ -2442,7 +2886,13 @@ unsafe fn handle_wizard_command(hwnd: HWND, id: i32) {
             if WIZARD_STEP < WIZARD_TOTAL_STEPS {
                 WIZARD_STEP += 1;
 
-                // Start polling on step 4
+                // Start polling on step 4, detecting afresh each time the
+                // step is entered (so after "Back" a wrong chat can be
+                // replaced by sending a new message from the right one).
+                if WIZARD_STEP == 4 {
+                    set_wizard_chat(None);
+                    WIZARD_POLL_GENERATION.fetch_add(1, AtomicOrdering::SeqCst);
+                }
                 if WIZARD_STEP == 4 && !WIZARD_POLLING {
                     WIZARD_POLLING = true;
                     SetTimer(hwnd, TIMER_POLL_TELEGRAM, 2000, None);
@@ -2486,20 +2936,23 @@ unsafe fn handle_wizard_command(hwnd: HWND, id: i32) {
 
 /// Poll Telegram for incoming messages to detect chat ID
 unsafe fn poll_telegram_for_chatid(hwnd: HWND) {
-    let wizard_chat_id_ref = std::ptr::addr_of!(WIZARD_CHAT_ID);
-    if !WIZARD_POLLING || (*wizard_chat_id_ref).is_some() {
+    if !WIZARD_POLLING || wizard_chat().is_some() {
         return;
     }
 
     if let Some(ref token) = WIZARD_TOKEN {
         // Spawn a thread to do the API call
         let token = token.clone();
+        let generation = WIZARD_POLL_GENERATION.load(AtomicOrdering::SeqCst);
         std::thread::spawn(move || {
-            if let Some(chat_id) = fetch_telegram_updates(&token) {
-                // Post message back to UI thread
-                WIZARD_CHAT_ID = Some(chat_id);
-                if let Some(wizard_hwnd) = WIZARD_HWND {
-                    let _ = InvalidateRect(wizard_hwnd, None, true);
+            if let Some(chat) = fetch_telegram_updates(&token) {
+                // Only if detection hasn't been restarted meanwhile.
+                if WIZARD_POLL_GENERATION.load(AtomicOrdering::SeqCst) == generation {
+                    set_wizard_chat(Some(chat));
+                    let wizard_hwnd = WIZARD_HWND.load(AtomicOrdering::SeqCst);
+                    if !wizard_hwnd.is_null() {
+                        let _ = InvalidateRect(HWND(wizard_hwnd), None, true);
+                    }
                 }
             }
         });
@@ -2509,40 +2962,47 @@ unsafe fn poll_telegram_for_chatid(hwnd: HWND) {
     let _ = InvalidateRect(hwnd, None, true);
 }
 
-/// Fetch latest updates from Telegram to get chat ID
-fn fetch_telegram_updates(token: &str) -> Option<i64> {
-    let url = format!("https://api.telegram.org/bot{}/getUpdates?limit=1&timeout=1", token);
+/// Ask Telegram for the most recent message sent to the bot and return
+/// that message's chat, with a display name.
+fn fetch_telegram_updates(token: &str) -> Option<DetectedChat> {
+    // offset=-1 returns only the newest pending update (and drops older
+    // ones). It used to take the oldest pending update, which could be
+    // anyone's chat that had messaged the bot earlier.
+    let url = format!("https://api.telegram.org/bot{}/getUpdates?offset=-1&limit=1&timeout=0", token);
 
-    // Use ureq for simple HTTP request (we already have it as a dependency through teloxide)
-    let response = match ureq::get(&url).timeout(std::time::Duration::from_secs(3)).call() {
-        Ok(r) => r,
-        Err(_) => return None,
+    let response = ureq::get(&url).timeout(std::time::Duration::from_secs(3)).call().ok()?;
+    let body = response.into_string().ok()?;
+    parse_latest_chat(&body)
+}
+
+/// The chat of the newest update in a `getUpdates` response, if any.
+fn parse_latest_chat(body: &str) -> Option<DetectedChat> {
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    let update = json.get("result")?.as_array()?.last()?;
+    let chat = ["message", "edited_message", "channel_post", "edited_channel_post", "my_chat_member"]
+        .iter()
+        .find_map(|kind| update.get(kind)?.get("chat"))?;
+    let id = chat.get("id")?.as_i64()?;
+
+    let text = |key: &str| chat.get(key).and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let mut name = match text("title") {
+        Some(title) => title.to_string(),
+        None => [text("first_name"), text("last_name")].into_iter().flatten().collect::<Vec<_>>().join(" "),
     };
-
-    let body = match response.into_string() {
-        Ok(b) => b,
-        Err(_) => return None,
-    };
-
-    // Parse JSON manually (avoid adding serde dependency just for this)
-    // Look for "chat":{"id": pattern
-    if let Some(chat_pos) = body.find("\"chat\":{\"id\":") {
-        let start = chat_pos + 13;
-        if let Some(end_pos) = body[start..].find(|c: char| !c.is_numeric() && c != '-') {
-            if let Ok(id) = body[start..start + end_pos].parse::<i64>() {
-                return Some(id);
-            }
-        }
+    if let Some(username) = text("username") {
+        name = if name.is_empty() { format!("@{username}") } else { format!("{name} (@{username})") };
     }
-
-    None
+    if name.is_empty() {
+        name = "?".to_string();
+    }
+    Some(DetectedChat { id, name })
 }
 
 /// Save wizard configuration to database
 unsafe fn save_wizard_config() {
     let wizard_token_ref = std::ptr::addr_of!(WIZARD_TOKEN);
-    let wizard_chat_id_ref = std::ptr::addr_of!(WIZARD_CHAT_ID);
-    if let (Some(ref token), Some(chat_id)) = (&*wizard_token_ref, *wizard_chat_id_ref) {
+    let chat_id = wizard_chat().map(|c| c.id);
+    if let (Some(ref token), Some(chat_id)) = (&*wizard_token_ref, chat_id) {
         // Save to database using the existing function signature
         crate::database::set_telegram_config(token, &chat_id.to_string(), true);
 
@@ -2599,16 +3059,7 @@ pub unsafe fn show_discord_wizard(parent_hwnd: HWND) {
     let wizard_class = w!("ScreenTimeDiscordWizard");
 
     // Register wizard window class
-    let wc = WNDCLASSW {
-        style: CS_HREDRAW | CS_VREDRAW,
-        lpfnWndProc: Some(dc_wizard_proc),
-        hInstance: hinstance.into(),
-        lpszClassName: wizard_class,
-        hbrBackground: CreateSolidBrush(COLORREF(0x00FFFFFF)),
-        hCursor: LoadCursorW(None, IDC_ARROW).ok().unwrap_or_default(),
-        ..zeroed()
-    };
-    RegisterClassW(&wc);
+    register_dialog_class(wizard_class, Some(dc_wizard_proc), 0x00FFFFFF);
 
     let screen_width = GetSystemMetrics(SM_CXSCREEN);
     let screen_height = GetSystemMetrics(SM_CYSCREEN);
@@ -2634,12 +3085,7 @@ pub unsafe fn show_discord_wizard(parent_hwnd: HWND) {
     if let Ok(hwnd) = wizard_hwnd {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
-
-        let mut msg: MSG = zeroed();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        run_modal_loop(hwnd);
     }
 }
 
@@ -2664,9 +3110,14 @@ unsafe extern "system" fn dc_wizard_proc(
             handle_dc_wizard_command(hwnd, id);
             LRESULT(0)
         }
-        WM_CLOSE | WM_DESTROY => {
-            PostQuitMessage(0);
+        WM_CLOSE => {
+            // Close only this wizard (see run_modal_loop).
+            DestroyWindow(hwnd).ok();
             LRESULT(0)
+        }
+        WM_NCDESTROY => {
+            release_gdi(hwnd);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
@@ -2686,12 +3137,12 @@ unsafe fn create_dc_wizard_buttons(hwnd: HWND) {
     let btn_y = height - scale(60);
     let margin = scale(20);
 
-    let btn_font = CreateFontW(
+    let btn_font = track_gdi(hwnd, CreateFontW(
         scale(15), 0, 0, 0,
         FW_NORMAL.0 as i32,
         0, 0, 0, 0, 0, 0, 5, 0,
         w!("Segoe UI"),
-    );
+    ));
 
     // Cancel button (left)
     let cancel_text = i18n::wide("wizard.cancel");
@@ -2854,6 +3305,7 @@ unsafe fn paint_dc_step_welcome(hdc: HDC, rect: &RECT) {
     let mut ready_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(25) };
     DrawTextW(hdc, &mut i18n::t("wizard.dc.welcome.ready").encode_utf16().collect::<Vec<_>>(), &mut ready_rect, DT_CENTER | DT_SINGLELINE);
 
+    deselect_font(hdc);
     let _ = DeleteObject(title_font);
     let _ = DeleteObject(desc_font);
     let _ = DeleteObject(icon_font);
@@ -2914,6 +3366,7 @@ unsafe fn paint_dc_step_create_bot(hdc: HDC, rect: &RECT) {
     let mut hint_text_rect = RECT { left: rect.left + scale(10), top: y + scale(8), right: rect.right - scale(10), bottom: y + scale(30) };
     DrawTextW(hdc, &mut i18n::t("wizard.dc.bot.hint").encode_utf16().collect::<Vec<_>>(), &mut hint_text_rect, DT_CENTER | DT_WORDBREAK);
 
+    deselect_font(hdc);
     let _ = DeleteObject(title_font);
     let _ = DeleteObject(step_font);
     let _ = DeleteObject(icon_font);
@@ -2971,7 +3424,7 @@ unsafe fn paint_dc_step_token(hdc: HDC, hwnd: HWND, rect: &RECT) {
             None,
         );
 
-        let edit_font = CreateFontW(scale(13), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Consolas"));
+        let edit_font = track_gdi(hwnd, CreateFontW(scale(13), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Consolas")));
         let new_edit = GetDlgItem(hwnd, ID_DC_WIZARD_TOKEN_EDIT).unwrap_or_default();
         if !new_edit.0.is_null() {
             SendMessageW(new_edit, WM_SETFONT, WPARAM(edit_font.0 as usize), LPARAM(1));
@@ -3001,6 +3454,7 @@ unsafe fn paint_dc_step_token(hdc: HDC, hwnd: HWND, rect: &RECT) {
         DrawTextW(hdc, &mut status_text.encode_utf16().collect::<Vec<_>>(), &mut status_rect, DT_CENTER | DT_SINGLELINE);
     }
 
+    deselect_font(hdc);
     let _ = DeleteObject(title_font);
     let _ = DeleteObject(label_font);
     let _ = DeleteObject(icon_font);
@@ -3061,7 +3515,7 @@ unsafe fn paint_dc_step_ids(hdc: HDC, hwnd: HWND, rect: &RECT) {
             rect.left + scale(120), y, edit_width, scale(28),
             hwnd, HMENU(ID_DC_WIZARD_CHANNEL_EDIT as _), hinstance, None,
         );
-        let edit_font = CreateFontW(scale(14), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Consolas"));
+        let edit_font = track_gdi(hwnd, CreateFontW(scale(14), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Consolas")));
         let new_edit = GetDlgItem(hwnd, ID_DC_WIZARD_CHANNEL_EDIT).unwrap_or_default();
         if !new_edit.0.is_null() {
             SendMessageW(new_edit, WM_SETFONT, WPARAM(edit_font.0 as usize), LPARAM(1));
@@ -3091,7 +3545,7 @@ unsafe fn paint_dc_step_ids(hdc: HDC, hwnd: HWND, rect: &RECT) {
             rect.left + scale(120), y, edit_width, scale(28),
             hwnd, HMENU(ID_DC_WIZARD_USER_EDIT as _), hinstance, None,
         );
-        let edit_font = CreateFontW(scale(14), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Consolas"));
+        let edit_font = track_gdi(hwnd, CreateFontW(scale(14), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Consolas")));
         let new_edit = GetDlgItem(hwnd, ID_DC_WIZARD_USER_EDIT).unwrap_or_default();
         if !new_edit.0.is_null() {
             SendMessageW(new_edit, WM_SETFONT, WPARAM(edit_font.0 as usize), LPARAM(1));
@@ -3104,6 +3558,7 @@ unsafe fn paint_dc_step_ids(hdc: HDC, hwnd: HWND, rect: &RECT) {
         }
     }
 
+    deselect_font(hdc);
     let _ = DeleteObject(title_font);
     let _ = DeleteObject(step_font);
     let _ = DeleteObject(icon_font);
@@ -3170,6 +3625,7 @@ unsafe fn paint_dc_step_success(hdc: HDC, rect: &RECT) {
     }
     let _ = DeleteObject(cmd_bg);
 
+    deselect_font(hdc);
     let _ = DeleteObject(title_font);
     let _ = DeleteObject(desc_font);
     let _ = DeleteObject(cmd_font);
@@ -3365,4 +3821,51 @@ fn send_discord_test_message(token: &str, channel_id: u64) {
         let message = format!("✅ {} - Screen Time Manager", crate::i18n::t("wizard.dc.success.title"));
         let _ = serenity::model::id::ChannelId::new(channel_id).say(&http, message).await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn newest_update_names_the_chat() {
+        let body = r#"{"ok":true,"result":[{"update_id":5,"message":{"message_id":9,
+            "from":{"id":42,"is_bot":false,"first_name":"Dan"},
+            "chat":{"id":42,"first_name":"Dan","last_name":"H","username":"dan_h","type":"private"},
+            "date":1,"text":"/start"}}]}"#;
+        assert_eq!(parse_latest_chat(body), Some(DetectedChat { id: 42, name: "Dan H (@dan_h)".into() }));
+    }
+
+    #[test]
+    fn group_chats_use_their_title_and_the_last_update_wins() {
+        let body = r#"{"ok":true,"result":[
+            {"update_id":1,"message":{"chat":{"id":1,"first_name":"Old","type":"private"}}},
+            {"update_id":2,"my_chat_member":{"chat":{"id":-100123,"title":"Family","type":"group"}}}]}"#;
+        assert_eq!(parse_latest_chat(body), Some(DetectedChat { id: -100123, name: "Family".into() }));
+    }
+
+    #[test]
+    fn no_usable_update_means_no_chat() {
+        assert_eq!(parse_latest_chat(r#"{"ok":true,"result":[]}"#), None);
+        assert_eq!(parse_latest_chat(r#"{"ok":false,"error_code":401}"#), None);
+        assert_eq!(parse_latest_chat("not json"), None);
+        let nameless = r#"{"ok":true,"result":[{"update_id":1,"message":{"chat":{"id":7,"type":"private"}}}]}"#;
+        assert_eq!(parse_latest_chat(nameless), Some(DetectedChat { id: 7, name: "?".into() }));
+    }
+
+    #[test]
+    fn settings_window_fits_when_it_can_and_scrolls_when_it_cannot() {
+        // 1080p at 100%: work area 1032 (48 px taskbar); content 992 client
+        // px (largest case, with the default-passcode warning); ~32 px frame.
+        let fits = settings_window_layout(392, 992, 8, 32, 1032, 17);
+        assert_eq!(fits, SettingsWindowLayout { width: 400, height: 1024, scroll: false });
+
+        // 1366x768 at 100%: work area 728.
+        let small = settings_window_layout(392, 992, 8, 32, 728, 17);
+        assert_eq!(small, SettingsWindowLayout { width: 417, height: 728, scroll: true });
+
+        // 1080p at 125%: everything scaled by 1.25, work area 1020.
+        let scaled = settings_window_layout(490, 1240, 10, 39, 1020, 21);
+        assert_eq!(scaled, SettingsWindowLayout { width: 521, height: 1020, scroll: true });
+    }
 }
