@@ -66,7 +66,7 @@ That's it. Setup does everything the app needs, for every Windows account on the
 
    ![Settings dialog](images/settings.png)
 
-6. **Change the passcode** - Use the "Change Passcode" section to set something your child won't guess! This passcode is shared machine-wide - if you have multiple kids on separate Windows accounts on the same PC, changing it from any one of their Settings dialogs changes it for all of them.
+6. **Change the passcode right away** - Use the "Change Passcode" section to set something your child won't guess! Until you do, anyone who has read this page knows it's `0000`, and Settings shows a red reminder. This passcode is shared machine-wide - if you have multiple kids on separate Windows accounts on the same PC, changing it from any one of their Settings dialogs changes it for all of them.
 
 ---
 
@@ -90,6 +90,8 @@ Your child can pause the timer for meals, homework, or breaks without needing yo
 - 45 minutes total pause time per day
 - Each pause auto-resumes after 20 minutes
 - Must wait 15 minutes between pauses
+
+You can change all three in Settings, under "Pause Timer". Set the daily pause to 0 to turn pausing off.
 
 You can view pause usage in "Today's Stats..." from the tray menu.
 
@@ -168,6 +170,8 @@ You can also monitor and control screen time from a Discord channel, using a Dis
 
 Once configured, only you can control the bot in that channel - it ignores commands from anyone else.
 
+**Use a channel only parents can see.** Anyone who can read the channel sees everything the bot posts there: alerts, your commands and its replies, including today's rotating PIN if you use `!getpin`. Don't use a channel your child (or their friends) can open.
+
 **Note:** the bot token/channel/user ID - like the passcode and rotating PIN - are stored machine-wide (shared across every Windows account on the PC, unlike time limits, which are per-account) - set it up once and it works no matter which child's account is running the app. Setup gives every account access to the shared settings folder; a copy of the app that wasn't installed with setup silently falls back to per-account storage instead. Since the config is shared, `!status`/`!history` (and their Telegram equivalents) show which Windows account is currently logged in, so you can tell whose stats you're looking at. If more than one of your kids' accounts is signed in at once (e.g. via Fast User Switching), only the one currently in the foreground answers bot commands, so you're never talking to two accounts' bots at the same time.
 
 ---
@@ -191,6 +195,30 @@ If you're worried about the passcode being watched and memorized, enable the rot
 ## Automatic Restart & Tamper Alerts
 
 If Screen Time Manager is stopped in any way other than the passcode-protected Quit option (e.g. ended via Task Manager), it's automatically relaunched within about a minute, and you'll get a Telegram/Discord alert if either is enabled. Setup turns this on for **every** Windows account on the PC, including accounts signed in at the same time via Fast User Switching. Installing an update doesn't count as tampering: the app restarts afterwards without an alert.
+
+The watchdog also notices when the app is still there but has stopped working - for example frozen, or suspended with a process tool - after a few minutes. It restarts the app and tells you once. Sleep, hibernation, restarts and switching users don't trigger this.
+
+Other alerts you may get:
+
+- **Wrong passcodes** - after five wrong codes in a row, each further wrong code makes the passcode prompt wait before it accepts another try (up to 15 minutes), and you get one alert, since someone may be guessing.
+- **Damaged settings** - if an account's settings file can't be opened, the app doesn't stop: a damaged file is set aside and replaced with default settings (re-check the limits for that account), and if the file can't be opened at all the app runs on default settings until it can. Either way you're told.
+
+If the PC is offline when an alert is raised, it's kept and sent once the connection is back (anything more than a day old is dropped).
+
+---
+
+## What It Protects Against (and What It Doesn't)
+
+Screen Time Manager is built to enforce limits for a child who uses the computer normally, and to make the obvious ways around it - ending it in Task Manager, signing out, restarting, guessing the passcode - either fail or get reported to you.
+
+It is not a lock that a determined child can't pick. It runs as your child's own Windows account, so its files are in places that account can open. A child who goes looking through the file system can read the passcode and the Telegram/Discord settings, and can change or delete the app's files. The tamper alerts are the backstop: most ways of interfering with the app end up as an alert on your phone. A hardened design that keeps the passcode and bot settings out of the child's reach is planned.
+
+A few more things worth knowing:
+
+- The lock screen covers every monitor with a window that keeps itself on top. It does not block the keyboard or mouse, so Windows shortcuts still reach Windows.
+- Your child needs a **standard** Windows account. On an Administrator account they can simply uninstall the app.
+- Change the passcode from `0000` as soon as you've installed it.
+- If you use Discord, keep the bot's channel visible only to parents (see above).
 
 ---
 
@@ -228,9 +256,9 @@ When you download or run the setup, your browser may say the file "isn't commonl
 
 To get past them: in the browser, choose **Keep** (in Edge, under **...** next to the download); on the SmartScreen screen, click **More info** and then **Run anyway**; at the Administrator prompt, click **Yes**.
 
-Here's why it happens: this app does things that look identical to malware when a scanner only looks at *behavior* and not *intent*. It locks the screen, blocks keyboard and mouse input, can shut the computer down, keeps itself running, and accepts remote commands over Telegram and Discord. That's exactly what a parental-control tool needs to do, and also exactly what a scanner's generic "this looks like a trojan" heuristic is tuned to catch. The setup and the app are also unsigned (a code-signing certificate costs money), which removes the one signal that would tell the scanner who built them; SmartScreen also warns about any new download that few people have run yet.
+Here's why it happens: this app does things that look identical to malware when a scanner only looks at *behavior* and not *intent*. It covers the screen with a window that stays on top, can shut the computer down, keeps itself running, and accepts remote commands over Telegram and Discord. That's exactly what a parental-control tool needs to do, and also exactly what a scanner's generic "this looks like a trojan" heuristic is tuned to catch. The setup and the app are also unsigned (a code-signing certificate costs money), which removes the one signal that would tell the scanner who built them; SmartScreen also warns about any new download that few people have run yet.
 
-It contains no malware. Nothing is hidden, and it only talks to the internet for the Telegram/Discord bots *you* configure with *your own* tokens, and to this project's GitHub page to check for new versions.
+It contains no malware. Nothing is hidden, and it only talks to the internet to reach Telegram's servers if you enable the Telegram bot, Discord's servers if you enable the Discord bot (both with *your own* tokens), and this project's GitHub page to check for new versions.
 
 **If you don't want to take that on trust, don't. Build it yourself from source — then the exe you run is the code you can read.**
 
