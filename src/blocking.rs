@@ -252,7 +252,57 @@ pub unsafe fn show_blocking_overlay_with_time(text: &str, remaining_seconds: i32
     if hwnd.0.is_null() {
         return;
     }
+    set_overlay_shown(text, remaining_seconds);
+    present_overlay(hwnd);
+}
 
+/// Shows the overlay because the time has run out - unless time arrived in
+/// the meantime. A bot's extension landing between the caller's "no time
+/// left" check and the show used to leave the overlay up with time remaining:
+/// the bot's hide ran before the overlay counted as shown, so it hid nothing.
+/// Returns whether the overlay is up. Same threading as
+/// `show_blocking_overlay_with_time`.
+pub unsafe fn show_out_of_time_overlay(text: &str) -> bool {
+    let hwnd = HWND(BLOCKING_HWND.load(Ordering::SeqCst));
+    if hwnd.0.is_null() {
+        return false;
+    }
+    let shown = show_unless_time_arrived(
+        || set_overlay_shown(text, -1),
+        // A read-modify-write rather than a load: it reads the latest value,
+        // and an extension after it (`extend_time` is one too) synchronizes
+        // with it - so either this sees the extension, or the extension's
+        // hide sees the overlay as shown and hides it.
+        || REMAINING_SECONDS.fetch_add(0, Ordering::SeqCst),
+        set_overlay_hidden,
+    );
+    if shown {
+        present_overlay(hwnd);
+    }
+    shown
+}
+
+/// Mark the overlay shown (`show_state`), then look at the remaining time
+/// again: still none, it stays shown (true); any other value - an extension,
+/// or "no limit" - and it's unmarked (`undo`) before any window shows, so
+/// nothing flickers, and false. Nothing is retried: the next tick's
+/// `zero_time_lock_due` check sees the time and doesn't try again.
+pub(crate) fn show_unless_time_arrived(
+    show_state: impl FnOnce(),
+    remaining_now: impl FnOnce() -> i32,
+    undo: impl FnOnce(),
+) -> bool {
+    show_state();
+    if remaining_now() == 0 {
+        true
+    } else {
+        undo();
+        false
+    }
+}
+
+/// The state side of showing the overlay (any thread).
+fn set_overlay_shown(text: &str, remaining_seconds: i32) {
     *BLOCKING_TEXT.lock().unwrap() = Some(text.to_string());
     PasscodeNotice::None.set();
     if remaining_seconds >= 0 {
@@ -266,7 +316,16 @@ pub unsafe fn show_blocking_overlay_with_time(text: &str, remaining_seconds: i32
         countdown_end_action(crate::session::other_users_logged_on()) == CountdownEnd::SignOut,
         Ordering::SeqCst,
     );
+}
 
+/// Undo `set_overlay_shown` before the window was shown.
+fn set_overlay_hidden() {
+    *BLOCKING_TEXT.lock().unwrap() = None;
+    SHUTDOWN_COUNTDOWN_SECONDS.store(-1, Ordering::SeqCst);
+}
+
+/// Show the window now (UI thread) or have the UI thread do it.
+unsafe fn present_overlay(hwnd: HWND) {
     if !on_ui_thread(hwnd) {
         let _ = PostMessageW(hwnd, WM_APP_SHOW_OVERLAY, WPARAM(0), LPARAM(0));
         return;
@@ -1587,6 +1646,41 @@ mod tests {
         assert_eq!(extended(0, 900), 900);
         assert_eq!(extended(-1, 900), 900, "no limit running: start fresh");
         assert_eq!(extended(i32::MAX - 1, 900), i32::MAX);
+    }
+
+    #[test]
+    fn out_of_time_overlay_stays_up_when_no_time_arrived() {
+        use std::cell::Cell;
+        let shown = Cell::new(false);
+        let up = show_unless_time_arrived(|| shown.set(true), || 0, || shown.set(false));
+        assert!(up);
+        assert!(shown.get());
+    }
+
+    #[test]
+    fn extension_in_the_instant_time_runs_out_takes_the_overlay_down() {
+        use std::cell::Cell;
+        // The bot extends (and its hide finds nothing shown yet) right as
+        // the overlay is marked shown.
+        let shown = Cell::new(false);
+        let remaining = Cell::new(0);
+        let undos = Cell::new(0);
+        let up = show_unless_time_arrived(
+            || {
+                remaining.set(extended(0, 15 * 60));
+                shown.set(true);
+            },
+            || remaining.get(),
+            || {
+                shown.set(false);
+                undos.set(undos.get() + 1);
+            },
+        );
+        assert!(!up);
+        assert!(!shown.get(), "no lock overlay with time remaining");
+        assert_eq!(undos.get(), 1, "undone once, never retried");
+        // "No limit" isn't "no time left" either
+        assert!(!show_unless_time_arrived(|| {}, || -1, || {}));
     }
 
     #[test]

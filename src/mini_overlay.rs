@@ -763,7 +763,12 @@ unsafe fn enforce_zero_time() {
     resume_timer(); // no-op unless paused
     database::save_remaining_time(remaining);
     let msg = database::get_blocking_message();
-    crate::blocking::show_blocking_overlay(&msg);
+    if !crate::blocking::show_out_of_time_overlay(&msg) {
+        // A bot extended the time in the meantime: no lock. Save the new
+        // time, in case the 0 above landed after the bot's own save.
+        database::save_remaining_time(REMAINING_SECONDS.load(Ordering::SeqCst));
+        return;
+    }
     crate::time_request::notify_out_of_time();
 }
 
@@ -970,6 +975,13 @@ mod tests {
         assert!(!zero_time_lock_due(0, true));
         assert!(!zero_time_lock_due(1, false));
         assert!(!zero_time_lock_due(-1, false), "negative means no limit");
+    }
+
+    #[test]
+    fn extended_time_is_not_locked_on_the_next_tick() {
+        // After an out-of-time show was undone because an extension arrived
+        // (blocking::show_unless_time_arrived), the next tick doesn't retry.
+        assert!(!zero_time_lock_due(15 * 60, false));
     }
 
     #[test]
