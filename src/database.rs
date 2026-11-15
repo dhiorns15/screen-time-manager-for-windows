@@ -88,7 +88,11 @@ pub fn init_database() -> Result<(), Box<dyn std::error::Error>> {
         // Lock screen timeout (seconds before shutdown, default 10 minutes)
         ("lock_screen_timeout", "600"),
         // Idle detection settings
-        ("idle_enabled", "1"),              // 1 = enabled, 0 = disabled
+        // Off unless a parent turns it on: "no keyboard/mouse input" also
+        // describes controller gaming and watching videos, which would
+        // otherwise stop the clock. Only written when the key is missing, so
+        // an install that already has a stored value keeps it.
+        ("idle_enabled", "0"),              // 1 = enabled, 0 = disabled
         ("idle_timeout_minutes", "5"),      // Minutes of inactivity before auto-pause
     ];
 
@@ -995,7 +999,7 @@ pub fn get_pause_log_today() -> Vec<String> {
 pub fn is_idle_enabled() -> bool {
     get_setting("idle_enabled")
         .map(|s| s == "1")
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 /// Get idle timeout in minutes (minimum 1)
