@@ -1262,6 +1262,50 @@ pub fn init_database_with_recovery() -> DatabaseStartup {
     start_temporary_database(last_error.to_string())
 }
 
+/// Remaining time for a day whose limit is `limit_secs` and of which
+/// `active_secs` have already been used. Extensions granted earlier that day
+/// aren't known, so this can come out lower than it really was - never
+/// higher.
+fn remaining_after_use(limit_secs: i32, active_secs: i32) -> i32 {
+    limit_secs.saturating_sub(active_secs.max(0)).max(0)
+}
+
+/// After `init_database_with_recovery` had to recreate the per-account
+/// database or replace it with a temporary one, start today from this
+/// account's usage as mirrored in the shared database (see
+/// `mirror_shared_daily_stat`, refreshed every 30 seconds) instead of from
+/// nothing: today's used time and pause time are carried over, and the
+/// remaining time is today's limit minus the time used. So damaging the
+/// settings file can't be used to get a fresh day's allowance (or pause
+/// budget), and the mirror isn't overwritten with smaller numbers. Returns
+/// the remaining time it set, or `None` if there was nothing to carry over
+/// (or today already has a remaining time).
+pub fn restore_today_from_shared_mirror() -> Option<i32> {
+    if load_remaining_time().is_some() {
+        return None;
+    }
+    let date = effective_today_date();
+    let username = crate::remote_commands::current_windows_username();
+    let mirrored = |kind: &str| {
+        get_shared_setting(&shared_user_stat_key(kind, &username, &date))
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(0)
+            .max(0)
+    };
+    let active = mirrored("active");
+    let paused = mirrored("pause");
+    if active == 0 && paused == 0 {
+        return None;
+    }
+
+    save_session_active_time(active);
+    save_pause_used_today(paused);
+    let limit_secs = (get_daily_limit(get_current_weekday()) * 60) as i32;
+    let remaining = remaining_after_use(limit_secs, active);
+    save_remaining_time(remaining);
+    Some(remaining)
+}
+
 fn start_temporary_database(error: String) -> DatabaseStartup {
     let installed = Connection::open_in_memory()
         .map_err(|e| e.into())
@@ -1538,6 +1582,15 @@ mod tests {
         assert_eq!(clamp_lock_screen_timeout(600), 600);
         assert_eq!(clamp_lock_screen_timeout(-1), 60);
         assert_eq!(clamp_lock_screen_timeout(-600), 60);
+    }
+
+    #[test]
+    fn recovered_day_starts_from_the_time_already_used() {
+        assert_eq!(remaining_after_use(7200, 3000), 4200);
+        assert_eq!(remaining_after_use(7200, 9000), 0, "used more than the limit (extensions)");
+        assert_eq!(remaining_after_use(7200, 0), 7200);
+        assert_eq!(remaining_after_use(0, 100), 0);
+        assert_eq!(remaining_after_use(7200, -5), 7200);
     }
 
     #[test]

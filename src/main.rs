@@ -135,6 +135,15 @@ fn main() {
         database::init_shared_database();
 
         report_database_recovery(&db_startup);
+        if matches!(
+            db_startup,
+            database::DatabaseStartup::Recreated { .. } | database::DatabaseStartup::Temporary { .. }
+        ) {
+            // Don't start today over on a fresh database (see there).
+            if let Some(remaining) = database::restore_today_from_shared_mirror() {
+                eprintln!("[Main] Carried today's usage over from the shared database: {remaining}s left");
+            }
+        }
 
         // Housekeeping: drop per-day usage/enforcement rows older than the
         // retention window now that both databases are open (prunes the
