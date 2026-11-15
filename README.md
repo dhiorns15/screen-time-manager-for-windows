@@ -1,10 +1,14 @@
 # Screen Time Manager
 
+[![CI](https://github.com/dhiorns15/screen-time-manager-for-windows/actions/workflows/ci.yml/badge.svg)](https://github.com/dhiorns15/screen-time-manager-for-windows/actions/workflows/ci.yml)
+
 A simple Windows app to manage your child's computer time. Set daily limits, and when time's up, the screen is blocked until you enter the passcode.
 
-No complicated setup. No special accounts needed. Just run it and configure your limits.
+No complicated setup. No special accounts needed. Just install it and configure your limits.
 
 Confirmed to be effectively blocking Fortnite, Roblox and Minecraft.
+
+Originally created by Simon Pamies ([spamsch/screen-time-manager-for-windows](https://github.com/spamsch/screen-time-manager-for-windows)); this project continues from his work.
 
 ---
 
@@ -22,9 +26,29 @@ Confirmed to be effectively blocking Fortnite, Roblox and Minecraft.
 
 ---
 
+## Installing
+
+You don't need to know anything about programming to install it.
+
+1. Go to the [latest release](https://github.com/dhiorns15/screen-time-manager-for-windows/releases/latest) and, under **Assets**, download `screen-time-manager-vX.Y.Z-windows-x64-setup.exe` (X.Y.Z is the version number).
+2. Run the downloaded file. Your browser or Windows may warn you about it first - see [Antivirus & Windows SmartScreen Warnings](#antivirus--windows-smartscreen-warnings) below.
+3. Click **Yes** when Windows asks whether to let it make changes. Setup needs Administrator rights, so if you run it from your child's (standard) account, Windows asks for an Administrator's password.
+4. Follow the steps in the setup window.
+
+That's it. Setup does everything the app needs, for every Windows account on the PC:
+
+- **Installs the app** to `C:\Program Files\ScreenTimeManager`, where only an Administrator can change or remove it.
+- **Starts it automatically** whenever anyone signs in to Windows - every account, not just the one you installed from. With several kids on separate accounts, one install covers all of them, even when they're signed in at the same time (Fast User Switching).
+- **Sets up the watchdog**, which relaunches the app if it's stopped and alerts you (see [Automatic Restart & Tamper Alerts](#automatic-restart--tamper-alerts)).
+- **Creates the shared settings folder** (`C:\ProgramData\ScreenTimeManager`) that every account can use, so the passcode and the Telegram/Discord settings are set up once for the whole PC.
+
+**Upgrading from an older version that you installed with `install.ps1`?** Just run the new setup. It takes over the scheduled tasks the old script made and keeps your settings; afterwards you can delete the folder you unzipped the old version into.
+
+---
+
 ## Getting Started
 
-1. **Run the app** - Double-click to start. A small timer appears in the top-right corner.
+1. **Find the timer** - While the app is running, a small timer shows in the top-right corner. If you don't see it right after installing, sign out of Windows and back in.
 
 2. **Find the tray icon** - Look for the clock icon in the system tray (bottom-right of your screen, near the clock).
 
@@ -97,6 +121,7 @@ You can monitor and control screen time from your phone using Telegram. This is 
 - `/setpin 1234` - Change the passcode remotely
 - `/setlimit 90` or `/setlimit saturday 180` - Change the daily time limit remotely (today, or a specific day)
 - `/rotatingpin on` and `/getpin` - Optional auto-rotating daily code (see below)
+- `/update` - Install a new version of the app, after the bot tells you one is out (see [Updating](#updating))
 
 **Setup (one-time):**
 
@@ -110,7 +135,7 @@ You can monitor and control screen time from your phone using Telegram. This is 
 
 Once configured, only you can control the bot - it ignores messages from anyone else.
 
-**Note:** the bot token/chat ID - like the passcode and rotating PIN - are stored machine-wide (shared across every Windows account on the PC, unlike time limits, which are per-account) - set it up once and it works no matter which child's account is running the app. If you have multiple children on separate standard (non-admin) Windows accounts, run `install.ps1` as Administrator at least once so those accounts get permission to read/write the shared config; otherwise it silently falls back to per-account storage.
+**Note:** the bot token/chat ID - like the passcode and rotating PIN - are stored machine-wide (shared across every Windows account on the PC, unlike time limits, which are per-account) - set it up once and it works no matter which child's account is running the app. Setup gives every account access to the shared settings folder; a copy of the app that wasn't installed with setup silently falls back to per-account storage instead.
 
 ---
 
@@ -130,6 +155,7 @@ You can also monitor and control screen time from a Discord channel, using a Dis
 - `!setpin 1234` - Change the passcode remotely
 - `!setlimit 90` or `!setlimit saturday 180` - Change the daily time limit remotely (today, or a specific day)
 - `!rotatingpin on` and `!getpin` - Optional auto-rotating daily code (see below)
+- `!update` - Install a new version of the app, after the bot tells you one is out (see [Updating](#updating))
 - `!help` - See all commands
 
 **Setup (one-time):**
@@ -142,7 +168,7 @@ You can also monitor and control screen time from a Discord channel, using a Dis
 
 Once configured, only you can control the bot in that channel - it ignores commands from anyone else.
 
-**Note:** the bot token/channel/user ID - like the passcode and rotating PIN - are stored machine-wide (shared across every Windows account on the PC, unlike time limits, which are per-account) - set it up once and it works no matter which child's account is running the app. If you have multiple children on separate standard (non-admin) Windows accounts, run `install.ps1` as Administrator at least once so those accounts get permission to read/write the shared config; otherwise it silently falls back to per-account storage. Since the config is shared, `!status`/`!history` (and their Telegram equivalents) show which Windows account is currently logged in, so you can tell whose stats you're looking at. If more than one of your kids' accounts is signed in at once (e.g. via Fast User Switching), only the one currently in the foreground answers bot commands, so you're never talking to two accounts' bots at the same time.
+**Note:** the bot token/channel/user ID - like the passcode and rotating PIN - are stored machine-wide (shared across every Windows account on the PC, unlike time limits, which are per-account) - set it up once and it works no matter which child's account is running the app. Setup gives every account access to the shared settings folder; a copy of the app that wasn't installed with setup silently falls back to per-account storage instead. Since the config is shared, `!status`/`!history` (and their Telegram equivalents) show which Windows account is currently logged in, so you can tell whose stats you're looking at. If more than one of your kids' accounts is signed in at once (e.g. via Fast User Switching), only the one currently in the foreground answers bot commands, so you're never talking to two accounts' bots at the same time.
 
 ---
 
@@ -164,9 +190,7 @@ If you're worried about the passcode being watched and memorized, enable the rot
 
 ## Automatic Restart & Tamper Alerts
 
-If Screen Time Manager is stopped in any way other than the passcode-protected Quit option (e.g. ended via Task Manager), it's automatically relaunched within about a minute, and you'll get a Telegram/Discord alert if either is enabled. This requires running `install.ps1` as Administrator at least once (it registers a Scheduled Task for this) - see "Making It Start Automatically" below.
-
-This also covers auto-starting at logon and the tamper-alert relaunch for **every** Windows account on the PC, not just whichever account you ran `install.ps1` from - so with multiple kids on separate accounts, one Administrator run of `install.ps1` sets all of them up, including if they're signed in at the same time via Fast User Switching.
+If Screen Time Manager is stopped in any way other than the passcode-protected Quit option (e.g. ended via Task Manager), it's automatically relaunched within about a minute, and you'll get a Telegram/Discord alert if either is enabled. Setup turns this on for **every** Windows account on the PC, including accounts signed in at the same time via Fast User Switching. Installing an update doesn't count as tampering: the app restarts afterwards without an alert.
 
 ---
 
@@ -179,33 +203,40 @@ This also covers auto-starting at logon and the tamper-alert relaunch for **ever
 
 ---
 
-## Making It Start Automatically
+## Updating
 
-**Recommended:** right-click `install.ps1` (next to `screen-time-manager.exe`) and choose **Run with PowerShell**, approving the Administrator prompt. Besides starting the app at logon, this also sets up the automatic relaunch/tamper-alert protection described above - and if you have multiple kids on separate Windows accounts, one run sets all of them up, not just the account you ran it from.
+**With Telegram or Discord set up:** when a new version comes out, the bot sends you a message. Reply `/update` (Telegram) or `!update` (Discord) to install it. The app downloads the new setup from this project's [Releases page](https://github.com/dhiorns15/screen-time-manager-for-windows/releases), checks that it's exactly the file published there, and installs it. The timer disappears briefly and comes back on its own a minute or so later, on every signed-in account. Your settings, limits and today's remaining time are kept.
 
-**Lighter alternative**, if you'd rather not run a script:
+**Without a bot:** download the new `...-windows-x64-setup.exe` from the [latest release](https://github.com/dhiorns15/screen-time-manager-for-windows/releases/latest) and run it, just like the first time. It installs over the old version and keeps your settings.
 
-1. Press `Win + R` on your keyboard
-2. Type `shell:startup` and press Enter
-3. Copy the Screen Time Manager app into this folder (or create a shortcut to it)
+---
 
-This starts the app at logon for the current Windows account only, and skips the watchdog protection - nothing relaunches it if the process is ended (e.g. via Task Manager), and it won't auto-start for any other Windows account on the PC.
+## Uninstalling
+
+Open **Settings > Apps > Installed apps** (on Windows 10, **Settings > Apps > Apps & features**), find **Screen Time Manager**, and choose **Uninstall**. Windows asks for Administrator approval, so a child on a standard account can't remove it.
+
+Uninstalling removes the app, its automatic start and the watchdog. Your settings and history are left behind in case you reinstall; delete these folders yourself for a clean slate:
+
+- `C:\ProgramData\ScreenTimeManager` - the shared settings: passcode, rotating PIN and Telegram/Discord setup
+- `C:\Users\<name>\AppData\Local\.screen-time-manager` in each child's account - that account's time limits, usage history and logs (paste `%LOCALAPPDATA%\.screen-time-manager` into File Explorer while signed in as them)
 
 ---
 
 ## Antivirus & Windows SmartScreen Warnings
 
-When you download or first run the app, Windows SmartScreen or your antivirus may warn that it's from an "unknown publisher" or flag it as suspicious. **This is a false positive.**
+When you download or run the setup, your browser may say the file "isn't commonly downloaded", Windows SmartScreen may show "Windows protected your PC", and the Administrator prompt shows "Unknown publisher". Your antivirus may also flag it as suspicious. **This is a false positive.**
 
-Here's why it happens: this app does things that look identical to malware when a scanner only looks at *behavior* and not *intent*. It locks the screen, blocks keyboard and mouse input, can shut the computer down, and accepts remote commands over Telegram. That's exactly what a parental-control tool needs to do, and also exactly what a scanner's generic "this looks like a trojan" heuristic is tuned to catch. The app is also unsigned (a code-signing certificate costs money), which removes the one signal that would tell the scanner who built it.
+To get past them: in the browser, choose **Keep** (in Edge, under **...** next to the download); on the SmartScreen screen, click **More info** and then **Run anyway**; at the Administrator prompt, click **Yes**.
 
-It contains no malware. Nothing is hidden, nothing phones home except the Telegram bot *you* configure with *your own* token.
+Here's why it happens: this app does things that look identical to malware when a scanner only looks at *behavior* and not *intent*. It locks the screen, blocks keyboard and mouse input, can shut the computer down, keeps itself running, and accepts remote commands over Telegram and Discord. That's exactly what a parental-control tool needs to do, and also exactly what a scanner's generic "this looks like a trojan" heuristic is tuned to catch. The setup and the app are also unsigned (a code-signing certificate costs money), which removes the one signal that would tell the scanner who built them; SmartScreen also warns about any new download that few people have run yet.
+
+It contains no malware. Nothing is hidden, and it only talks to the internet for the Telegram/Discord bots *you* configure with *your own* tokens, and to this project's GitHub page to check for new versions.
 
 **If you don't want to take that on trust, don't. Build it yourself from source — then the exe you run is the code you can read.**
 
 ### Build It Yourself
 
-1. Install [Rust](https://rustup.rs/) (the installer adds `cargo` to your PATH).
+1. Install [Rust](https://rustup.rs/) (the installer adds `cargo` to your PATH, and offers to install the Visual Studio C++ build tools Rust needs on Windows). The Rust version this project uses is pinned in `rust-toolchain.toml`; `cargo` downloads it the first time you build.
 2. Clone or download this repository.
 3. From the project folder, run:
 
@@ -213,13 +244,38 @@ It contains no malware. Nothing is hidden, nothing phones home except the Telegr
    cargo build --release
    ```
 
-4. The compiled app is at `target\release\screen-time-manager.exe`. Run it directly, or copy it next to the install scripts.
+4. The compiled app is at `target\release\screen-time-manager.exe`.
+5. To install it the same way as a release, build the setup as well: install [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`winget install JRSoftware.InnoSetup`), then run
 
-The release binary on GitHub is built this exact way, from this exact source, on a clean GitHub Actions runner. Building locally just lets you verify that for yourself.
+   ```
+   powershell -File installer\build.ps1
+   ```
+
+   and run the setup it writes to `target\installer\`. Running `screen-time-manager.exe` directly also works, but then nothing starts it at sign-in, there's no watchdog, and settings aren't shared between accounts.
+
+The setup on the Releases page is built this same way, from the tagged source, on a clean GitHub Actions runner by this repository's [release workflow](.github/workflows/release.yml), whose logs are public. Building locally just lets you verify that for yourself.
+
+Pull requests and every push are checked by the [CI workflow](.github/workflows/ci.yml): `cargo clippy --all-targets -- -D warnings`, `cargo test`, and a build of the setup that's installed, upgraded, updated and uninstalled on a Windows runner.
+
+### Releasing
+
+For maintainers:
+
+1. Bump `version` in `Cargo.toml` (versions are `X.Y.Z`), and run `cargo check` so `Cargo.lock` picks up the new version too - the release builds with `--locked` and fails if it's out of date.
+2. Commit both as `Release X.Y.Z`.
+3. Tag the commit `vX.Y.Z` and push the tag: `git tag vX.Y.Z` then `git push origin vX.Y.Z` (push the commit to `main` too).
+
+The [release workflow](.github/workflows/release.yml) refuses a tag that doesn't match the version in `Cargo.toml`. It tests and builds the release, publishes the setup with release notes listing every commit since the previous release (`ci/release-notes.sh`, so write commit subjects that make sense to people reading them there), and then checks that the previous release updates itself to the new one. Installed copies offer the new version to their admin from then on.
 
 ---
 
 ## Requirements
 
-- Windows 10 or Windows 11
+- Windows 10 or Windows 11 (64-bit)
 - That's it!
+
+---
+
+## License
+
+MIT - see [LICENSE](LICENSE). Originally written by Simon Pamies.

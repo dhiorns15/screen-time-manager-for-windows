@@ -1,0 +1,19 @@
+# Monthly pull requests for newer GitHub Actions and crates. The windows crates only work at the
+# same version as each other, so they come together; the rest's minor and patch updates come in one
+# pull request, and any other major update gets its own. On a fork, Dependabot only runs once it's
+# turned on in the repository's Settings (Code security and analysis).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      windows:
+        patterns: [windows, windows-*]
+      minor-and-patch:
+        update-types: [minor, patch]

@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Checking out is all it does.
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Installs the toolchain pinned in rust-toolchain.toml.
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      # --locked: a Cargo.lock that doesn't match Cargo.toml fails rather than being rewritten here.
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --locked
+      # Package the debug build to check the installer builds, installs, upgrades, updates and
+      # uninstalls. The runner is an administrator, as setup needs.
+      - run: installer/build.ps1 -Bin ..\target\debug
+        shell: pwsh
+      - run: installer/smoke-test.ps1
+        shell: pwsh
