@@ -1,6 +1,7 @@
 //! Discord bot module for Screen Time Manager
 //! Provides remote monitoring and control via a Discord bot listening in one channel
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -45,6 +46,11 @@ static BOT_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None)
 /// change is still using the old one, or across a session-handoff restart.
 static NOTIFY_CHANNEL_ID: Mutex<Option<u64>> = Mutex::new(None);
 
+/// Whether the current bot generation has connected to Discord (its `ready`
+/// event arrived) - so `can_notify` doesn't report a client that is still
+/// waiting for the network.
+static CONNECTED: AtomicBool = AtomicBool::new(false);
+
 struct Handler {
     channel_id: u64,
     admin_user_id: Option<u64>,
@@ -54,6 +60,7 @@ struct Handler {
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         eprintln!("[Discord] Bot connected as {}", ready.user.name);
+        CONNECTED.store(true, Ordering::SeqCst);
         // Fires on every (re)connect, including a session-handoff reconnect
         // under Fast User Switching (see session.rs) - so this doubles as an
         // "active user changed" notice, not just a genuine app startup one.
@@ -162,8 +169,9 @@ impl EventHandler for Handler {
 
 /// `!setpin`: the new passcode is in the admin's own message, which everyone
 /// in the channel can read, so delete it first. That needs the Manage
-/// Messages permission in the channel, which the setup wizard doesn't ask
-/// for - if it's missing, say so, so the admin can delete it by hand.
+/// Messages permission in the channel (the setup wizard asks for it, but bots
+/// invited before it did won't have it) - if it's missing, say so, so the
+/// admin can delete it by hand.
 async fn setpin_and_delete(ctx: &Context, msg: &Message, args: &str) -> String {
     let deleted = match msg.delete(ctx).await {
         Ok(()) => true,
@@ -328,6 +336,7 @@ pub fn start_bot_thread() {
                 Ok(rt) => rt.block_on(run_bot(settings)),
                 Err(e) => eprintln!("[Discord] Failed to create tokio runtime: {e}"),
             }
+            CONNECTED.store(false, Ordering::SeqCst);
             *BOT_HTTP.lock().unwrap() = None;
 
             // A start that arrived while this generation was stopping runs
@@ -372,10 +381,14 @@ pub fn notify_admin(text: &str) {
     }
 }
 
-/// Whether `notify_admin` would actually send anything right now - i.e. this
-/// session's bot client is up with a channel configured.
+/// Whether `notify_admin` would actually reach the channel right now - i.e.
+/// this session's bot client is up, has connected, and has a channel
+/// configured. (update.rs waits for this before claiming a one-off
+/// announcement, so it isn't spent on a client that's still offline.)
 pub fn can_notify() -> bool {
-    BOT_HTTP.lock().is_ok_and(|h| h.is_some()) && NOTIFY_CHANNEL_ID.lock().is_ok_and(|c| c.is_some())
+    CONNECTED.load(Ordering::SeqCst)
+        && BOT_HTTP.lock().is_ok_and(|h| h.is_some())
+        && NOTIFY_CHANNEL_ID.lock().is_ok_and(|c| c.is_some())
 }
 
 /// Signal the bot to shut down gracefully

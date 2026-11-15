@@ -488,7 +488,7 @@ fn en(key: &str) -> &'static str {
         "wizard.dc.bot.step4" => "4. Enable \"Message Content Intent\"",
         "wizard.dc.bot.step5" => "5. Click \"Reset Token\" and copy it",
         "wizard.dc.bot.step6" => "6. Go to \"OAuth2 > URL Generator\"",
-        "wizard.dc.bot.step7" => "7. Check \"bot\" + Send Messages/View Channels/Read History, open the URL",
+        "wizard.dc.bot.step7" => "7. Check \"bot\" + Send Messages/View Channels/Read Message History/Manage Messages, open the URL",
         "wizard.dc.bot.hint" => "Keep this token secret - anyone with it can control the bot",
 
         // Step 3: Enter Token
@@ -954,7 +954,7 @@ fn de(key: &str) -> &'static str {
         "wizard.dc.bot.step4" => "4. Aktivieren Sie \"Message Content Intent\"",
         "wizard.dc.bot.step5" => "5. Klicken Sie auf \"Reset Token\" und kopieren Sie ihn",
         "wizard.dc.bot.step6" => "6. Gehen Sie zu \"OAuth2 > URL Generator\"",
-        "wizard.dc.bot.step7" => "7. Wählen Sie \"bot\" + Send Messages/View Channels/Read History, öffnen Sie die URL",
+        "wizard.dc.bot.step7" => "7. Wählen Sie \"bot\" + Send Messages/View Channels/Read Message History/Manage Messages, öffnen Sie die URL",
         "wizard.dc.bot.hint" => "Halten Sie diesen Token geheim - damit kann jeder den Bot steuern",
 
         // Schritt 3: Token eingeben

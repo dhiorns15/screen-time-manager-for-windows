@@ -224,6 +224,28 @@ pub fn sync_remote_bots() {
     }
 }
 
+/// Restart this session's Telegram and/or Discord bot so it picks up a bot
+/// configuration that was just saved (Settings, or a setup wizard) - a bot
+/// only reads its settings when it starts, so without this a bot set up or
+/// changed in Settings stayed off (or on the old settings) until the next
+/// sign-in. Only if this session is the one running the bots (see
+/// `sync_remote_bots`); a stop followed by a start goes through
+/// `BotLifecycle`, which queues the start until the old bot has finished,
+/// and a bot that's now disabled simply doesn't come back.
+pub fn restart_remote_bots(telegram: bool, discord: bool) {
+    if *WAS_ACTIVE.lock().unwrap() != Some(true) {
+        return;
+    }
+    if telegram {
+        crate::telegram::stop_bot_thread();
+        crate::telegram::start_bot_thread();
+    }
+    if discord {
+        crate::discord::stop_bot_thread();
+        crate::discord::start_bot_thread();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

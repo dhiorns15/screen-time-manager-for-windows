@@ -1066,6 +1066,7 @@ const TELEGRAM_ADMIN_CHAT_ID: &str = "telegram_admin_chat_id";
 const TELEGRAM_ENABLED: &str = "telegram_enabled";
 
 /// Telegram bot configuration
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelegramConfig {
     pub bot_token: Option<String>,
     pub admin_chat_id: Option<i64>,
@@ -1102,6 +1103,7 @@ const DISCORD_ADMIN_USER_ID: &str = "discord_admin_user_id";
 const DISCORD_ENABLED: &str = "discord_enabled";
 
 /// Discord bot configuration
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscordConfig {
     pub bot_token: Option<String>,
     pub channel_id: Option<u64>,

@@ -11,7 +11,7 @@ use windows::{
         Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::Gdi::{
             BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject,
-            DrawTextW, Ellipse, EndPaint, FillRect, GetMonitorInfoW, GetStockObject, GetSysColorBrush,
+            DrawTextW, DT_CALCRECT, Ellipse, EndPaint, FillRect, GetMonitorInfoW, GetStockObject, GetSysColorBrush,
             InvalidateRect, LineTo, MonitorFromWindow, MoveToEx, SelectObject, SetBkColor,
             SetBkMode, SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER,
             DT_WORDBREAK, FW_BOLD, FW_NORMAL, GetSysColor, HDC, HGDIOBJ, MONITORINFO, COLOR_BTNFACE,
@@ -1395,7 +1395,10 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                             set_setting("blocking_message", &value);
                         }
 
-                        // Save Telegram settings
+                        // Save Telegram settings (and restart a bot whose
+                        // settings changed, below)
+                        let telegram_before = get_telegram_config();
+                        let discord_before = get_discord_config();
                         let mut telegram_token = String::new();
                         let mut telegram_chat_id = String::new();
 
@@ -1451,6 +1454,12 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                         };
 
                         set_discord_config(&discord_token, &discord_channel_id, &discord_admin_user_id, discord_enabled);
+
+                        let telegram_changed = get_telegram_config() != telegram_before;
+                        let discord_changed = get_discord_config() != discord_before;
+                        if telegram_changed || discord_changed {
+                            crate::session::restart_remote_bots(telegram_changed, discord_changed);
+                        }
 
                         // Save lock screen timeout (convert minutes to seconds)
                         if !handles.lock_screen_timeout.0.is_null() {
@@ -1512,14 +1521,24 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                 } else if id == ID_SETTINGS_CANCEL {
                     DestroyWindow(hwnd).ok();
                 } else if id == ID_TELEGRAM_WIZARD {
-                    // Open Telegram setup wizard
-                    show_telegram_wizard(hwnd);
-                    // Refresh dialog to show new values if wizard completed
+                    // Open Telegram setup wizard. If it saved, show what it
+                    // saved - otherwise Save would write the fields' old
+                    // values back over it - and start the bot with it.
+                    if show_telegram_wizard(hwnd) {
+                        if let Some(ref handles) = SETTINGS_EDIT_HANDLES {
+                            refresh_telegram_fields(handles);
+                        }
+                        crate::session::restart_remote_bots(true, false);
+                    }
                     let _ = InvalidateRect(hwnd, None, true);
                 } else if id == ID_DISCORD_WIZARD {
-                    // Open Discord setup wizard
-                    show_discord_wizard(hwnd);
-                    // Refresh dialog to show new values if wizard completed
+                    // Open Discord setup wizard (same as above)
+                    if show_discord_wizard(hwnd) {
+                        if let Some(ref handles) = SETTINGS_EDIT_HANDLES {
+                            refresh_discord_fields(handles);
+                        }
+                        crate::session::restart_remote_bots(false, true);
+                    }
                     let _ = InvalidateRect(hwnd, None, true);
                 }
 
@@ -1626,6 +1645,41 @@ static mut SETTINGS_SCROLL_POS: i32 = 0;
 static mut SETTINGS_SCROLLABLE: bool = false;
 /// The red "still the default passcode" label, if shown.
 static mut SETTINGS_DEFAULT_PASSCODE_WARNING: HWND = HWND(std::ptr::null_mut());
+
+/// Set a Settings edit field's text (nothing if the field doesn't exist).
+unsafe fn set_field_text(edit: HWND, text: &str) {
+    if edit.0.is_null() {
+        return;
+    }
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    SetWindowTextW(edit, PCWSTR(wide.as_ptr())).ok();
+}
+
+/// Tick or untick a Settings checkbox (nothing if it doesn't exist).
+unsafe fn set_checkbox(checkbox: HWND, checked: bool) {
+    if !checkbox.0.is_null() {
+        SendMessageW(checkbox, BM_SETCHECK, WPARAM(usize::from(checked)), LPARAM(0));
+    }
+}
+
+/// Show the saved Telegram settings in the Settings fields (after the setup
+/// wizard saved new ones).
+unsafe fn refresh_telegram_fields(handles: &SettingsEditHandles) {
+    let config = get_telegram_config();
+    set_checkbox(handles.telegram_enabled, config.enabled);
+    set_field_text(handles.telegram_token, config.bot_token.as_deref().unwrap_or(""));
+    set_field_text(handles.telegram_chat_id, &config.admin_chat_id.map(|id| id.to_string()).unwrap_or_default());
+}
+
+/// Show the saved Discord settings in the Settings fields (after the setup
+/// wizard saved new ones).
+unsafe fn refresh_discord_fields(handles: &SettingsEditHandles) {
+    let config = get_discord_config();
+    set_checkbox(handles.discord_enabled, config.enabled);
+    set_field_text(handles.discord_token, config.bot_token.as_deref().unwrap_or(""));
+    set_field_text(handles.discord_channel_id, &config.channel_id.map(|id| id.to_string()).unwrap_or_default());
+    set_field_text(handles.discord_admin_user_id, &config.admin_user_id.map(|id| id.to_string()).unwrap_or_default());
+}
 
 /// The parsed value of a numeric edit field, `None` if empty or not a
 /// number (or the field doesn't exist).
@@ -2116,6 +2170,8 @@ const ID_WIZARD_TOKEN_EDIT: i32 = 3004;
 static mut WIZARD_STEP: i32 = 1;
 static mut WIZARD_TOKEN: Option<String> = None;
 static mut WIZARD_POLLING: bool = false;
+/// Whether this run of the wizard saved a configuration.
+static mut WIZARD_SAVED: bool = false;
 /// The wizard window, read by the polling thread to request a repaint.
 static WIZARD_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 /// The chat the bot most recently heard from (written by the polling
@@ -2145,13 +2201,15 @@ fn set_wizard_chat(chat: Option<DetectedChat>) {
     }
 }
 
-/// Show the Telegram setup wizard
-pub unsafe fn show_telegram_wizard(parent_hwnd: HWND) {
+/// Show the Telegram setup wizard. Returns whether it saved a configuration
+/// (it does so on reaching its last step, whether or not Finish is clicked).
+pub unsafe fn show_telegram_wizard(parent_hwnd: HWND) -> bool {
     // Reset wizard state
     WIZARD_STEP = 1;
     WIZARD_TOKEN = None;
     set_wizard_chat(None);
     WIZARD_POLLING = false;
+    WIZARD_SAVED = false;
 
     let hinstance = GetModuleHandleW(None).unwrap();
     let wizard_class = w!("ScreenTimeTelegramWizard");
@@ -2188,6 +2246,7 @@ pub unsafe fn show_telegram_wizard(parent_hwnd: HWND) {
     }
 
     WIZARD_HWND.store(std::ptr::null_mut(), AtomicOrdering::SeqCst);
+    WIZARD_SAVED
 }
 
 /// Wizard window procedure
@@ -3005,6 +3064,7 @@ unsafe fn save_wizard_config() {
     if let (Some(ref token), Some(chat_id)) = (&*wizard_token_ref, chat_id) {
         // Save to database using the existing function signature
         crate::database::set_telegram_config(token, &chat_id.to_string(), true);
+        WIZARD_SAVED = true;
 
         // Send test message
         let token = token.clone();
@@ -3045,15 +3105,19 @@ static mut DC_WIZARD_STEP: i32 = 1;
 static mut DC_WIZARD_TOKEN: Option<String> = None;
 static mut DC_WIZARD_CHANNEL_ID: Option<String> = None;
 static mut DC_WIZARD_USER_ID: Option<String> = None;
+/// Whether this run of the wizard saved a configuration.
+static mut DC_WIZARD_SAVED: bool = false;
 const DC_WIZARD_TOTAL_STEPS: i32 = 5;
 
-/// Show the Discord setup wizard
-pub unsafe fn show_discord_wizard(parent_hwnd: HWND) {
+/// Show the Discord setup wizard. Returns whether it saved a configuration
+/// (it does so on reaching its last step, whether or not Finish is clicked).
+pub unsafe fn show_discord_wizard(parent_hwnd: HWND) -> bool {
     // Reset wizard state
     DC_WIZARD_STEP = 1;
     DC_WIZARD_TOKEN = None;
     DC_WIZARD_CHANNEL_ID = None;
     DC_WIZARD_USER_ID = None;
+    DC_WIZARD_SAVED = false;
 
     let hinstance = GetModuleHandleW(None).unwrap();
     let wizard_class = w!("ScreenTimeDiscordWizard");
@@ -3087,6 +3151,7 @@ pub unsafe fn show_discord_wizard(parent_hwnd: HWND) {
         let _ = SetForegroundWindow(hwnd);
         run_modal_loop(hwnd);
     }
+    DC_WIZARD_SAVED
 }
 
 /// Discord wizard window procedure
@@ -3348,9 +3413,15 @@ unsafe fn paint_dc_step_create_bot(hdc: HDC, rect: &RECT) {
 
     for step in steps.iter() {
         SetTextColor(hdc, COLORREF(0x00444444));
-        let mut step_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(30) };
-        DrawTextW(hdc, &mut step.encode_utf16().collect::<Vec<_>>(), &mut step_rect, DT_WORDBREAK);
-        y += scale(30);
+        // A step that wraps (the long permissions list in step 7) gets the
+        // room it needs instead of running into the next line.
+        let mut text: Vec<u16> = step.encode_utf16().collect();
+        let mut measured = RECT { left: rect.left, top: y, right: rect.right, bottom: y };
+        DrawTextW(hdc, &mut text, &mut measured, DT_WORDBREAK | DT_CALCRECT);
+        let height = (measured.bottom - measured.top + scale(8)).max(scale(30));
+        let mut step_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + height };
+        DrawTextW(hdc, &mut text, &mut step_rect, DT_WORDBREAK);
+        y += height;
     }
 
     y += scale(6);
@@ -3800,6 +3871,7 @@ unsafe fn save_dc_wizard_config() {
         (&*dc_wizard_token_ref, &*dc_wizard_channel_ref, &*dc_wizard_user_ref)
     {
         crate::database::set_discord_config(token, channel_id, user_id, true);
+        DC_WIZARD_SAVED = true;
 
         if let Ok(channel_id_num) = channel_id.parse::<u64>() {
             let token = token.clone();

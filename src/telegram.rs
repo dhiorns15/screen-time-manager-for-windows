@@ -1,6 +1,7 @@
 //! Telegram bot module for Screen Time Manager
 //! Provides remote monitoring and control via Telegram commands
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 use teloxide::prelude::*;
@@ -47,6 +48,11 @@ static BOT_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None)
 /// configured chat ID in Settings while a bot generation from before that
 /// change is still using the old one, or across a session-handoff restart.
 static ADMIN_CHAT_ID: Mutex<Option<i64>> = Mutex::new(None);
+
+/// Whether the current bot generation has reached Telegram (its `get_me`
+/// succeeded) - so `can_notify` doesn't report a bot that is still trying to
+/// connect, e.g. offline at startup, whose messages would just be lost.
+static CONNECTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(BotCommands, Clone, Debug)]
 #[command(rename_rule = "lowercase", description = "Screen Time Manager commands:")]
@@ -185,6 +191,7 @@ pub fn start_bot_thread() {
                 Ok(rt) => rt.block_on(run_bot(token, admin_chat_id)),
                 Err(e) => eprintln!("[Telegram] Failed to create tokio runtime: {e}"),
             }
+            CONNECTED.store(false, Ordering::SeqCst);
             *BOT_INSTANCE.lock().unwrap() = None;
 
             // A start that arrived while this generation was stopping runs
@@ -229,10 +236,14 @@ pub fn notify_admin(text: &str) {
     }
 }
 
-/// Whether `notify_admin` would actually send anything right now - i.e. this
-/// session's bot is running with an admin chat configured.
+/// Whether `notify_admin` would actually reach anyone right now - i.e. this
+/// session's bot is running, has connected to Telegram, and has an admin
+/// chat configured. (update.rs waits for this before claiming a one-off
+/// announcement, so it isn't spent on a bot that's still offline.)
 pub fn can_notify() -> bool {
-    BOT_INSTANCE.lock().is_ok_and(|b| b.is_some()) && ADMIN_CHAT_ID.lock().is_ok_and(|c| c.is_some())
+    CONNECTED.load(Ordering::SeqCst)
+        && BOT_INSTANCE.lock().is_ok_and(|b| b.is_some())
+        && ADMIN_CHAT_ID.lock().is_ok_and(|c| c.is_some())
 }
 
 /// Signal the bot to shut down gracefully
@@ -342,6 +353,7 @@ async fn connect_and_dispatch(
 ) -> Result<(), RequestError> {
     bot.get_me().await?;
     *failures = 0;
+    CONNECTED.store(true, Ordering::SeqCst);
 
     // Send startup notification, once per bot generation and only once
     // actually connected. A generation starts whenever the bot (re)starts,
