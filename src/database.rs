@@ -827,8 +827,13 @@ fn resync_clock_anchor(now_wall: i64, now_tick: i64, date: &str) {
 /// that's not elapsed time - it's the clock being moved - so "today" stays
 /// pinned to the last known-good date until the real clock drifts back
 /// within tolerance on its own.
+///
+/// A time-zone change moves the local date without moving the clock, so the
+/// anchor can't see it; the date this starts from is already the one in the
+/// time zone the PC is supposed to be in (`remembered_zone_today_date`), so
+/// a changed zone - before or after a reboot - moves nothing here.
 pub fn effective_today_date() -> String {
-    let today = get_today_date();
+    let today = remembered_zone_today_date();
     let now_wall = wall_clock_now_secs();
     let now_tick = monotonic_now_ms();
 
@@ -839,7 +844,6 @@ pub fn effective_today_date() -> String {
 
     let Some(((anchor_wall, anchor_tick), anchor_date)) = anchor else {
         // First run ever - nothing to compare against yet.
-        reset_utc_offset_baseline();
         resync_clock_anchor(now_wall, now_tick, &today);
         return today;
     };
@@ -848,24 +852,20 @@ pub fn effective_today_date() -> String {
         // The machine rebooted since the last anchor, so the tick counter
         // reset and can't sanity-check the wall clock across that gap.
         // Accept the current time and start fresh from here.
-        reset_utc_offset_baseline();
         resync_clock_anchor(now_wall, now_tick, &today);
         return today;
     }
 
-    let expected_wall = anchor_wall + (now_tick - anchor_tick) / 1000;
-    let drift = now_wall - expected_wall;
-    // A time-zone change moves the local date without moving UTC, so the
-    // drift check above can't see it - see `utc_offset_tamper_secs`.
-    let tz_shift = utc_offset_tamper_secs();
+    // Saturating: the anchor comes from the database, which can be edited.
+    let expected_wall = anchor_wall.saturating_add(now_tick.saturating_sub(anchor_tick) / 1000);
+    let drift = now_wall.saturating_sub(expected_wall);
 
-    if drift.abs() <= CLOCK_DRIFT_TOLERANCE_SECS && tz_shift.is_none() {
+    if drift.abs() <= CLOCK_DRIFT_TOLERANCE_SECS {
         resync_clock_anchor(now_wall, now_tick, &today);
         today
     } else {
-        let reported = if drift.abs() > CLOCK_DRIFT_TOLERANCE_SECS { drift } else { tz_shift.unwrap_or(drift) };
         set_setting("clock_tamper_active", "1");
-        set_setting("clock_tamper_drift_secs", &reported.to_string());
+        set_setting("clock_tamper_drift_secs", &drift.to_string());
         anchor_date
     }
 }
@@ -901,9 +901,24 @@ pub fn load_remaining_time() -> Option<i32> {
     get_setting(&key).and_then(|s| s.parse().ok())
 }
 
-/// Get the current weekday (0 = Monday, 6 = Sunday)
+/// Get the current weekday (0 = Monday, 6 = Sunday) - of the day in the time
+/// zone the PC is supposed to be in (see `remembered_zone_today_date`), so a
+/// changed time zone can't pick the next day's limit either.
 #[allow(dead_code)]
 pub fn get_current_weekday() -> u32 {
+    weekday_of_date(&remembered_zone_today_date()).unwrap_or_else(local_weekday)
+}
+
+/// Weekday (0 = Monday, 6 = Sunday) of a "YYYY-MM-DD" date.
+fn weekday_of_date(date: &str) -> Option<u32> {
+    let parts: Vec<i64> = date.splitn(3, '-').filter_map(|p| p.parse().ok()).collect();
+    let [y, m, d] = parts[..] else { return None };
+    // 1970-01-01 was a Thursday (3, counting from Monday = 0).
+    Some((days_from_civil(y, m, d) + 3).rem_euclid(7) as u32)
+}
+
+/// Weekday (0 = Monday, 6 = Sunday) by the local clock.
+fn local_weekday() -> u32 {
     use windows::Win32::System::SystemInformation::GetLocalTime;
 
     let st = unsafe { GetLocalTime() };
@@ -1415,16 +1430,22 @@ fn move_database_aside(db_path: &std::path::Path) -> std::io::Result<PathBuf> {
 // Time-zone tamper detection, local date, and in-flight pause persistence
 // ============================================================================
 
-/// The UTC offset (local minus UTC, minutes) in effect when the clock anchor
-/// was last created - at first run or after a reboot, deliberately *not* on
-/// every resync, so a time zone can't be walked a little at a time.
-const UTC_OFFSET_BASELINE_KEY: &str = "clock_anchor_utc_offset_mins";
+/// The time zone the PC is supposed to be in (`TimeZone::serialize`), kept
+/// machine-wide in the shared database. "Today" always follows this zone -
+/// see `remembered_zone_today_date`. It's recorded when there is none yet
+/// (first run, including the first run after upgrading from a version
+/// without it) and replaced only by saving Settings, which is behind the
+/// passcode (`adopt_current_time_zone`) - never by a reboot or a restart.
+/// (Replaces the old `clock_anchor_utc_offset_mins` baseline, which was
+/// re-recorded at every reboot, so "change the zone, then reboot" worked,
+/// and which let a zone change of up to an hour through as daylight saving.)
+const REMEMBERED_TIME_ZONE_KEY: &str = "time_zone_remembered";
 
-/// The largest UTC-offset change, relative to the baseline, that counts as a
-/// daylight-saving transition rather than a time-zone change. DST moves the
-/// offset by 60 minutes (30 in a few places) and back again, so it never
-/// strays further than this from the baseline.
-const MAX_DST_SHIFT_MINS: i64 = 60;
+/// The changed time zone the admin was last alerted about
+/// (`TimeZone::identity`), or "" while the PC is in the remembered zone - so
+/// each change is alerted once, not on every check or every start, and only
+/// by one of the accounts running the app.
+const TIME_ZONE_ALERTED_KEY: &str = "time_zone_alerted";
 
 /// Seconds since 1970-01-01 for a civil date and time (no time zone).
 fn civil_to_secs(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) -> i64 {
@@ -1452,30 +1473,303 @@ fn current_utc_offset_mins() -> i64 {
     utc_offset_mins_from(systemtime_secs(&local), systemtime_secs(&utc))
 }
 
-/// How far the offset moved beyond a DST step from the baseline, in minutes,
-/// or `None` if it's within one (including no change at all).
-fn utc_offset_shift_beyond_dst(baseline_mins: i64, current_mins: i64) -> Option<i64> {
-    let shift = current_mins - baseline_mins;
-    (shift.abs() > MAX_DST_SHIFT_MINS).then_some(shift)
+/// "YYYY-MM-DD" of a SYSTEMTIME.
+fn systemtime_date(st: &windows::Win32::Foundation::SYSTEMTIME) -> String {
+    format!("{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay)
 }
 
-fn reset_utc_offset_baseline() {
-    set_setting(UTC_OFFSET_BASELINE_KEY, &current_utc_offset_mins().to_string());
+/// The kernel32 time-zone calls, declared here because the `windows` crate is
+/// built without its `Win32_System_Time` feature.
+mod tz_api {
+    use windows::Win32::Foundation::{BOOL, SYSTEMTIME};
+
+    /// TIME_ZONE_INFORMATION.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct TimeZoneInformation {
+        pub bias: i32,
+        pub standard_name: [u16; 32],
+        pub standard_date: SYSTEMTIME,
+        pub standard_bias: i32,
+        pub daylight_name: [u16; 32],
+        pub daylight_date: SYSTEMTIME,
+        pub daylight_bias: i32,
+    }
+
+    /// DYNAMIC_TIME_ZONE_INFORMATION, which starts with the same fields.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct DynamicTimeZoneInformation {
+        pub tzi: TimeZoneInformation,
+        pub time_zone_key_name: [u16; 128],
+        pub dynamic_daylight_time_disabled: u8,
+    }
+
+    pub const TIME_ZONE_ID_INVALID: u32 = u32::MAX;
+
+    #[allow(non_snake_case)]
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn GetDynamicTimeZoneInformation(info: *mut DynamicTimeZoneInformation) -> u32;
+        pub fn SystemTimeToTzSpecificLocalTime(
+            zone: *const TimeZoneInformation,
+            utc: *const SYSTEMTIME,
+            local: *mut SYSTEMTIME,
+        ) -> BOOL;
+    }
 }
 
-/// `Some(shift in seconds)` while the time zone differs from the baseline by
-/// more than a DST step - a standard user can run `tzutil /s` to move "today"
-/// to tomorrow's date without touching the clock itself. Installs from before
-/// this check have no baseline yet; the first call records one.
-fn utc_offset_tamper_secs() -> Option<i64> {
-    let current = current_utc_offset_mins();
-    match get_setting(UTC_OFFSET_BASELINE_KEY).and_then(|s| s.parse::<i64>().ok()) {
-        Some(baseline) => utc_offset_shift_beyond_dst(baseline, current).map(|m| m * 60),
-        None => {
-            set_setting(UTC_OFFSET_BASELINE_KEY, &current.to_string());
-            None
+/// A Windows time zone: what identifies it, and its rules, so the local date
+/// in it can be worked out after the PC has moved to another zone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TimeZone {
+    /// Windows' key name, e.g. "W. Europe Standard Time" (can be empty).
+    key: String,
+    /// UTC minus local standard time, in minutes (Windows' `Bias`: -60 for
+    /// Central European Time, 210 for Newfoundland, -345 for Nepal).
+    bias: i32,
+    /// "Adjust for daylight saving time automatically" is off.
+    dst_disabled: bool,
+    standard_bias: i32,
+    daylight_bias: i32,
+    /// When standard and daylight time begin (SYSTEMTIME fields in order,
+    /// Windows' rule format). Month 0 means no daylight saving time.
+    standard_date: [u16; 8],
+    daylight_date: [u16; 8],
+}
+
+/// Biases further than a day from UTC aren't real zones (an edited value).
+const MAX_ZONE_BIAS_MINS: i32 = 24 * 60;
+
+fn systemtime_fields(st: &windows::Win32::Foundation::SYSTEMTIME) -> [u16; 8] {
+    [st.wYear, st.wMonth, st.wDayOfWeek, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds]
+}
+
+fn systemtime_from_fields(f: [u16; 8]) -> windows::Win32::Foundation::SYSTEMTIME {
+    windows::Win32::Foundation::SYSTEMTIME {
+        wYear: f[0], wMonth: f[1], wDayOfWeek: f[2], wDay: f[3],
+        wHour: f[4], wMinute: f[5], wSecond: f[6], wMilliseconds: f[7],
+    }
+}
+
+/// "UTC+05:45", "UTC-03:30", "UTC+00:00" for an offset in minutes.
+fn format_utc_offset(offset_mins: i32) -> String {
+    let sign = if offset_mins < 0 { '-' } else { '+' };
+    let m = offset_mins.unsigned_abs();
+    format!("UTC{}{:02}:{:02}", sign, m / 60, m % 60)
+}
+
+/// A time zone as named in the time-zone alert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimeZoneLabel {
+    /// Key name and standard offset, e.g. "Pacific Standard Time (UTC-08:00)".
+    pub name: String,
+    /// Automatic daylight saving time is switched off in it.
+    pub dst_off: bool,
+}
+
+impl TimeZone {
+    fn from_api(info: &tz_api::DynamicTimeZoneInformation) -> Self {
+        let key_len = info.time_zone_key_name.iter().position(|&c| c == 0).unwrap_or(info.time_zone_key_name.len());
+        TimeZone {
+            key: String::from_utf16_lossy(&info.time_zone_key_name[..key_len]),
+            bias: info.tzi.bias,
+            dst_disabled: info.dynamic_daylight_time_disabled != 0,
+            standard_bias: info.tzi.standard_bias,
+            daylight_bias: info.tzi.daylight_bias,
+            standard_date: systemtime_fields(&info.tzi.standard_date),
+            daylight_date: systemtime_fields(&info.tzi.daylight_date),
         }
     }
+
+    /// What tells one zone from another: its name, its standard offset and
+    /// whether automatic DST is off. A daylight-saving transition changes
+    /// none of these - it changes only the offset in effect - so it's never
+    /// taken for a zone change, while every real zone change is, including
+    /// one to a zone just an hour away and turning automatic DST on or off.
+    fn identity(&self) -> String {
+        format!("{}|{}|{}", self.bias, u8::from(self.dst_disabled), self.key)
+    }
+
+    fn same_zone(&self, other: &TimeZone) -> bool {
+        self.identity() == other.identity()
+    }
+
+    fn serialize(&self) -> String {
+        let fields = |f: &[u16; 8]| f.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
+        format!(
+            "1|{}|{}|{}|{}|{}|{}|{}",
+            self.bias,
+            u8::from(self.dst_disabled),
+            self.standard_bias,
+            self.daylight_bias,
+            fields(&self.standard_date),
+            fields(&self.daylight_date),
+            self.key,
+        )
+    }
+
+    /// Inverse of `serialize`; `None` for anything malformed or absurd.
+    fn parse(value: &str) -> Option<Self> {
+        fn fields(s: &str) -> Option<[u16; 8]> {
+            let parsed: Vec<u16> = s.split(',').map(|v| v.parse().ok()).collect::<Option<_>>()?;
+            parsed.try_into().ok()
+        }
+        let mut parts = value.splitn(8, '|');
+        if parts.next()? != "1" {
+            return None;
+        }
+        let bias: i32 = parts.next()?.parse().ok()?;
+        let dst_disabled = match parts.next()? {
+            "0" => false,
+            "1" => true,
+            _ => return None,
+        };
+        let standard_bias: i32 = parts.next()?.parse().ok()?;
+        let daylight_bias: i32 = parts.next()?.parse().ok()?;
+        let standard_date = fields(parts.next()?)?;
+        let daylight_date = fields(parts.next()?)?;
+        let key = parts.next()?.to_string();
+        let sane = [bias, standard_bias, daylight_bias].iter().all(|b| b.abs() <= MAX_ZONE_BIAS_MINS)
+            && (bias + standard_bias).abs() <= MAX_ZONE_BIAS_MINS
+            && (bias + daylight_bias).abs() <= MAX_ZONE_BIAS_MINS;
+        sane.then_some(TimeZone { key, bias, dst_disabled, standard_bias, daylight_bias, standard_date, daylight_date })
+    }
+
+    fn label(&self) -> TimeZoneLabel {
+        let offset = format_utc_offset(-(self.bias + self.standard_bias));
+        let name = if self.key.is_empty() { offset } else { format!("{} ({})", self.key, offset) };
+        TimeZoneLabel { name, dst_off: self.dst_disabled }
+    }
+
+    fn to_api(&self) -> tz_api::TimeZoneInformation {
+        // No daylight saving time when it's switched off: month 0 in both.
+        let (standard_date, daylight_date) = if self.dst_disabled {
+            ([0; 8], [0; 8])
+        } else {
+            (self.standard_date, self.daylight_date)
+        };
+        tz_api::TimeZoneInformation {
+            bias: self.bias,
+            standard_name: [0; 32],
+            standard_date: systemtime_from_fields(standard_date),
+            standard_bias: self.standard_bias,
+            daylight_name: [0; 32],
+            daylight_date: systemtime_from_fields(daylight_date),
+            daylight_bias: self.daylight_bias,
+        }
+    }
+
+    /// The local date in this zone at the UTC instant `utc`, daylight saving
+    /// included. Falls back to standard time if Windows rejects the rules.
+    fn date_at(&self, utc: &windows::Win32::Foundation::SYSTEMTIME) -> String {
+        let zone = self.to_api();
+        let mut local = windows::Win32::Foundation::SYSTEMTIME::default();
+        if unsafe { tz_api::SystemTimeToTzSpecificLocalTime(&zone, utc, &mut local) }.as_bool() {
+            return systemtime_date(&local);
+        }
+        let local_secs = systemtime_secs(utc) - i64::from(self.bias + self.standard_bias) * 60;
+        let (y, m, d) = civil_from_days(local_secs.div_euclid(86400));
+        format!("{:04}-{:02}-{:02}", y, m, d)
+    }
+}
+
+/// The time zone Windows is in now, or `None` if it won't say.
+fn current_time_zone() -> Option<TimeZone> {
+    let mut info: tz_api::DynamicTimeZoneInformation = unsafe { std::mem::zeroed() };
+    let result = unsafe { tz_api::GetDynamicTimeZoneInformation(&mut info) };
+    (result != tz_api::TIME_ZONE_ID_INVALID).then(|| TimeZone::from_api(&info))
+}
+
+fn remembered_time_zone() -> Option<TimeZone> {
+    get_shared_setting(REMEMBERED_TIME_ZONE_KEY).and_then(|s| TimeZone::parse(&s))
+}
+
+/// Today's date, given the remembered zone, the zone Windows is in now and
+/// the date by the local clock - and whether to (re)store the current zone
+/// as the remembered one.
+#[derive(Debug, PartialEq, Eq)]
+struct ZoneDay {
+    date: String,
+    record_current: bool,
+}
+
+/// While the PC is in the remembered zone, today is the local date. While it
+/// isn't - a child ran `tzutil /s` to borrow tomorrow, or the family is
+/// travelling - today is the date in the *remembered* zone at the same UTC
+/// instant: the day still rolls over at midnight there, and changing the
+/// zone, rebooting or both gains and loses nothing. Nothing is frozen, so
+/// midnight still comes. With no remembered zone yet (first run, or first
+/// run after an upgrade) the current one is recorded silently; while it's
+/// the same zone, newer rules for it (a Windows update) are recorded too.
+fn zone_day(
+    remembered: Option<&TimeZone>,
+    current: Option<&TimeZone>,
+    utc: &windows::Win32::Foundation::SYSTEMTIME,
+    local_date: &str,
+) -> ZoneDay {
+    match (remembered, current) {
+        (Some(r), Some(c)) if r.same_zone(c) => ZoneDay { date: local_date.to_string(), record_current: r != c },
+        // Moved to another zone, or the current one can't be read.
+        (Some(r), _) => ZoneDay { date: r.date_at(utc), record_current: false },
+        (None, c) => ZoneDay { date: local_date.to_string(), record_current: c.is_some() },
+    }
+}
+
+/// Today's date in the time zone the PC is supposed to be in - see
+/// `zone_day`. The starting point of `effective_today_date`.
+fn remembered_zone_today_date() -> String {
+    use windows::Win32::System::SystemInformation::{GetLocalTime, GetSystemTime};
+    let (local, utc) = unsafe { (GetLocalTime(), GetSystemTime()) };
+    let current = current_time_zone();
+    let day = zone_day(remembered_time_zone().as_ref(), current.as_ref(), &utc, &systemtime_date(&local));
+    if day.record_current {
+        if let Some(current) = &current {
+            set_shared_setting(REMEMBERED_TIME_ZONE_KEY, &current.serialize());
+        }
+    }
+    day.date
+}
+
+/// Whether to alert the admin now that the PC is in `current` rather than
+/// `remembered`: once per change. `stored` is TIME_ZONE_ALERTED_KEY's value;
+/// `swap` stores a new one and says whether that changed it, so when several
+/// accounts' apps see the same change only one of them alerts.
+fn claim_time_zone_alert(
+    remembered: &TimeZone,
+    current: &TimeZone,
+    stored: Option<&str>,
+    swap: impl FnOnce(&str) -> bool,
+) -> bool {
+    let marker = if remembered.same_zone(current) { String::new() } else { current.identity() };
+    if stored.unwrap_or("") == marker {
+        return false;
+    }
+    swap(&marker) && !marker.is_empty()
+}
+
+/// The remembered and the current time zone, the first time the PC is seen
+/// in a zone other than the remembered one (see `claim_time_zone_alert`).
+/// `None` otherwise, including before a zone has been remembered.
+pub fn take_pending_time_zone_alert() -> Option<(TimeZoneLabel, TimeZoneLabel)> {
+    let remembered = remembered_time_zone()?;
+    let current = current_time_zone()?;
+    let stored = get_shared_setting(TIME_ZONE_ALERTED_KEY);
+    let alert = claim_time_zone_alert(&remembered, &current, stored.as_deref(), |marker| {
+        swap_shared_setting(TIME_ZONE_ALERTED_KEY, marker).is_some()
+    });
+    alert.then(|| (remembered.label(), current.label()))
+}
+
+/// Make the zone Windows is in now the one the PC is supposed to be in.
+/// Called when Settings is saved (behind the passcode) - the way a parent
+/// accepts a time-zone change, as the alert tells them. If the new zone's
+/// date differs from the remembered zone's, the day changes with it at the
+/// next rollover check.
+pub fn adopt_current_time_zone() {
+    let Some(current) = current_time_zone() else { return };
+    set_shared_setting(REMEMBERED_TIME_ZONE_KEY, &current.serialize());
+    set_shared_setting(TIME_ZONE_ALERTED_KEY, "");
 }
 
 /// Today's date by the local clock, without the clock-tamper gate or any
@@ -1574,25 +1868,228 @@ mod timekeeping_tests {
         );
     }
 
-    #[test]
-    fn dst_transitions_are_not_tampering() {
-        // CET baseline: summer time and back
-        assert_eq!(utc_offset_shift_beyond_dst(60, 120), None);
-        assert_eq!(utc_offset_shift_beyond_dst(120, 60), None);
-        assert_eq!(utc_offset_shift_beyond_dst(60, 60), None);
-        // Lord Howe's 30-minute DST
-        assert_eq!(utc_offset_shift_beyond_dst(630, 660), None);
+    // ----- Time zones -----
+
+    /// US rules: DST from the 2nd Sunday of March 02:00 to the 1st Sunday of
+    /// November 02:00. EU rules: last Sunday of March to last Sunday of October.
+    const US_STANDARD: [u16; 8] = [0, 11, 0, 1, 2, 0, 0, 0];
+    const US_DAYLIGHT: [u16; 8] = [0, 3, 0, 2, 2, 0, 0, 0];
+
+    fn zone(key: &str, bias: i32, rules: Option<([u16; 8], [u16; 8])>) -> TimeZone {
+        let (standard_date, daylight_date, daylight_bias) = match rules {
+            Some((s, d)) => (s, d, -60),
+            None => ([0; 8], [0; 8], 0),
+        };
+        TimeZone {
+            key: key.to_string(),
+            bias,
+            dst_disabled: false,
+            standard_bias: 0,
+            daylight_bias,
+            standard_date,
+            daylight_date,
+        }
+    }
+    fn pacific() -> TimeZone { zone("Pacific Standard Time", 480, Some((US_STANDARD, US_DAYLIGHT))) }
+    fn eastern() -> TimeZone { zone("Eastern Standard Time", 300, Some((US_STANDARD, US_DAYLIGHT))) }
+    fn line_islands() -> TimeZone { zone("Line Islands Standard Time", -840, None) }
+    fn central_europe() -> TimeZone {
+        zone("W. Europe Standard Time", -60, Some(([0, 10, 0, 5, 3, 0, 0, 0], [0, 3, 0, 5, 2, 0, 0, 0])))
+    }
+    fn eastern_europe() -> TimeZone {
+        zone("GTB Standard Time", -120, Some(([0, 10, 0, 5, 4, 0, 0, 0], [0, 3, 0, 5, 3, 0, 0, 0])))
+    }
+    fn arabia() -> TimeZone { zone("Arab Standard Time", -180, None) }
+    fn nepal() -> TimeZone { zone("Nepal Standard Time", -345, None) }
+    fn india() -> TimeZone { zone("India Standard Time", -330, None) }
+    fn newfoundland() -> TimeZone { zone("Newfoundland Standard Time", 210, Some((US_STANDARD, US_DAYLIGHT))) }
+
+    fn utc(y: u16, mo: u16, d: u16, h: u16, mi: u16) -> windows::Win32::Foundation::SYSTEMTIME {
+        // Sunday = 0; 1970-01-01 was a Thursday.
+        let dow = (days_from_civil(y as i64, mo as i64, d as i64) + 4).rem_euclid(7) as u16;
+        systemtime_from_fields([y, mo, dow, d, h, mi, 0, 0])
+    }
+
+    /// "Today" with `remembered` remembered while Windows is in `current`.
+    fn today(remembered: &TimeZone, current: &TimeZone, at: &windows::Win32::Foundation::SYSTEMTIME) -> String {
+        let local = current.date_at(at);
+        zone_day(Some(remembered), Some(current), at, &local).date
     }
 
     #[test]
-    fn time_zone_jumps_are_tampering() {
-        // tzutil from UTC-8 to UTC+14 to borrow tomorrow
-        assert_eq!(utc_offset_shift_beyond_dst(-480, 840), Some(1320));
-        // Backwards too
-        assert_eq!(utc_offset_shift_beyond_dst(60, -600), Some(-660));
-        // Just past a DST step, or a DST step on top of a zone change
-        assert_eq!(utc_offset_shift_beyond_dst(60, 180), Some(120));
-        assert_eq!(utc_offset_shift_beyond_dst(60, 135), Some(75));
+    fn time_zone_api_structs_match_windows() {
+        assert_eq!(std::mem::size_of::<tz_api::TimeZoneInformation>(), 172);
+        assert_eq!(std::mem::size_of::<tz_api::DynamicTimeZoneInformation>(), 432);
+    }
+
+    #[test]
+    fn dates_in_a_zone_follow_its_daylight_saving_rules() {
+        // Pacific, winter and summer, either side of midnight
+        assert_eq!(pacific().date_at(&utc(2026, 11, 16, 7, 30)), "2026-11-15"); // 23:30 PST
+        assert_eq!(pacific().date_at(&utc(2026, 11, 16, 8, 30)), "2026-11-16"); // 00:30 PST
+        assert_eq!(pacific().date_at(&utc(2026, 7, 2, 6, 30)), "2026-07-01"); // 23:30 PDT
+        assert_eq!(pacific().date_at(&utc(2026, 7, 2, 7, 30)), "2026-07-02"); // 00:30 PDT
+        // The days DST starts (8 March 2026) and ends (1 November 2026)
+        assert_eq!(pacific().date_at(&utc(2026, 3, 9, 7, 30)), "2026-03-09"); // 00:30 PDT, 23:30 PST
+        assert_eq!(pacific().date_at(&utc(2026, 11, 2, 7, 30)), "2026-11-01"); // 23:30 PST, 00:30 PDT
+        // Central Europe
+        assert_eq!(central_europe().date_at(&utc(2026, 1, 1, 22, 30)), "2026-01-01"); // 23:30 CET
+        assert_eq!(central_europe().date_at(&utc(2026, 7, 1, 22, 30)), "2026-07-02"); // 00:30 CEST
+    }
+
+    #[test]
+    fn half_and_three_quarter_hour_zones_work() {
+        // Nepal +5:45
+        assert_eq!(nepal().date_at(&utc(2026, 11, 15, 18, 10)), "2026-11-15"); // 23:55
+        assert_eq!(nepal().date_at(&utc(2026, 11, 15, 18, 20)), "2026-11-16"); // 00:05
+        // Newfoundland -3:30, and -2:30 in summer
+        assert_eq!(newfoundland().date_at(&utc(2026, 11, 16, 3, 25)), "2026-11-15"); // 23:55 NST
+        assert_eq!(newfoundland().date_at(&utc(2026, 11, 16, 3, 35)), "2026-11-16"); // 00:05 NST
+        assert_eq!(newfoundland().date_at(&utc(2026, 7, 16, 2, 25)), "2026-07-15"); // 23:55 NDT
+        assert_eq!(newfoundland().date_at(&utc(2026, 7, 16, 2, 35)), "2026-07-16"); // 00:05 NDT
+        // Remembered Nepal, now India (+5:30): the day still follows Nepal
+        assert_eq!(today(&nepal(), &india(), &utc(2026, 11, 15, 18, 20)), "2026-11-16");
+        assert_eq!(today(&nepal(), &india(), &utc(2026, 11, 15, 18, 10)), "2026-11-15");
+        assert_eq!(nepal().label().name, "Nepal Standard Time (UTC+05:45)");
+        assert_eq!(newfoundland().label().name, "Newfoundland Standard Time (UTC-03:30)");
+        assert_eq!(format_utc_offset(0), "UTC+00:00");
+    }
+
+    #[test]
+    fn changing_the_zone_and_rebooting_gains_nothing() {
+        // 22:10 in California with no time left; tzutil to UTC+14 makes it
+        // 20:10 *tomorrow* locally. Today stays the 15th - the remembered zone
+        // is stored, and nothing at a reboot or restart replaces it.
+        let at = utc(2026, 11, 16, 6, 10);
+        assert_eq!(line_islands().date_at(&at), "2026-11-16");
+        let day = zone_day(Some(&pacific()), Some(&line_islands()), &at, "2026-11-16");
+        assert_eq!(day, ZoneDay { date: "2026-11-15".into(), record_current: false });
+        // ...and the day still rolls over at midnight in California
+        assert_eq!(today(&pacific(), &line_islands(), &utc(2026, 11, 16, 7, 59)), "2026-11-15");
+        assert_eq!(today(&pacific(), &line_islands(), &utc(2026, 11, 16, 8, 0)), "2026-11-16");
+        // Moving the zone backwards doesn't take a day away either
+        assert_eq!(today(&line_islands(), &pacific(), &utc(2026, 11, 16, 6, 10)), "2026-11-16");
+    }
+
+    #[test]
+    fn travelling_keeps_the_day_rolling_until_the_new_zone_is_accepted() {
+        // Flew from California to New York: midnight is at 03:00 local now
+        assert_eq!(today(&pacific(), &eastern(), &utc(2026, 11, 16, 5, 30)), "2026-11-15"); // 00:30 EST
+        assert_eq!(today(&pacific(), &eastern(), &utc(2026, 11, 16, 8, 30)), "2026-11-16"); // 03:30 EST
+        // Accepted (Settings saved): the local date again
+        let at = utc(2026, 11, 16, 5, 30);
+        let day = zone_day(Some(&eastern()), Some(&eastern()), &at, "2026-11-16");
+        assert_eq!(day, ZoneDay { date: "2026-11-16".into(), record_current: false });
+    }
+
+    #[test]
+    fn daylight_saving_transitions_are_not_zone_changes() {
+        // Windows reports the same zone all year: the offset in effect changes,
+        // the identity doesn't, so the local date is used.
+        for at in [utc(2026, 3, 9, 7, 30), utc(2026, 11, 2, 7, 30), utc(2026, 7, 2, 7, 30)] {
+            let local = pacific().date_at(&at);
+            let day = zone_day(Some(&pacific()), Some(&pacific()), &at, &local);
+            assert_eq!(day, ZoneDay { date: local, record_current: false });
+        }
+        // New rules for the same zone (a Windows update) are recorded quietly
+        let mut updated = pacific();
+        updated.daylight_date = [0, 3, 0, 3, 2, 0, 0, 0];
+        assert!(pacific().same_zone(&updated));
+        let day = zone_day(Some(&pacific()), Some(&updated), &utc(2026, 7, 2, 7, 30), "2026-07-02");
+        assert_eq!(day, ZoneDay { date: "2026-07-02".into(), record_current: true });
+    }
+
+    #[test]
+    fn a_zone_an_hour_away_does_not_end_the_day_early() {
+        // 23:10 in Berlin, switched to Athens (+1h): it's 00:10 there
+        let winter = utc(2026, 11, 15, 22, 10);
+        assert_eq!(eastern_europe().date_at(&winter), "2026-11-16");
+        assert!(!central_europe().same_zone(&eastern_europe()));
+        assert_eq!(today(&central_europe(), &eastern_europe(), &winter), "2026-11-15");
+        // 23:10 in Berlin in summer (UTC+2), switched to UTC+3
+        let summer = utc(2026, 7, 15, 21, 10);
+        assert_eq!(arabia().date_at(&summer), "2026-07-16");
+        assert_eq!(today(&central_europe(), &arabia(), &summer), "2026-07-15");
+        // Switching automatic daylight saving time on in summer when it was off
+        let mut no_dst = central_europe();
+        no_dst.dst_disabled = true;
+        assert!(!no_dst.same_zone(&central_europe()));
+        let at = utc(2026, 7, 15, 22, 30); // 23:30 without DST, 00:30 with it
+        assert_eq!(no_dst.date_at(&at), "2026-07-15");
+        assert_eq!(today(&no_dst, &central_europe(), &at), "2026-07-15");
+    }
+
+    #[test]
+    fn a_missing_remembered_zone_is_recorded_silently() {
+        let at = utc(2026, 11, 16, 6, 10);
+        // First run, or the first run after upgrading: the local date, and
+        // the current zone is stored...
+        let day = zone_day(None, Some(&line_islands()), &at, "2026-11-16");
+        assert_eq!(day, ZoneDay { date: "2026-11-16".into(), record_current: true });
+        // ...with nothing to alert about (take_pending_time_zone_alert needs
+        // a remembered zone)
+        assert!(!claim_time_zone_alert(&line_islands(), &line_islands(), None, |_| true));
+        // Windows won't say: the local date with nothing remembered...
+        assert_eq!(zone_day(None, None, &at, "2026-11-16"), ZoneDay { date: "2026-11-16".into(), record_current: false });
+        // ...the remembered zone's date otherwise
+        assert_eq!(zone_day(Some(&pacific()), None, &at, "2026-11-16").date, "2026-11-15");
+    }
+
+    #[test]
+    fn each_zone_change_is_alerted_once() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)", []).unwrap();
+        let mut check = |remembered: &TimeZone, current: &TimeZone| {
+            let stored: Option<String> = conn
+                .query_row("SELECT value FROM settings WHERE key = ?1", params![TIME_ZONE_ALERTED_KEY], |r| r.get(0))
+                .ok();
+            claim_time_zone_alert(remembered, current, stored.as_deref(), |marker| {
+                swap_setting_in(&mut conn, TIME_ZONE_ALERTED_KEY, marker).ok().flatten().is_some()
+            })
+        };
+        assert!(!check(&pacific(), &pacific()), "no change");
+        assert!(check(&pacific(), &line_islands()), "changed");
+        assert!(!check(&pacific(), &line_islands()), "already alerted - every later check and start");
+        assert!(check(&pacific(), &eastern()), "changed again");
+        assert!(!check(&pacific(), &pacific()), "back to the remembered zone");
+        assert!(check(&pacific(), &eastern()), "a new change");
+        // Accepted (adopt_current_time_zone clears the marker): quiet
+        assert!(!check(&eastern(), &eastern()));
+        // A swap that doesn't go through (database busy) alerts next time
+        assert!(!claim_time_zone_alert(&eastern(), &pacific(), Some(""), |_| false));
+    }
+
+    #[test]
+    fn remembered_zone_survives_storage_and_rejects_edits() {
+        let mut z = newfoundland();
+        z.key = "Odd|Name".into();
+        z.dst_disabled = true;
+        assert_eq!(TimeZone::parse(&z.serialize()), Some(z.clone()));
+        assert_eq!(TimeZone::parse(&pacific().serialize()), Some(pacific()));
+        assert_eq!(TimeZone::parse(""), None);
+        assert_eq!(TimeZone::parse("2|480|0|0|-60|0,11,0,1,2,0,0,0|0,3,0,2,2,0,0,0|X"), None, "unknown version");
+        assert_eq!(TimeZone::parse("1|480|0|0|-60|0,11,0,1,2,0,0|0,3,0,2,2,0,0,0|X"), None, "7 fields");
+        assert_eq!(TimeZone::parse("1|99999|0|0|-60|0,11,0,1,2,0,0,0|0,3,0,2,2,0,0,0|X"), None, "absurd bias");
+        assert_eq!(TimeZone::parse("1|480|2|0|-60|0,11,0,1,2,0,0,0|0,3,0,2,2,0,0,0|X"), None);
+    }
+
+    #[test]
+    fn the_current_zone_reads_and_converts_like_windows() {
+        use windows::Win32::System::SystemInformation::{GetLocalTime, GetSystemTime};
+        let current = current_time_zone().expect("time zone");
+        assert_eq!(TimeZone::parse(&current.serialize()), Some(current.clone()));
+        let (local, now) = unsafe { (GetLocalTime(), GetSystemTime()) };
+        // (Could only differ if the test ran across local midnight.)
+        assert_eq!(current.date_at(&now), systemtime_date(&local));
+    }
+
+    #[test]
+    fn weekdays_from_dates() {
+        assert_eq!(weekday_of_date("1970-01-01"), Some(3), "Thursday");
+        assert_eq!(weekday_of_date("2026-11-15"), Some(6), "Sunday");
+        assert_eq!(weekday_of_date("2026-11-16"), Some(0), "Monday");
+        assert_eq!(weekday_of_date("2024-02-29"), Some(3), "Thursday");
+        assert_eq!(weekday_of_date("garbage"), None);
     }
 
     #[test]

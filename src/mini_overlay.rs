@@ -432,7 +432,11 @@ static LAST_LOCAL_DATE: Mutex<Option<String>> = Mutex::new(None);
 /// countdown/session-active counters for the new day, mirroring what
 /// `main.rs` already does at a fresh startup. `force` re-checks the
 /// authoritative date (and persists the clock anchor) even if the local date
-/// looks unchanged - the accounting tick does this every 30 seconds.
+/// looks unchanged - the accounting tick does this every 30 seconds. That's
+/// also what rolls the day over while the PC is in a time zone other than the
+/// remembered one (see `database::effective_today_date`): the day ends at
+/// midnight in the remembered zone, when the local date doesn't change, so it
+/// rolls over up to 30 seconds after that midnight.
 unsafe fn check_day_rollover(force: bool) {
     let local = database::local_today_date();
     {
@@ -759,8 +763,8 @@ unsafe fn enforce_zero_time() {
 }
 
 /// Every PERIODIC_SAVE_TICKS: save counted time (the save also persists the
-/// clock anchor), and send a clock-tamper alert if one is pending - whether
-/// or not time is currently being counted.
+/// clock anchor), and send a clock-tamper or time-zone alert if one is
+/// pending - whether or not time is currently being counted.
 fn periodic_save() {
     if ACCOUNTING_DIRTY.swap(false, Ordering::SeqCst) {
         database::save_remaining_time(REMAINING_SECONDS.load(Ordering::SeqCst));
@@ -768,6 +772,9 @@ fn periodic_save() {
     }
     if let Some(drift) = database::take_pending_clock_tamper_alert() {
         crate::time_request::notify_clock_tamper(drift);
+    }
+    if let Some((remembered, current)) = database::take_pending_time_zone_alert() {
+        crate::time_request::notify_time_zone_change(&remembered, &current);
     }
 }
 

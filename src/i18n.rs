@@ -586,6 +586,13 @@ fn en(key: &str) -> &'static str {
         "wizard.connect.not_you_again" => "Not your chat? Go Back, then Next, then message the bot again.",
         "tg.getpin.unavailable" => "(could not be read just now - please try again)",
 
+        // ----- Time-zone change alert -----
+        "time_zone.notify.header" => "- the PC's time zone was changed.",
+        "time_zone.notify.old" => "Was:",
+        "time_zone.notify.new" => "Now:",
+        "time_zone.notify.dst_off" => "daylight saving time off",
+        "time_zone.notify.suffix" => "Screen time still follows the old time zone: the day starts at midnight there, so changing the time zone gains or loses no time. If the new time zone is right (for example, you are travelling), open Settings on this PC with the passcode and press Save - that switches to the new time zone.",
+
         // Fallback - return empty string for unknown keys (should not happen in practice)
         _ => "",
     }
@@ -1074,6 +1081,13 @@ fn de(key: &str) -> &'static str {
         "wizard.connect.not_you_again" => "Nicht Ihr Chat? Zurück, dann Weiter, dann dem Bot erneut schreiben.",
         "tg.getpin.unavailable" => "(konnte gerade nicht gelesen werden - bitte erneut versuchen)",
 
+        // ----- Zeitzonenwechsel -----
+        "time_zone.notify.header" => "- die Zeitzone des PCs wurde geändert.",
+        "time_zone.notify.old" => "Vorher:",
+        "time_zone.notify.new" => "Jetzt:",
+        "time_zone.notify.dst_off" => "Sommerzeit aus",
+        "time_zone.notify.suffix" => "Die Bildschirmzeit folgt weiter der alten Zeitzone: Der Tag beginnt um Mitternacht dort, ein Zeitzonenwechsel bringt also keine Zeit und kostet keine. Wenn die neue Zeitzone stimmt (zum Beispiel auf Reisen), öffnen Sie auf diesem PC mit dem Passcode die Einstellungen und klicken Sie auf Speichern - damit gilt die neue Zeitzone.",
+
         // Fallback to English
         _ => en(key),
     }
@@ -1142,6 +1156,18 @@ mod tests {
         }
         for text in [en("settings.error.minutes_range"), de("settings.error.minutes_range")] {
             assert!(text.contains("{min}") && text.contains("{max}"));
+        }
+    }
+
+    #[test]
+    fn time_zone_alert_keys_are_translated() {
+        for key in [
+            "time_zone.notify.header", "time_zone.notify.old", "time_zone.notify.new",
+            "time_zone.notify.dst_off", "time_zone.notify.suffix",
+        ] {
+            assert!(!en(key).is_empty(), "missing English text for {key}");
+            assert!(!de(key).is_empty(), "missing German text for {key}");
+            assert_ne!(en(key), de(key), "German text for {key} is just the English fallback");
         }
     }
 }

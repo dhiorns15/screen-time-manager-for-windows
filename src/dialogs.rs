@@ -1537,6 +1537,10 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                         }
                     }
 
+                    // Saving Settings (behind the passcode) is how a parent
+                    // accepts a time-zone change, as the alert about it says.
+                    crate::database::adopt_current_time_zone();
+
                     let msg = i18n::wide("settings.success.saved");
                     let title = i18n::wide("settings.success");
                     MessageBoxW(hwnd, PCWSTR(msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);

@@ -182,6 +182,32 @@ pub fn notify_session_lock(is_locked: bool, remaining_seconds: i32) {
     }
 }
 
+/// Called once per time-zone change (`database::take_pending_time_zone_alert`):
+/// the day keeps following the remembered zone until a parent saves Settings.
+/// Sent through the watchdog's alert queue, like the passcode lockout alert,
+/// so it isn't lost if the bot hasn't connected yet or this session isn't the
+/// one running it - it's only raised once.
+pub fn notify_time_zone_change(old_zone: &database::TimeZoneLabel, new_zone: &database::TimeZoneLabel) {
+    let describe = |zone: &database::TimeZoneLabel| {
+        if zone.dst_off {
+            format!("{}, {}", zone.name, i18n::t("time_zone.notify.dst_off"))
+        } else {
+            zone.name.clone()
+        }
+    };
+    let text = format!(
+        "🌐 {} {}\n{} {}\n{} {}\n{}",
+        current_windows_username(),
+        i18n::t("time_zone.notify.header"),
+        i18n::t("time_zone.notify.old"),
+        describe(old_zone),
+        i18n::t("time_zone.notify.new"),
+        describe(new_zone),
+        i18n::t("time_zone.notify.suffix"),
+    );
+    crate::watchdog::raise_alert(&text);
+}
+
 /// Called when remaining time crosses one of the configured warning
 /// thresholds (the same ones that trigger the kid-facing overlay), so the
 /// parent gets the same heads-up without needing to be looking at `status`.
