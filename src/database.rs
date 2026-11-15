@@ -51,7 +51,20 @@ pub fn get_database_path() -> PathBuf {
 pub fn init_database() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = get_database_path();
     let conn = Connection::open(&db_path)?;
+    install_settings_connection(conn)
+}
 
+/// Create the settings table and default rows on `conn`, then make it the
+/// per-account connection. Split out of `init_database` so the startup
+/// recovery (see `init_database_with_recovery`) can fall back to an
+/// in-memory database with the same defaults.
+fn install_settings_connection(conn: Connection) -> Result<(), Box<dyn std::error::Error>> {
+    prepare_settings_connection(&conn)?;
+    *DB_CONNECTION.lock().unwrap() = Some(conn);
+    Ok(())
+}
+
+fn prepare_settings_connection(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -111,7 +124,6 @@ pub fn init_database() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    *DB_CONNECTION.lock().unwrap() = Some(conn);
     Ok(())
 }
 
@@ -318,7 +330,19 @@ fn session_ending_recently() -> bool {
     std::fs::read_to_string(session_ending_marker_path())
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
-        .is_some_and(|written_at| wall_clock_now_secs() - written_at < SESSION_ENDING_MARKER_MAX_AGE_SECS)
+        .is_some_and(|written_at| session_ending_marker_is_recent(wall_clock_now_secs(), written_at))
+}
+
+/// How far in the future a `session_ending` timestamp may be and still
+/// count: only enough to absorb a small clock correction between writing and
+/// reading it. A marker further ahead than this used to be accepted (a
+/// negative age passed the age check), so a hand-written future timestamp
+/// could suppress the watchdog indefinitely.
+const SESSION_ENDING_MARKER_MAX_SKEW_SECS: i64 = 30;
+
+fn session_ending_marker_is_recent(now: i64, written_at: i64) -> bool {
+    let age = now - written_at;
+    (-SESSION_ENDING_MARKER_MAX_SKEW_SECS..SESSION_ENDING_MARKER_MAX_AGE_SECS).contains(&age)
 }
 
 /// Whether the app's most recent stop was either the passcode-protected Quit
@@ -869,9 +893,25 @@ pub fn get_current_weekday() -> u32 {
 
 /// Get lock screen timeout in seconds (time before shutdown when lock screen is active)
 pub fn get_lock_screen_timeout() -> i32 {
-    get_setting("lock_screen_timeout")
+    let secs = get_setting("lock_screen_timeout")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(600) // 10 minutes default
+        .unwrap_or(600); // 10 minutes default
+    clamp_lock_screen_timeout(secs)
+}
+
+/// The shortest lock-screen shutdown timeout, in seconds. Settings used to
+/// accept 0 minutes, which shut the PC down a second after every block
+/// (including at each logon with no time left); a value below a minute that
+/// is already stored is read as one minute. Negative values (never written
+/// by the app) are left alone.
+pub const MIN_LOCK_SCREEN_TIMEOUT_SECS: i32 = 60;
+
+fn clamp_lock_screen_timeout(secs: i32) -> i32 {
+    if (0..MIN_LOCK_SCREEN_TIMEOUT_SECS).contains(&secs) {
+        MIN_LOCK_SCREEN_TIMEOUT_SECS
+    } else {
+        secs
+    }
 }
 
 // ============================================================================
@@ -1092,6 +1132,191 @@ pub fn set_discord_config(token: &str, channel_id: &str, admin_user_id: &str, en
 }
 
 // ============================================================================
+// Passcode reading that fails closed, and startup database recovery
+// ============================================================================
+
+/// Whether `init_shared_database` has opened the shared database in this
+/// process.
+pub fn shared_database_is_open() -> bool {
+    SHARED_DB_CONNECTION.lock().is_ok_and(|g| g.is_some())
+}
+
+/// The passcode a fresh install starts with (see `init_database`'s defaults).
+pub const DEFAULT_PASSCODE: &str = "0000";
+
+/// What `read_passcode` found.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PasscodeRead {
+    /// A passcode is stored.
+    Set(String),
+    /// Neither database has a (non-blank) passcode row, so the default
+    /// `DEFAULT_PASSCODE` applies - the same assumption Settings has always
+    /// made when checking the current passcode.
+    NotConfigured,
+    /// A database could not be queried (busy beyond the 5-second busy
+    /// timeout, I/O error, not open...). Callers must refuse, not allow.
+    Unreadable,
+}
+
+/// Read the passcode, telling "nothing stored" apart from "could not read".
+/// Unlike `get_passcode` (which returns `None` for both, and which the
+/// passcode dialog used to treat as "no passcode, let them in"), a query
+/// error here is reported as `Unreadable`. The shared database wins when it
+/// has the row; when it doesn't (e.g. its one-time migration could not
+/// write), the per-account value is used, as `init_shared_database`'s
+/// migration intends.
+pub fn read_passcode() -> PasscodeRead {
+    use rusqlite::OptionalExtension;
+
+    fn query(conn: &Connection) -> rusqlite::Result<Option<String>> {
+        conn.query_row("SELECT value FROM settings WHERE key = 'passcode'", [], |row| row.get(0))
+            .optional()
+    }
+    fn classify(result: rusqlite::Result<Option<String>>) -> Option<PasscodeRead> {
+        match result {
+            Ok(Some(code)) if !code.trim().is_empty() => Some(PasscodeRead::Set(code)),
+            Ok(_) => None,
+            Err(_) => Some(PasscodeRead::Unreadable),
+        }
+    }
+
+    match SHARED_DB_CONNECTION.lock() {
+        Ok(guard) => {
+            if let Some(conn) = guard.as_ref() {
+                if let Some(found) = classify(query(conn)) {
+                    return found;
+                }
+            }
+        }
+        Err(_) => return PasscodeRead::Unreadable,
+    }
+
+    let Ok(guard) = DB_CONNECTION.lock() else { return PasscodeRead::Unreadable };
+    let Some(conn) = guard.as_ref() else { return PasscodeRead::Unreadable };
+    classify(query(conn)).unwrap_or(PasscodeRead::NotConfigured)
+}
+
+/// The passcode currently in force, or `None` if it could not be read (in
+/// which case nothing may be unlocked with it).
+pub fn effective_passcode() -> Option<String> {
+    match read_passcode() {
+        PasscodeRead::Set(code) => Some(code),
+        PasscodeRead::NotConfigured => Some(DEFAULT_PASSCODE.to_string()),
+        PasscodeRead::Unreadable => None,
+    }
+}
+
+/// Whether the passcode in force is still the factory default, for the
+/// warning in Settings. `false` if it could not be read.
+pub fn passcode_is_default() -> bool {
+    effective_passcode().as_deref() == Some(DEFAULT_PASSCODE)
+}
+
+/// Check an entered code without any attempt limiting, failing closed:
+/// `Some(true)` if it is the passcode or (when enabled) today's rotating
+/// PIN, `Some(false)` if not, `None` if the passcode could not be read and
+/// the rotating PIN did not match either. Attempt limiting lives in
+/// `passcode_guard`, which is what UI code should call.
+pub fn check_passcode(entered: &str) -> Option<bool> {
+    if is_rotating_pin_enabled() && entered == get_rotating_pin() {
+        return Some(true);
+    }
+    effective_passcode().map(|code| entered == code)
+}
+
+/// What `init_database_with_recovery` had to do to get a per-account
+/// database open.
+pub enum DatabaseStartup {
+    /// Opened normally (possibly after a retry).
+    Opened,
+    /// The file was unreadable as a database; it was renamed to `moved_to`
+    /// and a fresh one with default settings created.
+    Recreated { moved_to: PathBuf, error: String },
+    /// The file could not be opened and was left alone (e.g. locked by
+    /// another program, or a permissions/I/O problem); the app runs on an
+    /// in-memory database with default settings that is lost on exit.
+    Temporary { error: String },
+    /// Not even an in-memory database could be set up.
+    Failed { error: String },
+}
+
+/// Open the per-account database for the app's startup without ever
+/// leaving it stuck: a corrupt file is moved aside and recreated; any other
+/// failure is retried briefly and then replaced by a temporary in-memory
+/// database. Only files SQLite itself reports as corrupt or not a database
+/// are moved aside, so a file that is merely locked by another program
+/// can't be used to wipe the parent's settings.
+pub fn init_database_with_recovery() -> DatabaseStartup {
+    const RETRIES: u32 = 2;
+
+    let first_error = match init_database() {
+        Ok(()) => return DatabaseStartup::Opened,
+        Err(e) => e,
+    };
+
+    if is_corruption_error(first_error.as_ref()) {
+        let db_path = get_database_path();
+        return match move_database_aside(&db_path) {
+            Ok(moved_to) => match init_database() {
+                Ok(()) => DatabaseStartup::Recreated { moved_to, error: first_error.to_string() },
+                Err(e) => start_temporary_database(e.to_string()),
+            },
+            Err(e) => start_temporary_database(format!("{first_error}; could not move it aside: {e}")),
+        };
+    }
+
+    let mut last_error = first_error;
+    for _ in 0..RETRIES {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        match init_database() {
+            Ok(()) => return DatabaseStartup::Opened,
+            Err(e) => last_error = e,
+        }
+    }
+    start_temporary_database(last_error.to_string())
+}
+
+fn start_temporary_database(error: String) -> DatabaseStartup {
+    let installed = Connection::open_in_memory()
+        .map_err(|e| e.into())
+        .and_then(install_settings_connection);
+    match installed {
+        Ok(()) => DatabaseStartup::Temporary { error },
+        Err(e) => DatabaseStartup::Failed { error: format!("{error}; in-memory fallback: {e}") },
+    }
+}
+
+/// Whether SQLite reported the file as damaged or not a database at all.
+fn is_corruption_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    use rusqlite::ErrorCode;
+    matches!(
+        error.downcast_ref::<rusqlite::Error>(),
+        Some(rusqlite::Error::SqliteFailure(e, _))
+            if matches!(e.code, ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase)
+    )
+}
+
+/// Rename `db_path` (and any journal/WAL files next to it) to
+/// `<name>.broken-<unix time>`, keeping it for inspection. Returns the new
+/// path of the main file.
+fn move_database_aside(db_path: &std::path::Path) -> std::io::Result<PathBuf> {
+    let suffix = format!(".broken-{}", wall_clock_now_secs());
+    let mut moved_to = db_path.as_os_str().to_owned();
+    moved_to.push(&suffix);
+    let moved_to = PathBuf::from(moved_to);
+    std::fs::rename(db_path, &moved_to)?;
+    for extra in ["-journal", "-wal", "-shm"] {
+        let mut from = db_path.as_os_str().to_owned();
+        from.push(extra);
+        let mut to = db_path.as_os_str().to_owned();
+        to.push(extra);
+        to.push(&suffix);
+        let _ = std::fs::rename(PathBuf::from(from), PathBuf::from(to));
+    }
+    Ok(moved_to)
+}
+
+// ============================================================================
 // Time-zone tamper detection, local date, and in-flight pause persistence
 // ============================================================================
 
@@ -1304,5 +1529,52 @@ mod tests {
         assert_eq!(swap_setting_in(&mut conn, "k", "1.1.0").unwrap(), Some(Some("1.0.0".into())));
         let stored: String = conn.query_row("SELECT value FROM settings WHERE key = 'k'", [], |r| r.get(0)).unwrap();
         assert_eq!(stored, "1.1.0");
+    }
+
+    #[test]
+    fn session_ending_marker_rejects_future_and_old_timestamps() {
+        let now = 1_000_000;
+        assert!(session_ending_marker_is_recent(now, now));
+        assert!(session_ending_marker_is_recent(now, now - 119));
+        assert!(!session_ending_marker_is_recent(now, now - 120));
+        // A small clock correction is tolerated...
+        assert!(session_ending_marker_is_recent(now, now + 30));
+        // ...a timestamp from the future is not (it used to count forever).
+        assert!(!session_ending_marker_is_recent(now, now + 31));
+        assert!(!session_ending_marker_is_recent(now, now + 10 * 365 * 86_400));
+    }
+
+    #[test]
+    fn lock_screen_timeout_is_at_least_a_minute() {
+        assert_eq!(clamp_lock_screen_timeout(0), 60);
+        assert_eq!(clamp_lock_screen_timeout(59), 60);
+        assert_eq!(clamp_lock_screen_timeout(60), 60);
+        assert_eq!(clamp_lock_screen_timeout(600), 600);
+        assert_eq!(clamp_lock_screen_timeout(-1), -1);
+    }
+
+    #[test]
+    fn garbage_file_is_reported_as_corrupt_but_a_good_one_opens() {
+        let dir = std::env::temp_dir().join(format!("stm-db-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let garbage = dir.join("garbage.db");
+        std::fs::write(&garbage, vec![0x5Au8; 8192]).unwrap();
+        let conn = Connection::open(&garbage).unwrap();
+        let err = prepare_settings_connection(&conn).unwrap_err();
+        assert!(is_corruption_error(err.as_ref()), "{err}");
+        drop(conn);
+
+        let moved = move_database_aside(&garbage).unwrap();
+        assert!(!garbage.exists());
+        assert!(moved.exists());
+
+        let good = Connection::open(dir.join("good.db")).unwrap();
+        prepare_settings_connection(&good).unwrap();
+        let code: String = good.query_row("SELECT value FROM settings WHERE key = 'passcode'", [], |r| r.get(0)).unwrap();
+        assert_eq!(code, DEFAULT_PASSCODE);
+        drop(good);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

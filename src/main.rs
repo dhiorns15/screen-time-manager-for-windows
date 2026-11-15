@@ -39,7 +39,7 @@ use windows::{
 
 use blocking::{create_blocking_overlay, create_secondary_overlays, register_blocking_class, REMAINING_SECONDS};
 use constants::MUTEX_NAME;
-use database::{init_database, load_remaining_time, get_current_weekday, get_daily_limit};
+use database::{load_remaining_time, get_current_weekday, get_daily_limit};
 use mini_overlay::{create_mini_overlay, register_mini_overlay_class, show_mini_overlay};
 use overlay::{create_overlay_window, register_overlay_class};
 use tray::{add_tray_icon, remove_tray_icon, window_proc};
@@ -101,6 +101,11 @@ fn main() {
             return;
         }
 
+        // First heartbeat as soon as the mutex is ours, so the watchdog
+        // never sees the mutex held with only a previous session's
+        // heartbeat; the timer set up below keeps it fresh.
+        watchdog::write_heartbeat();
+
         // A real start of the app - clear any leftover intentional-quit
         // marker so the watchdog task's suppression only ever covers the gap
         // between a sanctioned Quit and this moment (see database.rs).
@@ -110,17 +115,16 @@ fn main() {
         // apart from "restarted since, then stopped again" (see watchdog.rs).
         database::record_app_started();
 
-        // Initialize database
-        if let Err(e) = init_database() {
-            let msg: Vec<u16> = format!("Failed to initialize database: {}\0", e)
-                .encode_utf16()
-                .collect();
-            MessageBoxW(
-                None,
-                PCWSTR(msg.as_ptr()),
-                w!("Database Error"),
-                MB_OK | MB_ICONERROR,
-            );
+        // Initialize database. Never stops in a message box: that used to
+        // leave the app holding the single-instance mutex while doing
+        // nothing, which the watchdog took for a healthy app. A corrupt file
+        // is moved aside and recreated; anything else falls back to a
+        // temporary in-memory database; the admin is told either way (below,
+        // once the bot settings are readable).
+        let db_startup = database::init_database_with_recovery();
+        if let database::DatabaseStartup::Failed { error } = &db_startup {
+            // Exiting releases the mutex, so the watchdog notices and alerts.
+            eprintln!("[Main] Could not set up any settings database: {error}");
             return;
         }
 
@@ -128,6 +132,8 @@ fn main() {
         // per-user mirrored stats); safe to fail (e.g. missing permissions),
         // falls back to per-account storage
         database::init_shared_database();
+
+        report_database_recovery(&db_startup);
 
         // Housekeeping: drop per-day usage/enforcement rows older than the
         // retention window now that both databases are open (prunes the
@@ -181,6 +187,15 @@ fn main() {
         // the whole app down.
         if let Err(e) = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) {
             eprintln!("[Main] Failed to register for session lock notifications: {e}");
+        }
+
+        // Keep the watchdog's heartbeat fresh from this (UI) thread, so it
+        // stops if the UI thread hangs or the process is suspended. The
+        // timer calls heartbeat_timer_proc directly from any message loop
+        // on this thread (including the dialogs' nested ones), so
+        // tray::window_proc doesn't see it.
+        if SetTimer(hwnd, HEARTBEAT_TIMER_ID, watchdog::HEARTBEAT_INTERVAL_MS, Some(heartbeat_timer_proc)) == 0 {
+            eprintln!("[Main] Failed to start the heartbeat timer");
         }
 
         // Create the overlay windows (initially hidden)
@@ -247,6 +262,38 @@ fn main() {
         // Cleanup: remove the tray icon
         remove_tray_icon();
     }
+}
+
+/// Timer id of the heartbeat timer on the main window ("HB").
+const HEARTBEAT_TIMER_ID: usize = 0x4842;
+
+unsafe extern "system" fn heartbeat_timer_proc(_hwnd: windows::Win32::Foundation::HWND, _msg: u32, _id: usize, _time: u32) {
+    watchdog::write_heartbeat();
+}
+
+/// Tell the admin if the per-account database had to be recreated or
+/// replaced by a temporary one (see `database::init_database_with_recovery`).
+fn report_database_recovery(startup: &database::DatabaseStartup) {
+    let (error, outcome) = match startup {
+        database::DatabaseStartup::Recreated { moved_to, error } => {
+            eprintln!("[Main] Settings database was unreadable ({error}); moved to {}", moved_to.display());
+            (error, i18n::t("db.alert.recreated"))
+        }
+        database::DatabaseStartup::Temporary { error } => {
+            eprintln!("[Main] Settings database could not be opened ({error}); using a temporary one");
+            (error, i18n::t("db.alert.temporary"))
+        }
+        _ => return,
+    };
+    let text = format!(
+        "⚠️ {} {} {} ({})\n{}",
+        i18n::t("db.alert.prefix"),
+        remote_commands::current_windows_username(),
+        i18n::t("db.alert.cannot_open"),
+        error,
+        outcome,
+    );
+    watchdog::raise_alert(&text);
 }
 
 /// Ensures only one instance of the application is running

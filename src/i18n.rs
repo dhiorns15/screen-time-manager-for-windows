@@ -521,6 +521,49 @@ fn en(key: &str) -> &'static str {
         "dc.getpin.sent_dm" => "Sent today's code to you by direct message.",
         "dc.getpin.dm_failed" => "Couldn't send you a direct message, so the code isn't posted here. Allow direct messages from members of this server in your Discord privacy settings, then try again.",
 
+        // ----- Passcode prompt: action, attempt limiting, read failure -----
+        "passcode.action.stats" => "Enter the code to view today's statistics",
+        "passcode.action.settings" => "Enter the code to open Settings",
+        "passcode.action.extend_15" => "Enter the code to add 15 minutes",
+        "passcode.action.extend_45" => "Enter the code to add 45 minutes",
+        "passcode.action.quit" => "Enter the code to quit Screen Time Manager",
+        "passcode.locked" => "Too many wrong codes. Try again in",
+        "passcode.unavailable" => "Could not read the passcode - try again",
+        "passcode_guard.notify.header" => "entered a wrong passcode this many times in a row:",
+        "passcode_guard.notify.suffix" => "Passcode entry is now locked for a while after each further wrong code. If this wasn't you, someone may be guessing the passcode.",
+
+        // ----- Settings: default passcode, lock screen, pause -----
+        "settings.passcode_default_warning" => "Passcode is still the default 0000 - please change it!",
+        "settings.shutdown_timeout_hint" => "minutes, at least 1",
+        "settings.error.shutdown_min" => "The shutdown timeout must be at least 1 minute.",
+        "settings.pause" => "Pause Timer",
+        "settings.pause_budget" => "Daily pause (min):",
+        "settings.pause_budget_hint" => "0 = no pausing",
+        "settings.pause_max" => "Longest pause (min):",
+        "settings.pause_max_hint" => "at least 1",
+        "settings.pause_cooldown" => "Pause cooldown (min):",
+        "settings.error.pause_max_min" => "The longest pause must be at least 1 minute (set the daily pause to 0 to turn pausing off).",
+
+        // ----- Telegram wizard: which chat was found -----
+        "wizard.connect.chat" => "Chat:",
+        "wizard.connect.id" => "ID",
+        "wizard.connect.not_you" => "Not your chat? Go Back, message the bot yourself, then Next.",
+
+        // ----- Watchdog: unresponsive app, late delivery -----
+        "watchdog.hung.prefix" => "Screen Time Manager stopped responding on",
+        "watchdog.hung.restarted" => "and was restarted.",
+        "watchdog.hung.restart_failed" => "and could not be restarted - please check on it.",
+        "watchdog.hung.suffix" => "It may have been suspended or frozen to stop the timer.",
+        "watchdog.blocked.prefix" => "Screen Time Manager is not working properly on",
+        "watchdog.blocked.suffix" => "- another program is holding its single-instance lock, so it can't be restarted. Please check the PC.",
+        "watchdog.alert.delayed" => "Delivered late - this happened at",
+
+        // ----- Settings database recovery at startup -----
+        "db.alert.prefix" => "Screen Time Manager on",
+        "db.alert.cannot_open" => "could not open its settings database",
+        "db.alert.recreated" => "The damaged file was set aside and a new one with default settings was created. Please check the time limits and other settings for this account.",
+        "db.alert.temporary" => "It is running with default settings for now, and changes won't be kept. Please check the PC.",
+
         // Fallback - return empty string for unknown keys (should not happen in practice)
         _ => "",
     }
@@ -944,7 +987,83 @@ fn de(key: &str) -> &'static str {
         "dc.getpin.sent_dm" => "Der heutige Code wurde Ihnen per Direktnachricht geschickt.",
         "dc.getpin.dm_failed" => "Direktnachricht konnte nicht gesendet werden, daher wird der Code hier nicht angezeigt. Erlauben Sie in Ihren Discord-Datenschutzeinstellungen Direktnachrichten von Mitgliedern dieses Servers und versuchen Sie es erneut.",
 
+        // ----- Code-Abfrage: Aktion, Versuchsbegrenzung, Lesefehler -----
+        "passcode.action.stats" => "Code eingeben, um die Tagesstatistik zu öffnen",
+        "passcode.action.settings" => "Code eingeben, um die Einstellungen zu öffnen",
+        "passcode.action.extend_15" => "Code eingeben, um 15 Minuten hinzuzufügen",
+        "passcode.action.extend_45" => "Code eingeben, um 45 Minuten hinzuzufügen",
+        "passcode.action.quit" => "Code eingeben, um den Bildschirmzeit Manager zu beenden",
+        "passcode.locked" => "Zu viele falsche Codes. Erneut versuchen in",
+        "passcode.unavailable" => "Code konnte nicht gelesen werden - bitte erneut versuchen",
+        "passcode_guard.notify.header" => "hat so oft hintereinander einen falschen Code eingegeben:",
+        "passcode_guard.notify.suffix" => "Die Code-Eingabe wird nach jedem weiteren falschen Code eine Zeit lang gesperrt. Wenn Sie das nicht waren, versucht vielleicht jemand, den Code zu erraten.",
+
+        // ----- Einstellungen: Standard-Code, Bildschirmsperre, Pause -----
+        "settings.passcode_default_warning" => "Der Code ist noch der Standard 0000 - bitte ändern!",
+        "settings.shutdown_timeout_hint" => "Minuten, mind. 1",
+        "settings.error.shutdown_min" => "Die Abschaltzeit muss mindestens 1 Minute betragen.",
+        "settings.pause" => "Pausen",
+        "settings.pause_budget" => "Pause pro Tag (Min):",
+        "settings.pause_budget_hint" => "0 = keine Pausen",
+        "settings.pause_max" => "Längste Pause (Min):",
+        "settings.pause_max_hint" => "mindestens 1",
+        "settings.pause_cooldown" => "Pausenabstand (Min):",
+        "settings.error.pause_max_min" => "Die längste Pause muss mindestens 1 Minute betragen (Pause pro Tag auf 0 setzen, um Pausen auszuschalten).",
+
+        // ----- Telegram-Assistent: gefundener Chat -----
+        "wizard.connect.chat" => "Chat:",
+        "wizard.connect.id" => "ID",
+        "wizard.connect.not_you" => "Nicht Ihr Chat? Zurück, dem Bot selbst schreiben, dann Weiter.",
+
+        // ----- Watchdog: App reagiert nicht, verspätete Zustellung -----
+        "watchdog.hung.prefix" => "Bildschirmzeit Manager reagierte nicht mehr auf",
+        "watchdog.hung.restarted" => "und wurde neu gestartet.",
+        "watchdog.hung.restart_failed" => "und konnte nicht neu gestartet werden - bitte überprüfen.",
+        "watchdog.hung.suffix" => "Möglicherweise wurde er angehalten oder eingefroren, um den Timer zu stoppen.",
+        "watchdog.blocked.prefix" => "Bildschirmzeit Manager funktioniert nicht richtig auf",
+        "watchdog.blocked.suffix" => "- ein anderes Programm hält seine Einzelinstanz-Sperre, daher kann er nicht neu gestartet werden. Bitte den PC überprüfen.",
+        "watchdog.alert.delayed" => "Verspätet zugestellt - passiert um",
+
+        // ----- Einstellungsdatenbank beim Start -----
+        "db.alert.prefix" => "Bildschirmzeit Manager auf",
+        "db.alert.cannot_open" => "konnte seine Einstellungsdatenbank nicht öffnen",
+        "db.alert.recreated" => "Die beschädigte Datei wurde beiseitegelegt und eine neue mit Standardeinstellungen angelegt. Bitte prüfen Sie die Zeitlimits und anderen Einstellungen dieses Kontos.",
+        "db.alert.temporary" => "Er läuft vorerst mit Standardeinstellungen, Änderungen werden nicht gespeichert. Bitte den PC überprüfen.",
+
         // Fallback to English
         _ => en(key),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Keys added for the passcode/dialog/watchdog fixes: every one must
+    /// exist in English and have its own German text (a missing German key
+    /// silently falls back to English).
+    #[test]
+    fn new_keys_are_translated() {
+        let same_in_both = ["wizard.connect.chat", "wizard.connect.id"];
+        let keys = [
+            "passcode.action.stats", "passcode.action.settings", "passcode.action.extend_15",
+            "passcode.action.extend_45", "passcode.action.quit", "passcode.locked",
+            "passcode.unavailable", "passcode_guard.notify.header", "passcode_guard.notify.suffix",
+            "settings.passcode_default_warning", "settings.shutdown_timeout_hint",
+            "settings.error.shutdown_min", "settings.pause", "settings.pause_budget",
+            "settings.pause_budget_hint", "settings.pause_max", "settings.pause_max_hint",
+            "settings.pause_cooldown", "settings.error.pause_max_min", "wizard.connect.chat",
+            "wizard.connect.id", "wizard.connect.not_you", "watchdog.hung.prefix",
+            "watchdog.hung.restarted", "watchdog.hung.restart_failed", "watchdog.hung.suffix",
+            "watchdog.blocked.prefix", "watchdog.blocked.suffix", "watchdog.alert.delayed",
+            "db.alert.prefix", "db.alert.cannot_open", "db.alert.recreated", "db.alert.temporary",
+        ];
+        for key in keys {
+            assert!(!en(key).is_empty(), "missing English text for {key}");
+            assert!(!de(key).is_empty(), "missing German text for {key}");
+            if !same_in_both.contains(&key) {
+                assert_ne!(en(key), de(key), "German text for {key} is just the English fallback");
+            }
+        }
     }
 }
