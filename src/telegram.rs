@@ -1,7 +1,6 @@
 //! Telegram bot module for Screen Time Manager
 //! Provides remote monitoring and control via Telegram commands
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use teloxide::prelude::*;
 use teloxide::error_handlers::LoggingErrorHandler;
@@ -13,18 +12,15 @@ use crate::i18n;
 use crate::remote_commands::{
     cmd_extend, cmd_getpin, cmd_history, cmd_lock, cmd_msg, cmd_pause, cmd_reduce, cmd_reset,
     cmd_resume, cmd_rotatingpin, cmd_setlimit, cmd_setmessage, cmd_setpin, cmd_status, cmd_time,
-    cmd_unlock, cmd_update, cmd_weekly, WeeklyMarkup,
+    cmd_unlock, cmd_update, cmd_weekly, BotLifecycle, StartAction, WeeklyMarkup,
 };
 use crate::time_request;
 
-/// Shutdown signal for graceful termination
-pub static BOT_SHUTDOWN: AtomicBool = AtomicBool::new(false);
-
-/// Whether a bot thread is currently running (or starting up) - guards
-/// start_bot_thread/stop_bot_thread so repeated calls (e.g. from the
-/// per-second active-session check in session.rs) are cheap no-ops once
+/// Whether a bot thread is running, whether it's been told to stop, and
+/// whether a start is queued behind a stop that's still in progress - see
+/// `BotLifecycle`. Makes start_bot_thread/stop_bot_thread cheap no-ops once
 /// already in the desired state.
-static BOT_RUNNING: AtomicBool = AtomicBool::new(false);
+static LIFECYCLE: BotLifecycle = BotLifecycle::new();
 
 /// Bot instance for sending notifications. A Mutex rather than a OnceLock
 /// because the bot can be stopped and restarted within the same process -
@@ -33,11 +29,11 @@ static BOT_RUNNING: AtomicBool = AtomicBool::new(false);
 static BOT_INSTANCE: Mutex<Option<Bot>> = Mutex::new(None);
 
 /// Handle for the most recently spawned bot thread, if any. `start_bot_thread`
-/// joins this before spawning a new one (see there for why) - BOT_SHUTDOWN is
-/// a single flag shared across every generation of the bot thread, so without
-/// this join, a new generation could reset it to `false` while the *previous*
-/// generation's shutdown-watcher task is still mid-teardown, leaving two
-/// overlapping bot instances alive at once.
+/// joins this before spawning a new one (see there for why) - the shutdown
+/// flag is a single flag shared across every generation of the bot thread,
+/// so without this join, a new generation could reset it to `false` while the
+/// *previous* generation's shutdown-watcher task is still mid-teardown,
+/// leaving two overlapping bot instances alive at once.
 static BOT_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 
 /// Admin chat ID for notifications. A Mutex rather than a OnceLock for the
@@ -116,67 +112,87 @@ fn light_runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread().enable_all().build()
 }
 
-/// Start the Telegram bot in a background thread. A no-op if a bot thread is
-/// already running/starting - safe to call repeatedly (e.g. from the
-/// per-second active-session check in session.rs).
-pub fn start_bot_thread() {
-    if BOT_RUNNING.swap(true, Ordering::SeqCst) {
-        return;
-    }
-
+/// Read the bot settings for a new generation: the token, if the bot is
+/// enabled and has one. Also records the admin chat ID for notifications -
+/// always overwritten, in case it changed in Settings since the last time a
+/// bot generation started.
+fn load_settings() -> Option<(String, Option<i64>)> {
     let config = database::get_telegram_config();
 
     if !config.enabled {
         eprintln!("[Telegram] Bot is disabled in settings");
-        BOT_RUNNING.store(false, Ordering::SeqCst);
-        return;
+        return None;
     }
 
     let Some(token) = config.bot_token else {
         eprintln!("[Telegram] Bot enabled but no token configured");
-        BOT_RUNNING.store(false, Ordering::SeqCst);
-        return;
+        return None;
     };
 
     if token.is_empty() {
         eprintln!("[Telegram] Bot token is empty");
-        BOT_RUNNING.store(false, Ordering::SeqCst);
-        return;
+        return None;
     }
 
-    let admin_chat_id = config.admin_chat_id;
+    *ADMIN_CHAT_ID.lock().unwrap() = config.admin_chat_id;
+    Some((token, config.admin_chat_id))
+}
 
-    // Store admin chat ID for notifications - always overwrite, in case it
-    // changed in Settings since the last time a bot generation started.
-    *ADMIN_CHAT_ID.lock().unwrap() = admin_chat_id;
+/// Start the Telegram bot in a background thread. A no-op if a bot thread is
+/// already running/starting - safe to call repeatedly (e.g. from the
+/// per-second active-session check in session.rs). If the previous bot is
+/// still shutting down, the start is queued and that bot's thread starts a
+/// fresh one as soon as it has finished (see `BotLifecycle`).
+pub fn start_bot_thread() {
+    match LIFECYCLE.request_start() {
+        StartAction::Spawn => {}
+        StartAction::AlreadyRunning => return,
+        StartAction::Queued => {
+            eprintln!("[Telegram] Previous bot still stopping - will restart once it has");
+            return;
+        }
+    }
+
+    let Some((token, admin_chat_id)) = load_settings() else {
+        LIFECYCLE.cancel_start();
+        return;
+    };
 
     // Wait for the previous generation's thread to fully exit before
-    // resetting BOT_SHUTDOWN and spawning a new one - see BOT_THREAD.
-    // BOT_RUNNING having just gone false->true above already means no other
-    // caller can be in this function concurrently, so this handle (if any)
-    // is exactly the generation we need to wait out.
+    // spawning a new one - see BOT_THREAD. `Spawn` above already means no
+    // other caller can be in this function concurrently and the previous
+    // thread has finished its last generation, so this join is short.
     if let Some(handle) = BOT_THREAD.lock().unwrap().take() {
         let _ = handle.join();
     }
 
-    BOT_SHUTDOWN.store(false, Ordering::SeqCst);
-
     let handle = std::thread::spawn(move || {
-        // Unlike a one-shot startup failure, this runs on every bot-thread
-        // generation (each Fast-User-Switching hand-off spawns a fresh one -
-        // see session.rs) - panicking here would be the exact mistake
-        // add_tray_icon used to make, just with a resource-exhaustion
-        // trigger instead of a shell-not-ready one. BOT_INSTANCE/BOT_RUNNING
-        // still need resetting on failure so a bad runtime creation can't
-        // wedge them true/Some forever and block every later restart.
-        match light_runtime() {
-            Ok(rt) => rt.block_on(async {
-                run_bot(token, admin_chat_id).await;
-            }),
-            Err(e) => eprintln!("[Telegram] Failed to create tokio runtime: {e}"),
+        let (mut token, mut admin_chat_id) = (token, admin_chat_id);
+        loop {
+            // Unlike a one-shot startup failure, this runs on every bot-thread
+            // generation (each Fast-User-Switching hand-off spawns a fresh one -
+            // see session.rs) - panicking here would be the exact mistake
+            // add_tray_icon used to make, just with a resource-exhaustion
+            // trigger instead of a shell-not-ready one. BOT_INSTANCE and the
+            // lifecycle still need resetting on failure so a bad runtime
+            // creation can't wedge them forever and block every later restart.
+            match light_runtime() {
+                Ok(rt) => rt.block_on(run_bot(token, admin_chat_id)),
+                Err(e) => eprintln!("[Telegram] Failed to create tokio runtime: {e}"),
+            }
+            *BOT_INSTANCE.lock().unwrap() = None;
+
+            // A start that arrived while this generation was stopping runs
+            // now, on this same thread, so it can't overlap the old one.
+            (token, admin_chat_id) = loop {
+                if !LIFECYCLE.finish_generation() {
+                    return;
+                }
+                if let Some(settings) = load_settings() {
+                    break settings;
+                }
+            };
         }
-        *BOT_INSTANCE.lock().unwrap() = None;
-        BOT_RUNNING.store(false, Ordering::SeqCst);
     });
     *BOT_THREAD.lock().unwrap() = Some(handle);
 }
@@ -186,9 +202,7 @@ pub fn start_bot_thread() {
 /// notification: it's used for routine active-session handoffs (see
 /// session.rs), not an actual app shutdown.
 pub fn stop_bot_thread() {
-    if BOT_RUNNING.load(Ordering::SeqCst) {
-        BOT_SHUTDOWN.store(true, Ordering::SeqCst);
-    }
+    LIFECYCLE.request_stop();
 }
 
 /// Proactively push a message to the configured admin chat, outside of any
@@ -218,7 +232,7 @@ pub fn can_notify() -> bool {
 
 /// Signal the bot to shut down gracefully
 pub fn signal_shutdown() {
-    BOT_SHUTDOWN.store(true, Ordering::SeqCst);
+    LIFECYCLE.request_shutdown();
 
     // Send shutdown notification if possible
     let bot = BOT_INSTANCE.lock().unwrap().clone();
@@ -312,9 +326,7 @@ async fn run_bot(token: String, admin_chat_id: Option<i64>) {
 
     // Spawn a task to monitor shutdown signal
     tokio::spawn(async move {
-        while !BOT_SHUTDOWN.load(Ordering::SeqCst) {
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
+        LIFECYCLE.wait_for_shutdown().await;
         shutdown_token.shutdown().ok();
     });
 
@@ -425,4 +437,3 @@ async fn handle_command(
     }
     Ok(())
 }
-

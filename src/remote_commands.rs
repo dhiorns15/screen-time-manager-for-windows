@@ -1,7 +1,9 @@
 //! Platform-agnostic remote command implementations
 //! Shared by both the Telegram and Discord bot integrations
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use crate::blocking;
 use crate::database;
@@ -531,6 +533,134 @@ pub fn format_pause_reason(reason: mini_overlay::PauseBlockedReason) -> String {
     }
 }
 
+// ============================================================================
+// Bot connection lifecycle, shared by telegram.rs and discord.rs
+// ============================================================================
+
+/// What `BotLifecycle::request_start` decided.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StartAction {
+    /// Nothing is running: the caller should spawn a bot thread.
+    Spawn,
+    /// A bot is already up (or starting) and wasn't asked to stop.
+    AlreadyRunning,
+    /// A bot is still tearing down after a stop. The bot thread will start
+    /// a fresh generation itself once that teardown finishes.
+    Queued,
+}
+
+#[derive(Default)]
+struct LifecycleState {
+    /// A bot thread exists and hasn't yet called `finish_generation` for the
+    /// last time.
+    running: bool,
+    /// A start arrived while the running generation was shutting down.
+    restart_queued: bool,
+}
+
+/// Start/stop bookkeeping for one bot (Telegram or Discord).
+///
+/// Starts and stops come from session.rs's edge-triggered
+/// `sync_remote_bots`, which fires exactly once per change of console
+/// ownership. Teardown of a bot generation takes a moment (a last HTTP
+/// round trip, closing the gateway), so a quick switch away and back used to
+/// land the "start" while the old generation was still running: start saw
+/// it running and did nothing, the old generation then exited, and no
+/// further edge ever came - leaving the session with no bot. Here such a
+/// start is queued instead, and the bot thread runs it as soon as the old
+/// generation has fully finished. Because the restart happens on the same
+/// thread, two generations still never overlap (see BOT_THREAD in each bot
+/// module for why that matters).
+///
+/// The shutdown flag that the bot's async tasks poll is only ever written
+/// under the state lock, so a stop can't be lost between "restart decided"
+/// and "flag cleared".
+pub struct BotLifecycle {
+    state: Mutex<LifecycleState>,
+    shutdown: AtomicBool,
+}
+
+impl BotLifecycle {
+    pub const fn new() -> Self {
+        Self {
+            state: Mutex::new(LifecycleState { running: false, restart_queued: false }),
+            shutdown: AtomicBool::new(false),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, LifecycleState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether the current generation has been told to stop.
+    pub fn shutdown_requested(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+
+    pub fn request_start(&self) -> StartAction {
+        let mut state = self.state();
+        if !state.running {
+            state.running = true;
+            self.shutdown.store(false, Ordering::SeqCst);
+            StartAction::Spawn
+        } else if self.shutdown.load(Ordering::SeqCst) {
+            state.restart_queued = true;
+            StartAction::Queued
+        } else {
+            StartAction::AlreadyRunning
+        }
+    }
+
+    /// After `Spawn`, the caller found nothing to run (bot disabled, no
+    /// token, ...) and didn't spawn a thread.
+    pub fn cancel_start(&self) {
+        let mut state = self.state();
+        state.running = false;
+        state.restart_queued = false;
+    }
+
+    /// Stop the running generation, if any, and forget any queued restart.
+    pub fn request_stop(&self) {
+        let mut state = self.state();
+        state.restart_queued = false;
+        if state.running {
+            self.shutdown.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// App exit: like `request_stop`, but raises the flag even if nothing
+    /// is running yet, so a generation that's about to start sees it.
+    pub fn request_shutdown(&self) {
+        let mut state = self.state();
+        state.restart_queued = false;
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+
+    /// Called by the bot thread when a generation has ended and its runtime
+    /// is gone. Returns true if a start was queued meanwhile: the thread
+    /// should then run a new generation (the shutdown flag is already
+    /// cleared). Returns false when the thread should exit; it no longer
+    /// counts as running from that point.
+    pub fn finish_generation(&self) -> bool {
+        let mut state = self.state();
+        if state.restart_queued {
+            state.restart_queued = false;
+            self.shutdown.store(false, Ordering::SeqCst);
+            true
+        } else {
+            state.running = false;
+            false
+        }
+    }
+
+    /// Resolves once the current generation has been told to stop.
+    pub async fn wait_for_shutdown(&self) {
+        while !self.shutdown_requested() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -564,5 +694,82 @@ mod tests {
         assert!(dc.starts_with("👤 max\\_k\n```\n"), "{dc}");
         assert!(dc.ends_with("```"), "{dc}");
         assert!(dc.contains("1h 35m"), "{dc}");
+    }
+
+    #[test]
+    fn lifecycle_plain_start_and_stop() {
+        let lc = BotLifecycle::new();
+        assert_eq!(lc.request_start(), StartAction::Spawn);
+        assert!(!lc.shutdown_requested());
+        assert_eq!(lc.request_start(), StartAction::AlreadyRunning);
+
+        lc.request_stop();
+        assert!(lc.shutdown_requested());
+        assert!(!lc.finish_generation(), "nothing queued: thread exits");
+
+        assert_eq!(lc.request_start(), StartAction::Spawn, "can start again afterwards");
+        assert!(!lc.shutdown_requested(), "flag cleared for the new generation");
+    }
+
+    #[test]
+    fn lifecycle_start_during_teardown_is_queued_not_lost() {
+        let lc = BotLifecycle::new();
+        assert_eq!(lc.request_start(), StartAction::Spawn);
+        lc.request_stop(); // switched away...
+        assert_eq!(lc.request_start(), StartAction::Queued); // ...and back, mid-teardown
+
+        assert!(lc.finish_generation(), "old generation done: run the queued one");
+        assert!(!lc.shutdown_requested(), "new generation must not see the old stop");
+        assert_eq!(lc.request_start(), StartAction::AlreadyRunning);
+
+        lc.request_stop();
+        assert!(!lc.finish_generation());
+    }
+
+    #[test]
+    fn lifecycle_stop_cancels_queued_restart() {
+        let lc = BotLifecycle::new();
+        lc.request_start();
+        lc.request_stop();
+        assert_eq!(lc.request_start(), StartAction::Queued);
+        lc.request_stop(); // switched away again before teardown finished
+        assert!(lc.shutdown_requested());
+        assert!(!lc.finish_generation(), "the queued start was withdrawn");
+    }
+
+    #[test]
+    fn lifecycle_stop_after_restart_decision_is_kept() {
+        let lc = BotLifecycle::new();
+        lc.request_start();
+        lc.request_stop();
+        lc.request_start();
+        assert!(lc.finish_generation());
+        lc.request_stop(); // arrives while the new generation is starting up
+        assert!(lc.shutdown_requested());
+        assert!(!lc.finish_generation());
+    }
+
+    #[test]
+    fn lifecycle_app_shutdown_and_cancelled_start() {
+        let lc = BotLifecycle::new();
+        lc.request_shutdown();
+        assert!(lc.shutdown_requested(), "raised even with nothing running");
+
+        assert_eq!(lc.request_start(), StartAction::Spawn);
+        lc.cancel_start(); // e.g. bot disabled in settings
+        assert_eq!(lc.request_start(), StartAction::Spawn);
+
+        lc.request_stop();
+        lc.request_start();
+        lc.request_shutdown();
+        assert!(!lc.finish_generation(), "app exit withdraws a queued restart");
+    }
+
+    #[test]
+    fn lifecycle_stop_when_idle_is_a_no_op() {
+        let lc = BotLifecycle::new();
+        lc.request_stop();
+        assert!(!lc.shutdown_requested());
+        assert_eq!(lc.request_start(), StartAction::Spawn);
     }
 }
