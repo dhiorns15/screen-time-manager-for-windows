@@ -45,7 +45,9 @@ pub static IS_IDLE_PAUSED: AtomicBool = AtomicBool::new(false);
 /// polled every tick the way idle detection is - the OS tells us the exact
 /// moment this changes, so there's no reason to guess at it - though the
 /// message is checked against `session::query_session_locked` first, since
-/// any process in the session can post it (see `on_session_lock_message`).
+/// any process in the session can post it (see `on_session_lock_message`),
+/// and Windows is asked again every few ticks either way
+/// (`recheck_session_lock`), in case a message was refused or never came.
 pub static IS_LOCK_PAUSED: AtomicBool = AtomicBool::new(false);
 
 /// Timer ID of the always-on accounting tick, owned by the hidden main window
@@ -67,7 +69,8 @@ const MAX_CREDITED_GAP_MS: u64 = 5000;
 const PERIODIC_SAVE_TICKS: u32 = 30;
 /// While paused, save the pause so far this often (seconds of pause).
 const PAUSE_PERSIST_SECS: i32 = 10;
-/// While lock-paused, re-ask Windows whether we're still locked this often.
+/// Re-ask Windows whether this session is locked this often (ticks), locked
+/// or not - see `recheck_session_lock`.
 const LOCK_RECHECK_TICKS: u32 = 5;
 
 /// `GetTickCount64` at the previous tick, the not-yet-credited milliseconds,
@@ -540,14 +543,16 @@ pub unsafe fn on_session_lock_message(message_says_locked: bool) {
     set_session_locked(locked);
 }
 
-/// While lock-paused, unpause if Windows now says this session, at the
-/// console, is unlocked (a missed unlock, or a lock that couldn't be checked
-/// when it arrived).
+/// Every LOCK_RECHECK_TICKS, whatever the current state: lock-pause if
+/// Windows says this session is locked, unpause if it says unlocked and this
+/// session is at the console (see `session::periodic_lock_state`). Catches a
+/// real lock that was refused or never arrived, a missed unlock, and a lock
+/// that couldn't be checked when it arrived.
 unsafe fn recheck_session_lock() {
-    if crate::session::query_session_locked() == Some(false)
-        && crate::session::is_active_console_session()
-    {
-        set_session_locked(false);
+    let wts = crate::session::query_session_locked();
+    let is_console = crate::session::is_active_console_session();
+    if let Some(locked) = crate::session::periodic_lock_state(wts, is_console) {
+        set_session_locked(locked);
     }
 }
 
@@ -659,7 +664,7 @@ pub unsafe fn on_accounting_tick() {
 
     check_day_rollover(periodic);
 
-    if IS_LOCK_PAUSED.load(Ordering::SeqCst) && tick.is_multiple_of(LOCK_RECHECK_TICKS) {
+    if tick.is_multiple_of(LOCK_RECHECK_TICKS) {
         recheck_session_lock();
     }
 

@@ -83,12 +83,31 @@ pub fn query_session_locked() -> Option<bool> {
 /// positively says this session, sitting at the console, is unlocked - that's
 /// a posted fake meant to freeze the countdown. A switched-away session can't
 /// be in use, so its lock is always believed. When Windows can't say, the
-/// message is believed, as before.
+/// message is believed, as before. Either way `periodic_lock_state` asks
+/// Windows again a few seconds later and corrects it.
 pub fn verified_lock_state(message_says_locked: bool, wts: Option<bool>, is_console: bool) -> bool {
     if message_says_locked {
         !(wts == Some(false) && is_console)
     } else {
         wts == Some(true)
+    }
+}
+
+/// What the periodic lock check (every few accounting ticks, whatever the
+/// current state) sets the lock state to, given what Windows reports (`wts`,
+/// see `query_session_locked`) and whether this session owns the console:
+/// `Some(state)`, or `None` to leave it as it is.
+///
+/// Windows saying locked always lock-pauses - that catches a real lock whose
+/// WM_WTSSESSION_CHANGE was refused because the flags hadn't caught up yet,
+/// or never arrived (`WTSRegisterSessionNotification` failed). Windows saying
+/// unlocked unpauses only at the console: a switched-away session can't be
+/// in use, so it stays paused. An unknown answer changes nothing.
+pub fn periodic_lock_state(wts: Option<bool>, is_console: bool) -> Option<bool> {
+    match wts {
+        Some(true) => Some(true),
+        Some(false) if is_console => Some(false),
+        _ => None,
     }
 }
 
@@ -294,6 +313,27 @@ mod tests {
         assert!(!verified_lock_state(false, Some(false), true));
         assert!(!verified_lock_state(false, None, true));
         assert!(verified_lock_state(false, Some(true), true));
+    }
+
+    #[test]
+    fn periodic_check_locks_whenever_windows_says_locked() {
+        // A real lock refused (flags not caught up) or never delivered
+        assert_eq!(periodic_lock_state(Some(true), true), Some(true));
+        assert_eq!(periodic_lock_state(Some(true), false), Some(true));
+    }
+
+    #[test]
+    fn periodic_check_unlocks_only_at_the_console() {
+        // A missed unlock, or a posted fake lock that was believed
+        assert_eq!(periodic_lock_state(Some(false), true), Some(false));
+        // Switched away under Fast User Switching: stays as it is (paused)
+        assert_eq!(periodic_lock_state(Some(false), false), None);
+    }
+
+    #[test]
+    fn periodic_check_ignores_an_unknown_answer() {
+        assert_eq!(periodic_lock_state(None, true), None);
+        assert_eq!(periodic_lock_state(None, false), None);
     }
 
     const LISTEN: WTS_CONNECTSTATE_CLASS = WTS_CONNECTSTATE_CLASS(6); // WTSListen
