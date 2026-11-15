@@ -785,6 +785,7 @@ pub fn effective_today_date() -> String {
 
     let Some(((anchor_wall, anchor_tick), anchor_date)) = anchor else {
         // First run ever - nothing to compare against yet.
+        reset_utc_offset_baseline();
         resync_clock_anchor(now_wall, now_tick, &today);
         return today;
     };
@@ -793,19 +794,24 @@ pub fn effective_today_date() -> String {
         // The machine rebooted since the last anchor, so the tick counter
         // reset and can't sanity-check the wall clock across that gap.
         // Accept the current time and start fresh from here.
+        reset_utc_offset_baseline();
         resync_clock_anchor(now_wall, now_tick, &today);
         return today;
     }
 
     let expected_wall = anchor_wall + (now_tick - anchor_tick) / 1000;
     let drift = now_wall - expected_wall;
+    // A time-zone change moves the local date without moving UTC, so the
+    // drift check above can't see it - see `utc_offset_tamper_secs`.
+    let tz_shift = utc_offset_tamper_secs();
 
-    if drift.abs() <= CLOCK_DRIFT_TOLERANCE_SECS {
+    if drift.abs() <= CLOCK_DRIFT_TOLERANCE_SECS && tz_shift.is_none() {
         resync_clock_anchor(now_wall, now_tick, &today);
         today
     } else {
+        let reported = if drift.abs() > CLOCK_DRIFT_TOLERANCE_SECS { drift } else { tz_shift.unwrap_or(drift) };
         set_setting("clock_tamper_active", "1");
-        set_setting("clock_tamper_drift_secs", &drift.to_string());
+        set_setting("clock_tamper_drift_secs", &reported.to_string());
         anchor_date
     }
 }
@@ -1083,6 +1089,121 @@ pub fn set_discord_config(token: &str, channel_id: &str, admin_user_id: &str, en
     set_shared_setting(DISCORD_CHANNEL_ID, channel_id);
     set_shared_setting(DISCORD_ADMIN_USER_ID, admin_user_id);
     set_shared_setting(DISCORD_ENABLED, if enabled { "true" } else { "false" });
+}
+
+// ============================================================================
+// Time-zone tamper detection
+// ============================================================================
+
+/// The UTC offset (local minus UTC, minutes) in effect when the clock anchor
+/// was last created - at first run or after a reboot, deliberately *not* on
+/// every resync, so a time zone can't be walked a little at a time.
+const UTC_OFFSET_BASELINE_KEY: &str = "clock_anchor_utc_offset_mins";
+
+/// The largest UTC-offset change, relative to the baseline, that counts as a
+/// daylight-saving transition rather than a time-zone change. DST moves the
+/// offset by 60 minutes (30 in a few places) and back again, so it never
+/// strays further than this from the baseline.
+const MAX_DST_SHIFT_MINS: i64 = 60;
+
+/// Seconds since 1970-01-01 for a civil date and time (no time zone).
+fn civil_to_secs(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) -> i64 {
+    days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s
+}
+
+fn systemtime_secs(st: &windows::Win32::Foundation::SYSTEMTIME) -> i64 {
+    civil_to_secs(
+        st.wYear as i64, st.wMonth as i64, st.wDay as i64,
+        st.wHour as i64, st.wMinute as i64, st.wSecond as i64,
+    )
+}
+
+/// Local minus UTC in whole minutes, given the same instant read both ways
+/// (in seconds since the epoch, as if both were UTC). Rounded to the nearest
+/// minute, since the two readings can straddle a second boundary.
+fn utc_offset_mins_from(local_secs: i64, utc_secs: i64) -> i64 {
+    (local_secs - utc_secs + 30).div_euclid(60)
+}
+
+/// The UTC offset currently in effect, in minutes (e.g. 60 for CET, 120 for CEST).
+fn current_utc_offset_mins() -> i64 {
+    use windows::Win32::System::SystemInformation::{GetLocalTime, GetSystemTime};
+    let (local, utc) = unsafe { (GetLocalTime(), GetSystemTime()) };
+    utc_offset_mins_from(systemtime_secs(&local), systemtime_secs(&utc))
+}
+
+/// How far the offset moved beyond a DST step from the baseline, in minutes,
+/// or `None` if it's within one (including no change at all).
+fn utc_offset_shift_beyond_dst(baseline_mins: i64, current_mins: i64) -> Option<i64> {
+    let shift = current_mins - baseline_mins;
+    (shift.abs() > MAX_DST_SHIFT_MINS).then_some(shift)
+}
+
+fn reset_utc_offset_baseline() {
+    set_setting(UTC_OFFSET_BASELINE_KEY, &current_utc_offset_mins().to_string());
+}
+
+/// `Some(shift in seconds)` while the time zone differs from the baseline by
+/// more than a DST step - a standard user can run `tzutil /s` to move "today"
+/// to tomorrow's date without touching the clock itself. Installs from before
+/// this check have no baseline yet; the first call records one.
+fn utc_offset_tamper_secs() -> Option<i64> {
+    let current = current_utc_offset_mins();
+    match get_setting(UTC_OFFSET_BASELINE_KEY).and_then(|s| s.parse::<i64>().ok()) {
+        Some(baseline) => utc_offset_shift_beyond_dst(baseline, current).map(|m| m * 60),
+        None => {
+            set_setting(UTC_OFFSET_BASELINE_KEY, &current.to_string());
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod timekeeping_tests {
+    use super::*;
+
+    #[test]
+    fn utc_offset_rounds_to_whole_minutes() {
+        let utc = civil_to_secs(2026, 3, 29, 0, 59, 59);
+        // CET (+1h), read a second apart across the boundary
+        assert_eq!(utc_offset_mins_from(civil_to_secs(2026, 3, 29, 2, 0, 0), utc), 60);
+        // Across a date boundary: local 00:30 next day vs UTC 23:30 = +60
+        assert_eq!(
+            utc_offset_mins_from(civil_to_secs(2026, 1, 1, 0, 30, 0), civil_to_secs(2025, 12, 31, 23, 30, 0)),
+            60
+        );
+        // West of UTC, including half hours (Newfoundland -3:30)
+        assert_eq!(
+            utc_offset_mins_from(civil_to_secs(2026, 1, 1, 8, 30, 0), civil_to_secs(2026, 1, 1, 12, 0, 1)),
+            -210
+        );
+        // Month end
+        assert_eq!(
+            utc_offset_mins_from(civil_to_secs(2026, 3, 1, 9, 0, 0), civil_to_secs(2026, 2, 28, 23, 0, 0)),
+            600
+        );
+    }
+
+    #[test]
+    fn dst_transitions_are_not_tampering() {
+        // CET baseline: summer time and back
+        assert_eq!(utc_offset_shift_beyond_dst(60, 120), None);
+        assert_eq!(utc_offset_shift_beyond_dst(120, 60), None);
+        assert_eq!(utc_offset_shift_beyond_dst(60, 60), None);
+        // Lord Howe's 30-minute DST
+        assert_eq!(utc_offset_shift_beyond_dst(630, 660), None);
+    }
+
+    #[test]
+    fn time_zone_jumps_are_tampering() {
+        // tzutil from UTC-8 to UTC+14 to borrow tomorrow
+        assert_eq!(utc_offset_shift_beyond_dst(-480, 840), Some(1320));
+        // Backwards too
+        assert_eq!(utc_offset_shift_beyond_dst(60, -600), Some(-660));
+        // Just past a DST step, or a DST step on top of a zone change
+        assert_eq!(utc_offset_shift_beyond_dst(60, 180), Some(120));
+        assert_eq!(utc_offset_shift_beyond_dst(60, 135), Some(75));
+    }
 }
 
 #[cfg(test)]
