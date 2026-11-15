@@ -545,6 +545,31 @@ pub fn retry_delay(failures: u32) -> Duration {
     Duration::from_secs((1u64 << failures.clamp(1, 6)).min(60))
 }
 
+/// Commands older than this when they reach the app are dropped rather
+/// than run. Telegram keeps undelivered messages for up to a day, so without
+/// this a "/e60" sent while the PC was asleep or offline would run whenever
+/// it next connected - for whichever account happened to be logged in then.
+///
+/// Measured against the PC's own clock. A child moving the clock forward
+/// could make fresh commands look stale, but that gains nothing over simply
+/// unplugging the network, which already blocks every remote command.
+pub const STALE_COMMAND_SECS: i64 = 5 * 60;
+
+/// Whether a message sent at `sent_unix` (seconds since the Unix epoch, from
+/// the chat service) is too old to act on at `now_unix`. A message dated in
+/// the future (the PC's clock is behind) is never stale.
+pub fn is_stale(sent_unix: i64, now_unix: i64) -> bool {
+    now_unix.saturating_sub(sent_unix) > STALE_COMMAND_SECS
+}
+
+/// Seconds since the Unix epoch by the PC's clock (0 if the clock is set
+/// before 1970, which makes nothing look stale).
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
 /// What `BotLifecycle::request_start` decided.
 #[derive(Debug, PartialEq, Eq)]
 pub enum StartAction {
@@ -687,6 +712,19 @@ mod tests {
         assert_eq!(secs, [2, 4, 8, 16, 32, 60, 60, 60]);
         assert_eq!(retry_delay(0).as_secs(), 2);
         assert_eq!(retry_delay(u32::MAX).as_secs(), 60);
+    }
+
+    #[test]
+    fn staleness_window() {
+        let now = 1_800_000_000;
+        assert!(!is_stale(now, now));
+        assert!(!is_stale(now - STALE_COMMAND_SECS, now), "exactly at the limit still runs");
+        assert!(is_stale(now - STALE_COMMAND_SECS - 1, now));
+        assert!(is_stale(now - 3 * 3600, now), "queued for hours while the PC slept");
+        assert!(!is_stale(now + 600, now), "PC clock behind the server's");
+        assert!(!is_stale(now, 0), "PC clock before 1970");
+        assert!(!is_stale(i64::MIN, i64::MIN));
+        assert!(is_stale(i64::MIN, i64::MAX), "no overflow");
     }
 
     #[test]

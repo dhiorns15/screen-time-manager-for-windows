@@ -16,7 +16,8 @@ use crate::i18n;
 use crate::remote_commands::{
     cmd_extend, cmd_getpin, cmd_history, cmd_lock, cmd_msg, cmd_pause, cmd_reduce, cmd_reset,
     cmd_resume, cmd_rotatingpin, cmd_setlimit, cmd_setmessage, cmd_setpin, cmd_status, cmd_time,
-    cmd_unlock, cmd_update, cmd_weekly, retry_delay, BotLifecycle, StartAction, WeeklyMarkup,
+    cmd_unlock, cmd_update, cmd_weekly, is_stale, now_unix, retry_delay, BotLifecycle,
+    StartAction, WeeklyMarkup,
 };
 use crate::time_request;
 
@@ -361,9 +362,14 @@ async fn connect_and_dispatch(
         }
     }
 
-    // Same listener `dispatch()` would build.
+    // Same listener `dispatch()` would build, plus dropping whatever queued
+    // up while no bot was connected (the PC was off, asleep, offline, or
+    // another account had the console): those commands were meant for then,
+    // not for whoever happens to be logged in now. Teloxide's default keeps
+    // them and replays them all on connect.
     let listener = Polling::builder(bot.clone())
         .timeout(Duration::from_secs(10))
+        .drop_pending_updates()
         .delete_webhook()
         .await
         .build();
@@ -376,6 +382,20 @@ async fn connect_and_dispatch(
 }
 
 fn build_dispatcher(bot: Bot, admin_chat_id: Option<i64>) -> Dispatcher<Bot, RequestError, DefaultKey> {
+    // Anything that queued up while the connection was down mid-session
+    // (e.g. the PC slept) arrives in a burst on reconnect; dropping
+    // pending updates at connect doesn't cover that, so old messages are
+    // also filtered here, before any other handler sees them.
+    let stale_handler = Update::filter_message()
+        .filter(|msg: Message| is_stale(msg.date.timestamp(), now_unix()))
+        .endpoint(|msg: Message| async move {
+            eprintln!(
+                "[Telegram] Ignoring message {} from {} - sent too long ago",
+                msg.id, msg.date
+            );
+            Ok(())
+        });
+
     // Command handler
     let command_handler = Update::filter_message()
         .filter_command::<Command>()
@@ -411,8 +431,9 @@ fn build_dispatcher(bot: Bot, admin_chat_id: Option<i64>) -> Dispatcher<Bot, Req
             Ok(())
         });
 
-    // Combine handlers - commands first, then fallback
+    // Combine handlers - stale messages dropped first, then commands, then fallback
     let handler = dptree::entry()
+        .branch(stale_handler)
         .branch(command_handler)
         .branch(fallback_handler);
 
