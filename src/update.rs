@@ -610,7 +610,7 @@ fn announce_version_change() {
                 // version with this feature) - not an update.
                 if let Some(Some(previous)) = database::swap_shared_setting(LAST_RUNNING_VERSION_KEY, &current) {
                     let text = format!("✅ {} v{previous} → v{current}", i18n::t("update.notify.updated"));
-                    notify_bots(&text, &text);
+                    send_claimed_announcement(&text);
                 }
                 return;
             }
@@ -659,10 +659,25 @@ fn notify_update_available(release: &Release) {
         i18n::t("update.notify.current"),
         Version::current(),
     );
-    notify_bots(
-        &format!("{body}{}", i18n::t("update.notify.how_tg")),
-        &format!("{body}{}", i18n::t("update.notify.how_dc")),
-    );
+    // One text for both bots (see `send_claimed_announcement`), so it names
+    // the command for each one that's enabled.
+    let how = match (database::get_telegram_config().enabled, database::get_discord_config().enabled) {
+        (true, false) => i18n::t("update.notify.how_tg").to_string(),
+        (false, true) => i18n::t("update.notify.how_dc").to_string(),
+        _ => format!("{}\n{}", i18n::t("update.notify.how_tg"), i18n::t("update.notify.how_dc")),
+    };
+    send_claimed_announcement(&format!("{body}{how}"));
+}
+
+/// Send an announcement this session has just claimed in the shared
+/// database (so no other session will send it). Through the watchdog's
+/// alert queue rather than straight through the bots: a send through the
+/// bots can fail (offline, Telegram/Discord unreachable) with nobody
+/// noticing, and then the claimed announcement would be lost for good; the
+/// queue retries until it's delivered (for up to a day), to every enabled
+/// bot, whether or not that bot has connected in this session.
+fn send_claimed_announcement(text: &str) {
+    crate::watchdog::raise_alert(text);
 }
 
 /// Starts the SYSTEM update task. Standard users are allowed to run it -
