@@ -17,7 +17,7 @@ use windows::{
         },
         Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC},
         System::LibraryLoader::GetModuleHandleW,
-        System::Shutdown::{ExitWindowsEx, EWX_SHUTDOWN, SHUTDOWN_REASON},
+        System::Shutdown::{ExitWindowsEx, EWX_LOGOFF, EWX_SHUTDOWN, SHUTDOWN_REASON},
         System::Threading::{GetCurrentProcess, GetCurrentThreadId, OpenProcessToken},
         Security::{
             AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
@@ -203,8 +203,12 @@ pub unsafe fn show_blocking_overlay_with_time(text: &str, remaining_seconds: i32
     }
 
     // Initialize shutdown countdown from database setting
-    let timeout = crate::database::get_lock_screen_timeout();
+    let timeout = effective_lock_timeout(crate::database::get_lock_screen_timeout());
     SHUTDOWN_COUNTDOWN_SECONDS.store(timeout, Ordering::SeqCst);
+    COUNTDOWN_SIGNS_OUT.store(
+        countdown_end_action(crate::session::other_users_logged_on()) == CountdownEnd::SignOut,
+        Ordering::SeqCst,
+    );
 
     if !on_ui_thread(hwnd) {
         let _ = PostMessageW(hwnd, WM_APP_SHOW_OVERLAY, WPARAM(0), LPARAM(0));
@@ -227,7 +231,8 @@ unsafe fn apply_show_overlay(hwnd: HWND) {
         return;
     }
 
-    // Hide the mini overlay while blocking screen is shown
+    // Hide the mini overlay while blocking screen is shown (time keeps being
+    // tracked by the main window's accounting tick - see mini_overlay)
     crate::mini_overlay::hide_mini_overlay();
 
     let edit_ptr = BLOCKING_EDIT_HWND.load(Ordering::SeqCst);
@@ -266,27 +271,82 @@ unsafe fn apply_show_overlay(hwnd: HWND) {
     show_secondary_overlays();
 }
 
-/// Extend the remaining time by the specified minutes
-pub fn extend_time(minutes: i32) {
-    let current = REMAINING_SECONDS.load(Ordering::SeqCst);
-    let additional_seconds = minutes * 60;
-
+/// Remaining time after extending `current` by `additional_seconds`.
+fn extended(current: i32, additional_seconds: i32) -> i32 {
     if current < 0 {
         // No timer was running, start fresh
-        REMAINING_SECONDS.store(additional_seconds, Ordering::SeqCst);
+        additional_seconds
     } else {
         // Add to existing time
-        REMAINING_SECONDS.store(current + additional_seconds, Ordering::SeqCst);
+        current.saturating_add(additional_seconds)
     }
 }
 
-/// Reduce the remaining time by the specified minutes
-pub fn reduce_time(minutes: i32) {
-    let current = REMAINING_SECONDS.load(Ordering::SeqCst);
-    let reduction_seconds = minutes * 60;
+/// Remaining time after reducing `current` by `reduction_seconds`.
+fn reduced(current: i32, reduction_seconds: i32) -> i32 {
+    current.saturating_sub(reduction_seconds).max(0)
+}
 
-    let new_time = (current - reduction_seconds).max(0);
-    REMAINING_SECONDS.store(new_time, Ordering::SeqCst);
+/// Extend the remaining time by the specified minutes. One atomic update, so
+/// the countdown tick on the UI thread can't overwrite an extension made from
+/// a bot thread at the same moment.
+pub fn extend_time(minutes: i32) {
+    let additional_seconds = minutes * 60;
+    let _ = REMAINING_SECONDS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+        Some(extended(current, additional_seconds))
+    });
+}
+
+/// Reduce the remaining time by the specified minutes (atomically, as above)
+pub fn reduce_time(minutes: i32) {
+    let reduction_seconds = minutes * 60;
+    let _ = REMAINING_SECONDS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+        Some(reduced(current, reduction_seconds))
+    });
+}
+
+/// The shortest lock-screen countdown actually used: a configured 0 (the
+/// Settings field takes whole minutes) would otherwise end the session on
+/// the countdown's first tick.
+const MIN_LOCK_SCREEN_TIMEOUT_SECS: i32 = 60;
+
+fn effective_lock_timeout(configured_secs: i32) -> i32 {
+    configured_secs.max(MIN_LOCK_SCREEN_TIMEOUT_SECS)
+}
+
+/// The countdown only runs while this session is the one at the console and
+/// unlocked - i.e. while someone can actually see it. A session switched
+/// away under Fast User Switching, or sitting at the Windows lock screen,
+/// waits.
+fn countdown_should_run(is_console_session: bool, session_locked: bool) -> bool {
+    is_console_session && !session_locked
+}
+
+/// What happens when the lock-screen countdown runs out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CountdownEnd {
+    /// Nobody else is signed in: shut the machine down, as always.
+    Shutdown,
+    /// Another account is signed in (Fast User Switching): sign only this
+    /// session out, rather than shutting down on top of someone else's work.
+    SignOut,
+}
+
+fn countdown_end_action(other_users_logged_on: bool) -> CountdownEnd {
+    if other_users_logged_on {
+        CountdownEnd::SignOut
+    } else {
+        CountdownEnd::Shutdown
+    }
+}
+
+/// Whether the countdown will sign out rather than shut down, as last
+/// checked by TIMER_COUNTDOWN - read by WM_PAINT for the countdown label.
+static COUNTDOWN_SIGNS_OUT: AtomicBool = AtomicBool::new(false);
+
+/// Sign this session out (the countdown's end when others are signed in).
+unsafe fn initiate_sign_out() -> bool {
+    ExitWindowsEx(EWX_LOGOFF, SHUTDOWN_REASON(0)).is_ok()
 }
 
 /// Format seconds into a human-readable string (e.g., "1h 30m 45s")
@@ -557,13 +617,18 @@ pub unsafe extern "system" fn blocking_overlay_proc(
             );
             SelectObject(hdc, time_font);
 
+            let (now_key, in_key) = if COUNTDOWN_SIGNS_OUT.load(Ordering::SeqCst) {
+                ("blocking.signout_now", "blocking.signout_in")
+            } else {
+                ("blocking.shutdown_now", "blocking.shutdown_in")
+            };
             let time_str = if shutdown_countdown >= 0 {
                 if shutdown_countdown <= 60 {
                     SetTextColor(hdc, COLORREF(0x004040FF)); // Red
-                    format!("{} {}s", i18n::t("blocking.shutdown_now"), shutdown_countdown)
+                    format!("{} {}s", i18n::t(now_key), shutdown_countdown)
                 } else {
                     SetTextColor(hdc, COLORREF(COLOR_ACCENT));
-                    format!("{} {}", i18n::t("blocking.shutdown_in"), format_time(shutdown_countdown))
+                    format!("{} {}", i18n::t(in_key), format_time(shutdown_countdown))
                 }
             } else {
                 SetTextColor(hdc, COLORREF(COLOR_ACCENT));
@@ -850,20 +915,39 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                     // in or rearranged while locked. Cheap when nothing has
                     // changed (a few metrics and one monitor enumeration).
                     sync_monitor_layout(hwnd);
-                    push_to_topmost(hwnd, false);
+                    reassert_blocking_window(hwnd);
                     // The secondary blankers need re-asserting too, or an app
                     // dragged onto another monitor would be usable during
                     // lockout.
                     show_secondary_overlays();
                 }
                 TIMER_COUNTDOWN => {
-                    // Decrement shutdown countdown
+                    // Count down only while someone can see it (see
+                    // countdown_should_run) - a blocked session that was
+                    // switched away from used to shut the machine down under
+                    // whoever was using it by then.
+                    let running = countdown_should_run(
+                        crate::session::is_active_console_session(),
+                        crate::mini_overlay::IS_LOCK_PAUSED.load(Ordering::SeqCst),
+                    );
                     let shutdown_remaining = SHUTDOWN_COUNTDOWN_SECONDS.load(Ordering::SeqCst);
-                    if shutdown_remaining > 0 {
-                        SHUTDOWN_COUNTDOWN_SECONDS.store(shutdown_remaining - 1, Ordering::SeqCst);
-                    } else if shutdown_remaining == 0 {
-                        // Trigger shutdown with proper privilege
-                        initiate_shutdown();
+                    if running && shutdown_remaining >= 0 {
+                        // Who else is signed in: refreshed every 5 seconds for
+                        // the label, and always right before acting on it.
+                        if shutdown_remaining == 0 || shutdown_remaining % 5 == 0 {
+                            let action = countdown_end_action(crate::session::other_users_logged_on());
+                            COUNTDOWN_SIGNS_OUT.store(action == CountdownEnd::SignOut, Ordering::SeqCst);
+                        }
+                        if shutdown_remaining > 0 {
+                            SHUTDOWN_COUNTDOWN_SECONDS.store(shutdown_remaining - 1, Ordering::SeqCst);
+                        } else {
+                            let signs_out = COUNTDOWN_SIGNS_OUT.load(Ordering::SeqCst);
+                            match countdown_end_action(signs_out) {
+                                // Trigger shutdown with proper privilege
+                                CountdownEnd::Shutdown => { initiate_shutdown(); }
+                                CountdownEnd::SignOut => { initiate_sign_out(); }
+                            }
+                        }
                     }
 
                     // Only invalidate the countdown region, not the entire window
@@ -1360,6 +1444,35 @@ pub(crate) unsafe fn push_to_topmost(hwnd: HWND, show: bool) {
     let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
 }
 
+/// Put the main lock overlay back the way it should be, on every
+/// TIMER_REASSERT_TOPMOST tick: shown (another process in the session can
+/// hide or minimize it with ShowWindow, and it used to stay hidden), at the
+/// primary monitor's origin (or moved off screen with SetWindowPos), and at
+/// the top of the topmost band. Skipped once a hide has been requested, so a
+/// tick between a bot's hide and its posted WM_APP_HIDE_OVERLAY can't
+/// re-show it.
+unsafe fn reassert_blocking_window(hwnd: HWND) {
+    if !is_blocking_overlay_visible() {
+        return;
+    }
+    if IsIconic(hwnd).as_bool() {
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+    }
+    let mut window: RECT = zeroed();
+    if GetWindowRect(hwnd, &mut window).is_ok() && (window.left != 0 || window.top != 0) {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0, 0,
+            GetSystemMetrics(SM_CXSCREEN),
+            GetSystemMetrics(SM_CYSCREEN),
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        layout_children(hwnd);
+    }
+    push_to_topmost(hwnd, true);
+}
+
 /// Show every secondary blanker and push it back to the top of the topmost
 /// band. Runs on show and on every TIMER_REASSERT_TOPMOST tick: besides the
 /// z-order repair, blankers rebuilt mid display-mode change can end up
@@ -1379,5 +1492,78 @@ unsafe fn show_secondary_overlays() {
 unsafe fn hide_secondary_overlays() {
     for hwnd in secondary_overlay_hwnds() {
         let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extend_adds_or_starts_fresh() {
+        assert_eq!(extended(100, 900), 1000);
+        assert_eq!(extended(0, 900), 900);
+        assert_eq!(extended(-1, 900), 900, "no limit running: start fresh");
+        assert_eq!(extended(i32::MAX - 1, 900), i32::MAX);
+    }
+
+    #[test]
+    fn reduce_never_goes_below_zero() {
+        assert_eq!(reduced(1000, 900), 100);
+        assert_eq!(reduced(100, 900), 0);
+        assert_eq!(reduced(-1, 900), 0);
+    }
+
+    #[test]
+    fn extensions_from_other_threads_are_not_lost() {
+        // Stand-in for REMAINING_SECONDS: one thread counting down, others
+        // extending, all through the same fetch_update pattern.
+        use std::sync::atomic::AtomicI32;
+        static REMAINING: AtomicI32 = AtomicI32::new(1_000_000);
+        let countdown = std::thread::spawn(|| {
+            for _ in 0..10_000 {
+                let _ = REMAINING.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+                    (c > 0).then(|| (c - 1).max(0))
+                });
+            }
+        });
+        let extenders: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..1_000 {
+                        let _ = REMAINING.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
+                            Some(extended(c, 60))
+                        });
+                    }
+                })
+            })
+            .collect();
+        countdown.join().unwrap();
+        for e in extenders {
+            e.join().unwrap();
+        }
+        assert_eq!(REMAINING.load(Ordering::SeqCst), 1_000_000 - 10_000 + 4 * 1_000 * 60);
+    }
+
+    #[test]
+    fn lock_timeout_is_at_least_a_minute() {
+        assert_eq!(effective_lock_timeout(0), 60);
+        assert_eq!(effective_lock_timeout(-600), 60);
+        assert_eq!(effective_lock_timeout(59), 60);
+        assert_eq!(effective_lock_timeout(600), 600);
+    }
+
+    #[test]
+    fn countdown_runs_only_at_the_unlocked_console() {
+        assert!(countdown_should_run(true, false));
+        assert!(!countdown_should_run(true, true), "Windows lock screen");
+        assert!(!countdown_should_run(false, false), "switched away");
+        assert!(!countdown_should_run(false, true));
+    }
+
+    #[test]
+    fn countdown_signs_out_when_others_are_signed_in() {
+        assert_eq!(countdown_end_action(true), CountdownEnd::SignOut);
+        assert_eq!(countdown_end_action(false), CountdownEnd::Shutdown);
     }
 }

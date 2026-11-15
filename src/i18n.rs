@@ -218,6 +218,8 @@ fn en(key: &str) -> &'static str {
         "blocking.request_time_button" => "📨 Request More Time",
         "blocking.request_sent" => "✅ Sent! Wait",
         "blocking.request_unavailable" => "Enable Telegram or Discord in Settings to request more time here",
+        "blocking.signout_in" => "Signing out in:",
+        "blocking.signout_now" => "SIGNING OUT IN:",
 
         // ----- About Dialog -----
         "about.text" => concat!("Screen Time Manager v", env!("CARGO_PKG_VERSION"), "\n\nA parental control application for managing screen time.\n\n(c) Simon Pamies"),
@@ -634,6 +636,8 @@ fn de(key: &str) -> &'static str {
         "blocking.request_time_button" => "📨 Mehr Zeit anfragen",
         "blocking.request_sent" => "✅ Gesendet! Warten",
         "blocking.request_unavailable" => "Aktivieren Sie Telegram oder Discord in den Einstellungen, um hier mehr Zeit anzufragen",
+        "blocking.signout_in" => "Abmeldung in:",
+        "blocking.signout_now" => "ABMELDUNG IN:",
 
         // ----- About Dialog -----
         "about.text" => concat!("Bildschirmzeit Manager v", env!("CARGO_PKG_VERSION"), "\n\nEine Kindersicherungs-App zur Verwaltung der Bildschirmzeit.\n\n(c) Simon Pamies"),
