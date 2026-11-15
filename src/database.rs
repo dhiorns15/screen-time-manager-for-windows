@@ -444,33 +444,78 @@ pub fn set_rotating_pin_enabled(enabled: bool) {
     set_shared_setting(ROTATING_PIN_ENABLED, if enabled { "true" } else { "false" });
 }
 
-/// Get (creating if needed) the secret used to derive the daily rotating PIN
-fn get_or_create_rotating_secret() -> String {
-    if let Some(secret) = get_shared_setting(ROTATING_PIN_SECRET) {
-        return secret;
+/// Get (creating if needed) the secret used to derive the daily rotating
+/// PIN, from the shared database (or the per-account one when the shared
+/// one isn't open, like the other shared settings). `None` if it could not
+/// be read: a busy or failing database must never be taken for a missing
+/// secret, since writing a new one would invalidate a PIN the parent has
+/// already been given.
+fn get_or_create_rotating_secret() -> Option<String> {
+    match SHARED_DB_CONNECTION.lock() {
+        Ok(guard) => {
+            if let Some(conn) = guard.as_ref() {
+                return get_or_create_rotating_secret_in(conn, new_rotating_secret);
+            }
+        }
+        Err(_) => return None,
     }
+    let guard = DB_CONNECTION.lock().ok()?;
+    get_or_create_rotating_secret_in(guard.as_ref()?, new_rotating_secret)
+}
+
+/// `get_or_create_rotating_secret` against one database: a new secret is
+/// only created when the read succeeded and found no row. Created with
+/// INSERT OR IGNORE and read back, so two processes creating it at once
+/// both end up with the same one.
+fn get_or_create_rotating_secret_in(conn: &Connection, new_secret: impl FnOnce() -> String) -> Option<String> {
+    use rusqlite::OptionalExtension;
+
+    let read = |conn: &Connection| -> rusqlite::Result<Option<String>> {
+        conn.query_row("SELECT value FROM settings WHERE key = ?1", params![ROTATING_PIN_SECRET], |row| row.get(0))
+            .optional()
+    };
+    match read(conn) {
+        Ok(Some(secret)) => return Some(secret),
+        Ok(None) => {}
+        Err(_) => return None,
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
+        params![ROTATING_PIN_SECRET, new_secret()],
+    )
+    .ok()?;
+    read(conn).ok().flatten()
+}
+
+fn new_rotating_secret() -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
-    let seed = RandomState::new().build_hasher().finish();
-    let secret = seed.to_string();
-    set_shared_setting(ROTATING_PIN_SECRET, &secret);
-    secret
+    RandomState::new().build_hasher().finish().to_string()
 }
 
 /// Today's rotating 4-digit PIN - deterministic for the day (so it can be
 /// verified without storing it anywhere), changes at the next date rollover.
 /// Not cryptographically secure - it just needs to be different day to day,
 /// not withstand a determined attacker, so a simple FNV hash is enough here.
-pub fn get_rotating_pin() -> String {
-    let secret = get_or_create_rotating_secret();
-    let date = get_today_date();
+/// `None` if its secret could not be read (nothing then matches it).
+pub fn rotating_pin() -> Option<String> {
+    let secret = get_or_create_rotating_secret()?;
+    Some(rotating_pin_for(&secret, &get_today_date()))
+}
 
+fn rotating_pin_for(secret: &str, date: &str) -> String {
     let mut hash: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
     for byte in secret.bytes().chain(date.bytes()) {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(0x100000001b3); // FNV prime
     }
     format!("{:04}", hash % 10000)
+}
+
+/// Today's rotating PIN for showing to the admin (`/getpin`), or a note
+/// that it could not be read right now.
+pub fn get_rotating_pin() -> String {
+    rotating_pin().unwrap_or_else(|| crate::i18n::t("tg.getpin.unavailable").to_string())
 }
 
 /// Get a setting value from the database
@@ -1224,7 +1269,7 @@ pub fn passcode_is_default() -> bool {
 /// the rotating PIN did not match either. Attempt limiting lives in
 /// `passcode_guard`, which is what UI code should call.
 pub fn check_passcode(entered: &str) -> Option<bool> {
-    if is_rotating_pin_enabled() && entered == get_rotating_pin() {
+    if is_rotating_pin_enabled() && rotating_pin().is_some_and(|pin| entered == pin) {
         return Some(true);
     }
     effective_passcode().map(|code| entered == code)
@@ -1579,6 +1624,34 @@ mod tests {
         assert_eq!(swap_setting_in(&mut conn, "k", "1.1.0").unwrap(), Some(Some("1.0.0".into())));
         let stored: String = conn.query_row("SELECT value FROM settings WHERE key = 'k'", [], |r| r.get(0)).unwrap();
         assert_eq!(stored, "1.1.0");
+    }
+
+    #[test]
+    fn rotating_secret_is_created_only_when_missing_never_on_a_read_error() {
+        let conn = Connection::open_in_memory().unwrap();
+        // No settings table: every read fails, as with a busy or broken
+        // database. Nothing may be created (it used to write a new secret).
+        assert_eq!(get_or_create_rotating_secret_in(&conn, || panic!("must not create")), None);
+
+        conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)", []).unwrap();
+        assert_eq!(get_or_create_rotating_secret_in(&conn, || "first".into()).as_deref(), Some("first"));
+        // An existing secret is kept, whoever wrote it.
+        assert_eq!(get_or_create_rotating_secret_in(&conn, || panic!("must not create")).as_deref(), Some("first"));
+        conn.execute("DELETE FROM settings", []).unwrap();
+        conn.execute("INSERT INTO settings VALUES (?1, 'other')", params![ROTATING_PIN_SECRET]).unwrap();
+        assert_eq!(get_or_create_rotating_secret_in(&conn, || "mine".into()).as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn rotating_pin_is_four_digits_and_changes_with_the_date() {
+        let a = rotating_pin_for("12345", "2026-11-15");
+        assert_eq!(a.len(), 4);
+        assert!(a.chars().all(|c| c.is_ascii_digit()));
+        assert_eq!(a, rotating_pin_for("12345", "2026-11-15"));
+        assert_ne!(
+            (1..=9).map(|d| rotating_pin_for("12345", &format!("2026-11-1{d}"))).collect::<std::collections::HashSet<_>>().len(),
+            1
+        );
     }
 
     #[test]
