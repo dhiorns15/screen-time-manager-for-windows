@@ -60,6 +60,10 @@ const TRAY_ICON_ADD_RETRIES: u32 = 5;
 pub unsafe fn add_tray_icon(hwnd: HWND) {
     let hinstance = GetModuleHandleW(None).expect("Failed to get module handle");
 
+    // MAKEINTRESOURCE(1): resource ID 1, not a dangling pointer. Clippy's
+    // suggested `ptr::dangling::<u16>()` would be address 2 (u16 alignment),
+    // i.e. a different resource ID.
+    #[allow(clippy::manual_dangling_ptr)]
     let hicon = LoadIconW(hinstance, PCWSTR(1 as *const u16))
         .or_else(|_| LoadIconW(None, IDI_APPLICATION))
         .expect("Failed to load icon");
@@ -338,6 +342,9 @@ pub unsafe extern "system" fn window_proc(
                         MB_OK | MB_ICONINFORMATION,
                     );
                 }
+                // Keep the modal passcode prompt in the arm body, like the
+                // sibling arms, rather than hiding it in a match guard.
+                #[allow(clippy::collapsible_match)]
                 IDM_QUIT => {
                     if verify_passcode_for_quit(hwnd) {
                         // Tell the watchdog task this is a sanctioned stop, not

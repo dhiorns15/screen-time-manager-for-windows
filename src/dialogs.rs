@@ -1161,7 +1161,6 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                         // Save Telegram settings
                         let mut telegram_token = String::new();
                         let mut telegram_chat_id = String::new();
-                        let telegram_enabled;
 
                         if !handles.telegram_token.0.is_null() {
                             let mut buffer = [0u16; 512];
@@ -1175,12 +1174,12 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                             telegram_chat_id = String::from_utf16_lossy(&buffer[..len as usize]);
                         }
 
-                        if !handles.telegram_enabled.0.is_null() {
+                        let telegram_enabled = if !handles.telegram_enabled.0.is_null() {
                             let checked = SendMessageW(handles.telegram_enabled, BM_GETCHECK, WPARAM(0), LPARAM(0));
-                            telegram_enabled = checked.0 == 1;
+                            checked.0 == 1
                         } else {
-                            telegram_enabled = false;
-                        }
+                            false
+                        };
 
                         set_telegram_config(&telegram_token, &telegram_chat_id, telegram_enabled);
 
@@ -1188,7 +1187,6 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                         let mut discord_token = String::new();
                         let mut discord_channel_id = String::new();
                         let mut discord_admin_user_id = String::new();
-                        let discord_enabled;
 
                         if !handles.discord_token.0.is_null() {
                             let mut buffer = [0u16; 512];
@@ -1208,12 +1206,12 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                             discord_admin_user_id = String::from_utf16_lossy(&buffer[..len as usize]);
                         }
 
-                        if !handles.discord_enabled.0.is_null() {
+                        let discord_enabled = if !handles.discord_enabled.0.is_null() {
                             let checked = SendMessageW(handles.discord_enabled, BM_GETCHECK, WPARAM(0), LPARAM(0));
-                            discord_enabled = checked.0 == 1;
+                            checked.0 == 1
                         } else {
-                            discord_enabled = false;
-                        }
+                            false
+                        };
 
                         set_discord_config(&discord_token, &discord_channel_id, &discord_admin_user_id, discord_enabled);
 
@@ -1483,7 +1481,7 @@ pub unsafe fn show_stats_dialog(parent_hwnd: HWND) {
 
                 SelectObject(hdc, value_font);
                 SetTextColor(hdc, COLORREF(0x00333333));
-                let day_str = format!("{}", weekday_name);
+                let day_str = weekday_name.to_string();
                 let mut value_rect = RECT { left: value_x, top: y, right: rect.right - scale(15), bottom: y + scale(22) };
                 DrawTextW(hdc, &mut day_str.encode_utf16().collect::<Vec<_>>(), &mut value_rect, DT_SINGLELINE);
                 y += scale(24);

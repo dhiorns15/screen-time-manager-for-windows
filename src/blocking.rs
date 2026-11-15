@@ -58,7 +58,7 @@ unsafe fn initiate_shutdown() -> bool {
     }
 
     // Enable the privilege
-    let mut tp = TOKEN_PRIVILEGES {
+    let tp = TOKEN_PRIVILEGES {
         PrivilegeCount: 1,
         Privileges: [windows::Win32::Security::LUID_AND_ATTRIBUTES {
             Luid: luid,
@@ -66,7 +66,7 @@ unsafe fn initiate_shutdown() -> bool {
         }],
     };
 
-    if AdjustTokenPrivileges(token_handle, false, Some(&mut tp), 0, None, None).is_err() {
+    if AdjustTokenPrivileges(token_handle, false, Some(&tp), 0, None, None).is_err() {
         let _ = CloseHandle(token_handle);
         return false;
     }
@@ -728,7 +728,7 @@ pub unsafe extern "system" fn blocking_overlay_proc(
             let id = (wparam.0 & 0xFFFF) as i32;
             let notification = ((wparam.0 >> 16) & 0xFFFF) as u32;
 
-            if notification == BN_CLICKED as u32 {
+            if notification == BN_CLICKED {
                 match id {
                     ID_UNLOCK_BUTTON => {
                         if check_blocking_passcode() {
@@ -808,8 +808,8 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                             initiate_shutdown();
                         }
                     }
-                    ID_REQUEST_TIME_BUTTON => {
-                        if REQUEST_COOLDOWN_REMAINING.load(Ordering::SeqCst) <= 0 {
+                    ID_REQUEST_TIME_BUTTON
+                        if REQUEST_COOLDOWN_REMAINING.load(Ordering::SeqCst) <= 0 => {
                             let note_ptr = REQUEST_NOTE_EDIT_HWND.load(Ordering::SeqCst);
                             let mut note = String::new();
                             if !note_ptr.is_null() {
@@ -837,7 +837,6 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                                 let _ = EnableWindow(HWND(note_ptr), false);
                             }
                             SetTimer(hwnd, TIMER_REQUEST_COOLDOWN, 1000, None);
-                        }
                     }
                     _ => {}
                 }
