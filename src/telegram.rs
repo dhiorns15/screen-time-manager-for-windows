@@ -6,7 +6,7 @@ use std::time::Duration;
 use teloxide::prelude::*;
 use teloxide::dispatching::DefaultKey;
 use teloxide::error_handlers::LoggingErrorHandler;
-use teloxide::types::ParseMode;
+use teloxide::types::{ParseMode, UserId};
 use teloxide::update_listeners::Polling;
 use teloxide::utils::command::BotCommands;
 use teloxide::RequestError;
@@ -413,11 +413,8 @@ fn build_dispatcher(bot: Bot, admin_chat_id: Option<i64>) -> Dispatcher<Bot, Req
                         i18n::t("tg.error.unknown_cmd")
                     ).await?;
                 } else if !text.is_empty() {
-                    // Check authorization
-                    let authorized = admin_chat_id
-                        .map(|id| msg.chat.id.0 == id)
-                        .unwrap_or(false);
-                    if authorized {
+                    // Check authorization (silently ignored otherwise)
+                    if authorize(&bot, &msg, admin_chat_id).await == AuthDecision::Allow {
                         unsafe {
                             crate::overlay::show_overlay(text, 10);
                         }
@@ -444,6 +441,76 @@ fn build_dispatcher(bot: Bot, admin_chat_id: Option<i64>) -> Dispatcher<Bot, Req
         })
         .error_handler(LoggingErrorHandler::with_custom_text("[Telegram] Error in handler"))
         .build()
+}
+
+/// Outcome of the authorisation check for a command or on-screen message.
+#[derive(Debug, PartialEq, Eq)]
+enum AuthDecision {
+    Allow,
+    Deny,
+    /// No admin chat configured at all.
+    NoAdmin,
+    /// From a member of the configured group: allowed only if Telegram says
+    /// that user is the group's owner or an administrator.
+    CheckGroupAdmin(u64),
+}
+
+/// Who may control the bot. The rule:
+///
+/// - The message must come from the configured admin chat.
+/// - If that chat is a private chat with the bot (the normal setup), that's
+///   enough: the only person in it is the one who set it up.
+/// - If it's a group, the sender must also be one of the group's owner or
+///   administrators - so a child added to a family group can't send
+///   commands just by being a member. A message an administrator posts
+///   anonymously "as the group" (sender chat = the group itself; only
+///   administrators can do that) counts; one posted on behalf of any other
+///   chat or channel doesn't.
+fn auth_decision(
+    admin_chat_id: Option<i64>,
+    chat_id: i64,
+    chat_is_private: bool,
+    sender_user_id: Option<u64>,
+    sender_chat_id: Option<i64>,
+) -> AuthDecision {
+    let Some(admin_chat_id) = admin_chat_id else {
+        return AuthDecision::NoAdmin;
+    };
+    if chat_id != admin_chat_id {
+        return AuthDecision::Deny;
+    }
+    if chat_is_private {
+        return AuthDecision::Allow;
+    }
+    match (sender_chat_id, sender_user_id) {
+        (Some(sender_chat), _) if sender_chat == chat_id => AuthDecision::Allow,
+        (Some(_), _) | (None, None) => AuthDecision::Deny,
+        (None, Some(user_id)) => AuthDecision::CheckGroupAdmin(user_id),
+    }
+}
+
+/// `auth_decision`, with the group-administrator lookup done (fails closed:
+/// if Telegram can't be asked, the command is refused). Never returns
+/// `CheckGroupAdmin`.
+async fn authorize(bot: &Bot, msg: &Message, admin_chat_id: Option<i64>) -> AuthDecision {
+    let decision = auth_decision(
+        admin_chat_id,
+        msg.chat.id.0,
+        msg.chat.is_private(),
+        msg.from.as_ref().map(|user| user.id.0),
+        msg.sender_chat.as_ref().map(|chat| chat.id.0),
+    );
+    let AuthDecision::CheckGroupAdmin(user_id) = decision else {
+        return decision;
+    };
+    match bot.get_chat_member(msg.chat.id, UserId(user_id)).await {
+        Ok(member) if member.kind.is_privileged() => AuthDecision::Allow,
+        Ok(_) => AuthDecision::Deny,
+        Err(e) => {
+            eprintln!("[Telegram] Couldn't check group admin status of {user_id}: {e}");
+            AuthDecision::Deny
+        }
+    }
 }
 
 /// Handle incoming commands
@@ -474,16 +541,18 @@ async fn handle_command(
         _ => {}
     }
 
-    // Authorization check for all other commands
-    if let Some(admin_id) = admin_chat_id {
-        if sender_id != admin_id {
+    // Authorization check for all other commands - see `auth_decision`
+    match authorize(&bot, &msg, admin_chat_id).await {
+        AuthDecision::Allow => {}
+        AuthDecision::NoAdmin => {
+            // No admin configured - reject all commands except /start and /chatid
+            bot.send_message(msg.chat.id, i18n::t("tg.error.no_admin")).await?;
+            return Ok(());
+        }
+        AuthDecision::Deny | AuthDecision::CheckGroupAdmin(_) => {
             bot.send_message(msg.chat.id, i18n::t("tg.error.unauthorized")).await?;
             return Ok(());
         }
-    } else {
-        // No admin configured - reject all commands except /start and /chatid
-        bot.send_message(msg.chat.id, i18n::t("tg.error.no_admin")).await?;
-        return Ok(());
     }
 
     // Commands that dismiss/grant time on the lock screen resolve any
@@ -549,3 +618,51 @@ async fn handle_command(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PARENT: i64 = 111_222_333;
+    const GROUP: i64 = -1_001_234_567_890;
+
+    #[test]
+    fn private_chat_with_the_bot_is_the_admin() {
+        assert_eq!(auth_decision(Some(PARENT), PARENT, true, Some(PARENT as u64), None), AuthDecision::Allow);
+    }
+
+    #[test]
+    fn other_chats_are_refused() {
+        assert_eq!(auth_decision(Some(PARENT), 999, true, Some(999), None), AuthDecision::Deny);
+        assert_eq!(auth_decision(Some(PARENT), GROUP, false, Some(PARENT as u64), None), AuthDecision::Deny);
+    }
+
+    #[test]
+    fn nothing_configured() {
+        assert_eq!(auth_decision(None, PARENT, true, Some(PARENT as u64), None), AuthDecision::NoAdmin);
+    }
+
+    #[test]
+    fn group_members_need_admin_status() {
+        assert_eq!(
+            auth_decision(Some(GROUP), GROUP, false, Some(42), None),
+            AuthDecision::CheckGroupAdmin(42)
+        );
+    }
+
+    #[test]
+    fn group_senders_without_a_user_or_as_another_chat() {
+        // An administrator posting anonymously as the group itself.
+        assert_eq!(
+            auth_decision(Some(GROUP), GROUP, false, Some(1_087_968_824), Some(GROUP)),
+            AuthDecision::Allow
+        );
+        // Posting on behalf of some other channel.
+        assert_eq!(
+            auth_decision(Some(GROUP), GROUP, false, Some(136_817_688), Some(-100_777)),
+            AuthDecision::Deny
+        );
+        assert_eq!(auth_decision(Some(GROUP), GROUP, false, None, None), AuthDecision::Deny);
+    }
+}
+
