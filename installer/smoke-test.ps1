@@ -135,8 +135,9 @@ function CheckTask([string]$Name, [string]$Arguments, [string]$PrincipalSid, [st
     $t
 }
 
-function TriggersOf($Task, [string]$Class) {
-    @($Task.Triggers | Where-Object { $_.CimClass.CimClassName -eq $Class })
+# A task's triggers as an array. A task without any has $null Triggers, and @($null) is one item.
+function TriggersOf($Task, [string]$Class = '') {
+    @($Task.Triggers | Where-Object { $null -ne $_ -and (!$Class -or $_.CimClass.CimClassName -eq $Class) })
 }
 
 # The update task's DACL: standard accounts may read and run it, and nothing more.
@@ -168,20 +169,20 @@ function CheckInstall([string]$Version, [datetime]$Since) {
     Check ((Get-Item $marker).LastWriteTime -ge $Since.AddSeconds(-2)) 'updating.marker was not rewritten'
 
     $t = CheckTask $mainTask '' $usersSid 'Limited' 'Parallel' 'PT0S'
-    Check (@($t.Triggers).Count -eq 1) "Task $mainTask should only have a logon trigger"
-    $logon = TriggersOf $t 'MSFT_TaskLogonTrigger'
+    Check (@(TriggersOf $t).Count -eq 1) "Task $mainTask should only have a logon trigger"
+    $logon = @(TriggersOf $t 'MSFT_TaskLogonTrigger')
     Check ($logon.Count -eq 1 -and !$logon[0].UserId) "Task $mainTask should start at the sign-in of any user"
     Check ($t.Settings.RestartCount -eq 3 -and $t.Settings.RestartInterval -eq 'PT1M') "Task $mainTask should restart 3 times, every minute"
     Check ($t.Settings.StartWhenAvailable) "Task $mainTask should start when available"
 
     $t = CheckTask $watchdogTask '--watchdog-check' $usersSid 'Limited' 'Parallel' 'PT5M'
-    $time = TriggersOf $t 'MSFT_TaskTimeTrigger'
+    $time = @(TriggersOf $t 'MSFT_TaskTimeTrigger')
     Check ($time.Count -eq 1 -and $time[0].Repetition.Interval -eq 'PT1M' -and !$time[0].Repetition.Duration) "Task $watchdogTask should run every minute, indefinitely"
-    $logon = TriggersOf $t 'MSFT_TaskLogonTrigger'
+    $logon = @(TriggersOf $t 'MSFT_TaskLogonTrigger')
     Check ($logon.Count -eq 1 -and !$logon[0].UserId -and $logon[0].Delay -eq 'PT2M') "Task $watchdogTask should run 2 minutes after the sign-in of any user"
 
     $t = CheckTask $updateTask '--update' $systemSid 'Highest' 'IgnoreNew' 'PT2H'
-    Check (@($t.Triggers).Count -eq 0) "Task $updateTask should only run on demand"
+    Check (@(TriggersOf $t).Count -eq 0) "Task $updateTask should only run on demand"
     CheckUpdateTaskSecurity
 
     Check (Test-Path $sharedDir) "$sharedDir was not created"
@@ -378,11 +379,15 @@ try {
     }
     if (!$done) {
         ShowFile "$dir\updates\update.log"
+        ShowFile "$dir\updates\setup.log"
         Receive-Job $server | Out-Host
         throw "5 minutes after --update the installed version is $(InstalledVersion), not $next"
     }
     CheckInstall $next $since
     Check (Test-Path "$dir\updates\$asset") "The updater did not keep its download in $dir\updates"
+    # The updater passes "/LOG=<path with a space>" as one quoted argument; setup must accept it.
+    Check (Test-Path "$dir\updates\setup.log") "Setup run by --update wrote no $dir\updates\setup.log"
+    Check ((Get-Item "$dir\updates\setup.log").LastWriteTime -ge $since) 'setup.log is not from this update'
     "Updated $version to $next through --update; the fake release server saw:" | Out-Host
     Receive-Job $server | Out-Host
 
