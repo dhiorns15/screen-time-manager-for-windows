@@ -718,10 +718,36 @@ fn accrue_pause(secs: i32) {
     if ends {
         // Auto-resume
         force_resume();
-    } else if prev / PAUSE_PERSIST_SECS != duration / PAUSE_PERSIST_SECS
-        && IS_PAUSED.load(Ordering::SeqCst)
-    {
-        database::save_inflight_pause(duration);
+    } else if prev / PAUSE_PERSIST_SECS != duration / PAUSE_PERSIST_SECS {
+        persist_inflight_pause(
+            duration,
+            database::save_inflight_pause,
+            // A read-modify-write, not a load: if it still reads "paused", a
+            // resume after it (a swap) synchronizes with it, so the resume's
+            // clear comes after the save above it.
+            || IS_PAUSED.fetch_or(false, Ordering::SeqCst),
+            database::clear_inflight_pause,
+        );
+    }
+}
+
+/// Save the pause so far (`save`), if it's still running. A resume from a
+/// bot thread can land between that check and the save: it has counted the
+/// pause and cleared the saved copy already, so the save put back a copy the
+/// next start would count a second time. So the paused flag is checked again
+/// after the save, and the copy cleared if the pause has ended.
+fn persist_inflight_pause(
+    duration: i32,
+    save: impl FnOnce(i32),
+    mut still_paused: impl FnMut() -> bool,
+    clear: impl FnOnce(),
+) {
+    if !still_paused() {
+        return;
+    }
+    save(duration);
+    if !still_paused() {
+        clear();
     }
 }
 
@@ -982,6 +1008,59 @@ mod tests {
         // After an out-of-time show was undone because an extension arrived
         // (blocking::show_unless_time_arrived), the next tick doesn't retry.
         assert!(!zero_time_lock_due(15 * 60, false));
+    }
+
+    /// A stand-in for the saved in-flight pause and the paused flag.
+    struct PauseFixture {
+        paused: std::cell::Cell<bool>,
+        saved: std::cell::Cell<Option<i32>>,
+    }
+
+    impl PauseFixture {
+        fn new() -> Self {
+            PauseFixture { paused: true.into(), saved: None.into() }
+        }
+        /// What `resume_timer` does to these two (counting the pause aside).
+        fn resume(&self) {
+            self.paused.set(false);
+            self.saved.set(None);
+        }
+        fn persist(&self, duration: i32, before_save: impl FnOnce()) {
+            persist_inflight_pause(
+                duration,
+                |d| {
+                    before_save();
+                    self.saved.set(Some(d));
+                },
+                || self.paused.get(),
+                || self.saved.set(None),
+            );
+        }
+    }
+
+    #[test]
+    fn running_pause_is_saved() {
+        let f = PauseFixture::new();
+        f.persist(130, || {});
+        assert_eq!(f.saved.get(), Some(130));
+    }
+
+    #[test]
+    fn ended_pause_is_not_saved() {
+        let f = PauseFixture::new();
+        f.resume();
+        f.persist(130, || {});
+        assert_eq!(f.saved.get(), None);
+    }
+
+    #[test]
+    fn resume_racing_the_save_leaves_no_copy_to_count_twice() {
+        // The bot's resume counts the pause and clears the copy just before
+        // the tick's save writes it back.
+        let f = PauseFixture::new();
+        f.persist(130, || f.resume());
+        assert_eq!(f.saved.get(), None, "would be counted again at the next start");
+        assert!(!f.paused.get());
     }
 
     #[test]
