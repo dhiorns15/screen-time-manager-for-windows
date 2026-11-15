@@ -14,8 +14,8 @@
 //! When the mutex *is* held, the app's heartbeat (see `write_heartbeat`)
 //! must also be recent: a suspended or frozen app, or some other process
 //! squatting on the mutex name, holds the mutex without doing anything. See
-//! `check_heartbeat` for how that avoids false alerts around sleep, reboots
-//! and Fast User Switching.
+//! `check_heartbeat` for how that avoids false alerts around sleep, Modern
+//! Standby, reboots, a locked screen and Fast User Switching.
 //!
 //! Alerts are queued in a file and retried on later runs until delivered
 //! (bounded in number and age), so one raised while offline isn't lost.
@@ -30,8 +30,7 @@ use windows::{
             PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
         },
         UI::WindowsAndMessaging::{
-            FindWindowW, GetWindowThreadProcessId, SendMessageTimeoutW, SMTO_ABORTIFHUNG,
-            SMTO_BLOCK, WM_NULL,
+            FindWindowW, GetWindowThreadProcessId, SendMessageTimeoutW, SMTO_BLOCK, WM_NULL,
         },
     },
 };
@@ -521,10 +520,11 @@ fn clear_stale_tracker() {
 
 /// The app holds the mutex; check its heartbeat. A stale one has to be seen
 /// on several consecutive runs over a couple of minutes of awake time (see
-/// `StaleTracker`) before anything happens, and then the app's window is
-/// probed: if it still answers, nothing is done (the heartbeat file itself
-/// is the problem). Only an app that doesn't answer is ended and restarted,
-/// and the admin is told once per incident.
+/// `StaleTracker`) before anything happens, and only while someone is using
+/// the session (see `someone_using_session`). Then the app's window is
+/// probed, twice with a pause in between: if it answers, or the heartbeat
+/// moves on meanwhile, nothing is done. Only an app that stays unresponsive
+/// is ended and restarted, and the admin is told once per incident.
 fn check_heartbeat(logon_token: Option<i64>) {
     let Some(token) = logon_token else {
         set_last_state("running");
@@ -550,6 +550,21 @@ fn check_heartbeat(logon_token: Option<i64>) {
             let prev = std::fs::read_to_string(stale_tracker_path()).ok().and_then(|s| StaleTracker::parse(&s));
             let mut tracker = StaleTracker::observe(prev, &hb, now_unbiased, wall_now());
             if tracker.confirmed() && !tracker.handled {
+                let attended = someone_using_session(
+                    crate::session::is_active_console_session(),
+                    crate::session::query_session_locked(),
+                    session_idle_secs(),
+                    age_secs,
+                );
+                if !attended {
+                    // Not handled yet: acted on at a later run if someone
+                    // starts using the PC while it's still stuck.
+                    let _ = std::fs::write(stale_tracker_path(), tracker.serialize());
+                    log_state("hb_stale_unattended", &format!(
+                        "app holds its mutex but its heartbeat is {age_secs}s old - not acting while nobody is using this session (no keyboard/mouse input since, locked, or not at the console)"
+                    ));
+                    return;
+                }
                 tracker.handled = true;
                 let _ = std::fs::write(stale_tracker_path(), tracker.serialize());
                 handle_unresponsive_app(&hb, age_secs);
@@ -566,23 +581,83 @@ fn check_heartbeat(logon_token: Option<i64>) {
     }
 }
 
+/// Keyboard or mouse input has to have come at least this long after the
+/// app's last heartbeat for a stuck app to count as one someone is using.
+const INPUT_AFTER_HEARTBEAT_MARGIN_SECS: u64 = 10;
+
+/// Whether someone is evidently using this session while its app is stuck:
+/// it's the session at the console, it isn't locked, and there has been
+/// keyboard or mouse input since the app's last heartbeat. Only then can a
+/// stuck app be costing screen time, so only then is it ended and the admin
+/// alerted. Everything else that can stop the heartbeat without anyone
+/// tampering - a PC left alone whose display went off (Modern Standby
+/// suspends desktop apps), a session switched away from or locked - has no
+/// such input, and waits: if someone starts using the PC while the app is
+/// still stuck, the next run acts. If the input time can't be read, nothing
+/// is done (a missed detection is better than a false alert).
+fn someone_using_session(is_console: bool, locked: Option<bool>, idle_secs: Option<u64>, heartbeat_age_secs: u64) -> bool {
+    is_console
+        && locked != Some(true)
+        && idle_secs.is_some_and(|idle| idle.saturating_add(INPUT_AFTER_HEARTBEAT_MARGIN_SECS) < heartbeat_age_secs)
+}
+
+/// Seconds since this session's last keyboard or mouse input.
+fn session_idle_secs() -> Option<u64> {
+    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+    let mut info = LASTINPUTINFO { cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+    unsafe { GetLastInputInfo(&mut info) }
+        .as_bool()
+        .then(|| u64::from(unsafe { GetTickCount() }.wrapping_sub(info.dwTime) / 1000))
+}
+
 /// Class name of the app's hidden main window (main.rs).
 const MAIN_WINDOW_CLASS: PCWSTR = w!("ScreenTimeManagerClass");
+
+/// How long to wait for the app's window to answer a probe.
+const PROBE_TIMEOUT_MS: u32 = 5000;
+/// Before acting on an app that didn't answer, look again after this long.
+const SECOND_LOOK_DELAY: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Whether the window answers a WM_NULL within `PROBE_TIMEOUT_MS`. Not
+/// SMTO_ABORTIFHUNG: an app that has only just been resumed (e.g. from
+/// standby) still counts as "hung" to Windows until it pumps messages again,
+/// so it's given the full timeout to do so.
+fn window_answers(hwnd: windows::Win32::Foundation::HWND) -> bool {
+    let mut result = 0usize;
+    let answered = unsafe {
+        SendMessageTimeoutW(hwnd, WM_NULL, WPARAM(0), LPARAM(0), SMTO_BLOCK, PROBE_TIMEOUT_MS, Some(&mut result))
+    };
+    answered.0 != 0
+}
+
+/// Whether the app has written a different heartbeat than `hb` since.
+fn heartbeat_moved_on(hb: &Heartbeat) -> bool {
+    std::fs::read_to_string(heartbeat_path())
+        .ok()
+        .and_then(|s| Heartbeat::parse(&s))
+        .is_some_and(|now| now != *hb)
+}
 
 fn handle_unresponsive_app(hb: &Heartbeat, age_secs: u64) {
     let window = unsafe { FindWindowW(MAIN_WINDOW_CLASS, PCWSTR::null()) }.ok().filter(|h| !h.0.is_null());
 
-    if let Some(hwnd) = window {
-        let mut result = 0usize;
-        let answered = unsafe {
-            SendMessageTimeoutW(hwnd, WM_NULL, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG | SMTO_BLOCK, 5000, Some(&mut result))
-        };
-        if answered.0 != 0 {
-            log_state("hb_responsive", &format!(
-                "heartbeat {age_secs}s old but the app's window still responds - heartbeat file not updating? not alerting"
-            ));
-            return;
-        }
+    if window.is_some_and(window_answers) {
+        log_state("hb_responsive", &format!(
+            "heartbeat {age_secs}s old but the app's window still responds - heartbeat file not updating? not alerting"
+        ));
+        return;
+    }
+
+    // Second look before doing anything drastic: an app that was merely
+    // paused and has just resumed catches up within seconds, starting with
+    // its overdue heartbeat.
+    std::thread::sleep(SECOND_LOOK_DELAY);
+    if heartbeat_moved_on(hb) || window.is_some_and(window_answers) {
+        log_state("hb_recovered", &format!(
+            "heartbeat {age_secs}s old and the app didn't answer at first, but it's running again - not alerting"
+        ));
+        return;
     }
 
     // The process to end: the one that owns the unresponsive window, or
@@ -1047,6 +1122,22 @@ mod tests {
         let later = StaleTracker::observe(Some(t), &h, 9_000 * S, 99_999);
         assert!(later.handled);
         assert_eq!(StaleTracker::parse(&later.serialize()), Some(later));
+    }
+
+    #[test]
+    fn stuck_app_is_acted_on_only_while_someone_uses_the_pc() {
+        // Suspended, then the PC used: input long after the last heartbeat.
+        assert!(someone_using_session(true, Some(false), Some(5), 400));
+        assert!(someone_using_session(true, None, Some(60), 400), "lock state unknown");
+        // Display off / Modern Standby / walked away: last input before the
+        // last heartbeat.
+        assert!(!someone_using_session(true, Some(false), Some(900), 400));
+        assert!(!someone_using_session(true, Some(false), Some(395), 400), "within the margin");
+        // Locked, or switched away under Fast User Switching.
+        assert!(!someone_using_session(true, Some(true), Some(5), 400));
+        assert!(!someone_using_session(false, Some(false), Some(5), 400));
+        // Input time unreadable: do nothing.
+        assert!(!someone_using_session(true, Some(false), None, 400));
     }
 
     #[test]
