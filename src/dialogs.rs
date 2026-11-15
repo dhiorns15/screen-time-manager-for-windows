@@ -170,14 +170,10 @@ struct SettingsEditHandles {
     pause_cooldown: HWND,
 }
 
-/// What a passcode prompt is for, so the dialog can say so.
+/// What a passcode prompt is for, so the dialog can say so (one per tray
+/// menu item that asks for the passcode).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-// Only `Generic` is used until tray.rs passes the specific action (see
-// `verify_passcode_for_action`).
-#[allow(dead_code)]
 pub enum PasscodeAction {
-    /// No specific action named ("Enter 4-digit code to continue").
-    Generic,
     Stats,
     Settings,
     Extend15,
@@ -188,7 +184,6 @@ pub enum PasscodeAction {
 impl PasscodeAction {
     fn prompt_key(self) -> &'static str {
         match self {
-            PasscodeAction::Generic => "passcode.subtitle",
             PasscodeAction::Stats => "passcode.action.stats",
             PasscodeAction::Settings => "passcode.action.settings",
             PasscodeAction::Extend15 => "passcode.action.extend_15",
@@ -196,11 +191,6 @@ impl PasscodeAction {
             PasscodeAction::Quit => "passcode.action.quit",
         }
     }
-}
-
-/// Verify passcode before allowing sensitive operations
-pub unsafe fn verify_passcode_for_quit(parent_hwnd: HWND) -> bool {
-    verify_passcode_for_action(parent_hwnd, PasscodeAction::Generic)
 }
 
 /// Ask for the passcode, naming the action it will allow. Fails closed: if
@@ -1346,20 +1336,9 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
 
                         // If today's limit was lowered, cap remaining time to the new limit
                         {
-                            use crate::blocking::REMAINING_SECONDS;
-                            use crate::database::{get_current_weekday, get_daily_limit, save_remaining_time};
-                            use crate::mini_overlay::update_mini_overlay;
-                            use std::sync::atomic::Ordering;
-
-                            let weekday = get_current_weekday();
-                            let new_limit_seconds = (get_daily_limit(weekday) * 60) as i32;
-                            let remaining = REMAINING_SECONDS.load(Ordering::SeqCst);
-
-                            if remaining > new_limit_seconds {
-                                REMAINING_SECONDS.store(new_limit_seconds, Ordering::SeqCst);
-                                save_remaining_time(new_limit_seconds);
-                                update_mini_overlay();
-                            }
+                            use crate::database::{get_current_weekday, get_daily_limit};
+                            let new_limit_seconds = (get_daily_limit(get_current_weekday()) * 60) as i32;
+                            crate::blocking::cap_remaining_time(new_limit_seconds);
                         }
 
                         if !handles.warning1_minutes.0.is_null() {
@@ -1468,9 +1447,11 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                             let value = String::from_utf16_lossy(&buffer[..len as usize]);
                             if let Ok(minutes) = value.parse::<i32>() {
                                 // At least a minute (0 meant "shut down a
-                                // second after every block"); validated above.
-                                let seconds = minutes.max(1) * 60;
-                                set_setting("lock_screen_timeout", &seconds.to_string());
+                                // second after every block"); validated
+                                // above, and enforced again where it's read
+                                // (database::get_lock_screen_timeout).
+                                let minutes = minutes.max(crate::database::MIN_LOCK_SCREEN_TIMEOUT_MINS);
+                                set_setting("lock_screen_timeout", &(minutes * 60).to_string());
                             }
                         }
 

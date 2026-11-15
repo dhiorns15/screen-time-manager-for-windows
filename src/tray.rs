@@ -23,7 +23,7 @@ use windows::{
 use crate::blocking::{extend_time, get_remaining_seconds, hide_blocking_overlay, show_blocking_overlay, BLOCKING_HWND};
 use crate::constants::*;
 use crate::database::{get_blocking_message, get_warning_config, is_pause_enabled};
-use crate::dialogs::{show_settings_dialog, show_stats_dialog, verify_passcode_for_quit};
+use crate::dialogs::{show_settings_dialog, show_stats_dialog, verify_passcode_for_action, PasscodeAction};
 use crate::i18n;
 use crate::mini_overlay::{is_paused, is_idle_paused, can_pause, toggle_pause, PauseBlockedReason, get_remaining_pause_budget};
 use crate::overlay::{show_overlay, OVERLAY_HWND};
@@ -309,17 +309,17 @@ pub unsafe extern "system" fn window_proc(
                     show_blocking_overlay(&message);
                 }
                 IDM_TODAYS_STATS => {
-                    if verify_passcode_for_quit(hwnd) {
+                    if verify_passcode_for_action(hwnd, PasscodeAction::Stats) {
                         show_stats_dialog(hwnd);
                     }
                 }
                 IDM_SETTINGS => {
-                    if verify_passcode_for_quit(hwnd) {
+                    if verify_passcode_for_action(hwnd, PasscodeAction::Settings) {
                         show_settings_dialog(hwnd);
                     }
                 }
                 IDM_EXTEND_15 => {
-                    if verify_passcode_for_quit(hwnd) {
+                    if verify_passcode_for_action(hwnd, PasscodeAction::Extend15) {
                         extend_time(15);
                         crate::time_request::notify_passcode_extend(
                             "passcode_extend.source.tray_menu",
@@ -329,7 +329,7 @@ pub unsafe extern "system" fn window_proc(
                     }
                 }
                 IDM_EXTEND_45 => {
-                    if verify_passcode_for_quit(hwnd) {
+                    if verify_passcode_for_action(hwnd, PasscodeAction::Extend45) {
                         extend_time(45);
                         crate::time_request::notify_passcode_extend(
                             "passcode_extend.source.tray_menu",
@@ -352,7 +352,7 @@ pub unsafe extern "system" fn window_proc(
                 // sibling arms, rather than hiding it in a match guard.
                 #[allow(clippy::collapsible_match)]
                 IDM_QUIT => {
-                    if verify_passcode_for_quit(hwnd) {
+                    if verify_passcode_for_action(hwnd, PasscodeAction::Quit) {
                         // Tell the watchdog task this is a sanctioned stop, not
                         // the app being killed out from under the timer.
                         crate::database::mark_intentional_quit();

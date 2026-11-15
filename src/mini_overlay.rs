@@ -294,15 +294,29 @@ fn cooldown_remaining_secs(now: i64, last_pause_end: i64, cooldown_secs: i64) ->
     (cooldown_secs - elapsed.max(0)).clamp(0, cooldown_secs)
 }
 
-/// Get remaining pause budget in seconds
+/// Pause budget left today in seconds. 0 while pausing is switched off
+/// (Settings saves a daily pause of 0 as `pause_enabled=0`), whatever the
+/// stored budget says.
 pub fn get_remaining_pause_budget() -> i32 {
     let config = database::get_pause_config();
-    let budget_seconds = (config.daily_budget_minutes * 60) as i32;
-    let used = database::get_pause_used_today();
-    (budget_seconds - used).max(0)
+    remaining_pause_budget(
+        database::is_pause_enabled(),
+        (config.daily_budget_minutes * 60) as i32,
+        database::get_pause_used_today(),
+    )
 }
 
-/// Get maximum pause duration for current pause (considering budget and config)
+fn remaining_pause_budget(enabled: bool, budget_seconds: i32, used_seconds: i32) -> i32 {
+    if enabled {
+        (budget_seconds - used_seconds).max(0)
+    } else {
+        0
+    }
+}
+
+/// Get maximum pause duration for current pause (considering budget and
+/// config). 0 while pausing is off, so a pause in progress when it's switched
+/// off ends at the next tick (see `accrue_pause`).
 pub fn get_max_pause_duration() -> i32 {
     let config = database::get_pause_config();
     let max_single = (config.max_duration_minutes * 60) as i32;
@@ -944,6 +958,16 @@ mod tests {
         assert!(!zero_time_lock_due(0, true));
         assert!(!zero_time_lock_due(1, false));
         assert!(!zero_time_lock_due(-1, false), "negative means no limit");
+    }
+
+    #[test]
+    fn switched_off_pausing_leaves_no_budget() {
+        assert_eq!(remaining_pause_budget(true, 45 * 60, 600), 45 * 60 - 600);
+        assert_eq!(remaining_pause_budget(true, 600, 900), 0, "overspent");
+        assert_eq!(remaining_pause_budget(false, 45 * 60, 0), 0, "disabled with a budget left");
+        assert_eq!(remaining_pause_budget(true, 0, 0), 0, "daily pause of 0");
+        // ...so a pause in progress ends on the next tick
+        assert_eq!(pause_step(300, 1, remaining_pause_budget(false, 45 * 60, 0)), (300, true));
     }
 
     #[test]

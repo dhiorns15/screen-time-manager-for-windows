@@ -104,7 +104,9 @@ pub fn notify_passcode_extend(source_key: &str, minutes: i32, remaining_seconds:
 
 /// Called once per run of wrong passcodes, when it reaches the point where
 /// entry starts being locked (see `passcode_guard`) - someone may be
-/// guessing.
+/// guessing. Sent through the watchdog's alert queue rather than the running
+/// bots, like the tamper alerts: it goes out even if the bot hasn't
+/// connected yet (or the PC is offline - then it's retried), and only once.
 pub fn notify_passcode_lockout(failures: u32) {
     let username = current_windows_username();
     let text = format!(
@@ -114,16 +116,7 @@ pub fn notify_passcode_lockout(failures: u32) {
         failures,
         i18n::t("passcode_guard.notify.suffix"),
     );
-
-    let tg = database::get_telegram_config();
-    let dc = database::get_discord_config();
-
-    if tg.enabled {
-        telegram::notify_admin(&text);
-    }
-    if dc.enabled {
-        discord::notify_admin(&text);
-    }
+    crate::watchdog::raise_alert(&text);
 }
 
 /// Called whenever idle detection flips the timer between paused and running

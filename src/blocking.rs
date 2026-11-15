@@ -2,7 +2,7 @@
 //! Full-screen overlay that requires passcode to dismiss
 
 use std::mem::zeroed;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU8, Ordering};
 use std::sync::Mutex;
 use windows::{
     core::w,
@@ -37,6 +37,7 @@ use crate::constants::*;
 use crate::database::{get_discord_config, get_telegram_config};
 use crate::dpi::scale;
 use crate::i18n;
+use crate::passcode_guard::{self, Attempt};
 
 /// Initiates a Windows shutdown with proper privilege handling
 unsafe fn initiate_shutdown() -> bool {
@@ -109,7 +110,63 @@ struct MonitorInfo {
 pub static BLOCKING_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 pub static BLOCKING_TEXT: Mutex<Option<String>> = Mutex::new(None);
 pub static BLOCKING_EDIT_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
-pub static PASSCODE_ERROR: AtomicBool = AtomicBool::new(false);
+
+/// What the line under the lock screen's passcode field says after the last
+/// attempt (a `PasscodeNotice` as u8).
+static PASSCODE_NOTICE: AtomicU8 = AtomicU8::new(PasscodeNotice::None as u8);
+
+/// The lock screen's passcode feedback, from the last attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum PasscodeNotice {
+    None = 0,
+    Incorrect = 1,
+    /// Entry is locked after too many wrong codes; the time left is read
+    /// from `passcode_guard` whenever it's drawn.
+    LockedOut = 2,
+    /// The passcode couldn't be read, so nothing was unlocked.
+    Unavailable = 3,
+}
+
+impl PasscodeNotice {
+    fn after(attempt: Attempt) -> Self {
+        match attempt {
+            Attempt::Correct => PasscodeNotice::None,
+            Attempt::Wrong { locked_for_secs: 0 } => PasscodeNotice::Incorrect,
+            Attempt::Wrong { .. } | Attempt::LockedOut { .. } => PasscodeNotice::LockedOut,
+            Attempt::Unavailable => PasscodeNotice::Unavailable,
+        }
+    }
+
+    fn current() -> Self {
+        match PASSCODE_NOTICE.load(Ordering::SeqCst) {
+            1 => PasscodeNotice::Incorrect,
+            2 => PasscodeNotice::LockedOut,
+            3 => PasscodeNotice::Unavailable,
+            _ => PasscodeNotice::None,
+        }
+    }
+
+    fn set(self) {
+        PASSCODE_NOTICE.store(self as u8, Ordering::SeqCst);
+    }
+
+    /// The text to show, given the lockout seconds left right now. A lockout
+    /// that has run out shows nothing: the next code will be checked.
+    fn text(self, lockout_left: u64) -> Option<String> {
+        match self {
+            PasscodeNotice::None => None,
+            PasscodeNotice::Incorrect => Some(i18n::t("blocking.incorrect").to_string()),
+            PasscodeNotice::LockedOut if lockout_left == 0 => None,
+            PasscodeNotice::LockedOut => Some(format!(
+                "{} {}",
+                i18n::t("passcode.locked"),
+                passcode_guard::format_wait(lockout_left)
+            )),
+            PasscodeNotice::Unavailable => Some(i18n::t("passcode.unavailable").to_string()),
+        }
+    }
+}
 
 /// "Request more time" button/edit, and how many cooldown seconds remain
 /// before it can be used again (0 = ready)
@@ -197,14 +254,14 @@ pub unsafe fn show_blocking_overlay_with_time(text: &str, remaining_seconds: i32
     }
 
     *BLOCKING_TEXT.lock().unwrap() = Some(text.to_string());
-    PASSCODE_ERROR.store(false, Ordering::SeqCst);
+    PasscodeNotice::None.set();
     if remaining_seconds >= 0 {
         REMAINING_SECONDS.store(remaining_seconds, Ordering::SeqCst);
     }
 
-    // Initialize shutdown countdown from database setting
-    let timeout = effective_lock_timeout(crate::database::get_lock_screen_timeout());
-    SHUTDOWN_COUNTDOWN_SECONDS.store(timeout, Ordering::SeqCst);
+    // Initialize shutdown countdown from database setting (never under a
+    // minute - see database::get_lock_screen_timeout)
+    SHUTDOWN_COUNTDOWN_SECONDS.store(crate::database::get_lock_screen_timeout(), Ordering::SeqCst);
     COUNTDOWN_SIGNS_OUT.store(
         countdown_end_action(crate::session::other_users_logged_on()) == CountdownEnd::SignOut,
         Ordering::SeqCst,
@@ -305,13 +362,27 @@ pub fn reduce_time(minutes: i32) {
     });
 }
 
-/// The shortest lock-screen countdown actually used: a configured 0 (the
-/// Settings field takes whole minutes) would otherwise end the session on
-/// the countdown's first tick.
-const MIN_LOCK_SCREEN_TIMEOUT_SECS: i32 = 60;
+/// Remaining time capped to a new daily limit, or `None` if it's already
+/// within it (including "no limit running", which is negative).
+fn capped(current: i32, limit_seconds: i32) -> Option<i32> {
+    (current > limit_seconds).then_some(limit_seconds)
+}
 
-fn effective_lock_timeout(configured_secs: i32) -> i32 {
-    configured_secs.max(MIN_LOCK_SCREEN_TIMEOUT_SECS)
+/// Cap the remaining time to `limit_seconds` (a daily limit that was just
+/// lowered), atomically as above, so a countdown tick or an extension on
+/// another thread can't be lost between the check and the store. Saves and
+/// redraws if it changed anything; returns whether it did.
+pub fn cap_remaining_time(limit_seconds: i32) -> bool {
+    let changed = REMAINING_SECONDS
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| capped(current, limit_seconds))
+        .is_ok();
+    if changed {
+        crate::database::save_remaining_time(REMAINING_SECONDS.load(Ordering::SeqCst));
+        unsafe {
+            crate::mini_overlay::update_mini_overlay();
+        }
+    }
+    changed
 }
 
 /// The countdown only runs while this session is the one at the console and
@@ -416,20 +487,44 @@ pub fn is_blocking_overlay_visible() -> bool {
     BLOCKING_TEXT.lock().unwrap().is_some()
 }
 
-/// Verify passcode entered in blocking overlay
+/// Check the code typed on the lock screen - attempt-limited like the tray's
+/// passcode prompt (see `passcode_guard`) - and set the notice under the
+/// field to match.
 unsafe fn check_blocking_passcode() -> bool {
+    let edit_ptr = BLOCKING_EDIT_HWND.load(Ordering::SeqCst);
+    if edit_ptr.is_null() {
+        return false;
+    }
+    let mut buffer = [0u16; 16];
+    let len = GetWindowTextW(HWND(edit_ptr), &mut buffer);
+    let entered: String = String::from_utf16_lossy(&buffer[..len as usize]);
+
+    let attempt = passcode_guard::attempt(&entered);
+    PasscodeNotice::after(attempt).set();
+    attempt.is_correct()
+}
+
+/// After a code that didn't unlock: show the notice, clear the field for
+/// the next try and beep.
+unsafe fn reject_passcode(hwnd: HWND) {
+    let _ = InvalidateRect(hwnd, None, false);
     let edit_ptr = BLOCKING_EDIT_HWND.load(Ordering::SeqCst);
     if !edit_ptr.is_null() {
         let edit = HWND(edit_ptr);
-        let mut buffer = [0u16; 16];
-        let len = GetWindowTextW(edit, &mut buffer);
-        let entered: String = String::from_utf16_lossy(&buffer[..len as usize]);
-
-        if crate::database::verify_passcode(&entered) {
-            return true;
-        }
+        SetWindowTextW(edit, w!("")).ok();
+        let _ = SetFocus(edit);
     }
-    false
+    let _ = PlaySoundW(w!("SystemExclamation"), None, SND_ALIAS | SND_ASYNC);
+}
+
+/// Where the passcode notice is drawn, for a panel at (`panel_x`, `panel_y`).
+fn passcode_notice_rect(panel_x: i32, panel_y: i32, panel_width: i32, panel_height: i32) -> RECT {
+    RECT {
+        left: panel_x,
+        top: panel_y + panel_height - scale(40),
+        right: panel_x + panel_width,
+        bottom: panel_y + panel_height - scale(15),
+    }
 }
 
 // The passcode EDIT control owns keyboard focus once created, so WM_KEYDOWN
@@ -745,8 +840,15 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                 );
             }
 
-            // Error message at the bottom
-            if PASSCODE_ERROR.load(Ordering::SeqCst) {
+            // Passcode notice at the bottom (wrong code, locked out with the
+            // time left, or the passcode couldn't be read)
+            let notice = PasscodeNotice::current();
+            let lockout_left = if notice == PasscodeNotice::LockedOut {
+                passcode_guard::lockout_remaining()
+            } else {
+                0
+            };
+            if let Some(text) = notice.text(lockout_left) {
                 SetTextColor(hdc, COLORREF(COLOR_ERROR));
                 let error_font = CreateFontW(
                     scale(15), 0, 0, 0,
@@ -755,15 +857,10 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                     w!("Segoe UI"),
                 );
                 SelectObject(hdc, error_font);
-                let mut error_rect = RECT {
-                    left: panel_x,
-                    top: panel_y + panel_height - scale(40),
-                    right: panel_x + panel_width,
-                    bottom: panel_y + panel_height - scale(15),
-                };
+                let mut error_rect = passcode_notice_rect(panel_x, panel_y, panel_width, panel_height);
                 DrawTextW(
                     hdc,
-                    &mut i18n::t("blocking.incorrect").encode_utf16().collect::<Vec<_>>(),
+                    &mut text.encode_utf16().collect::<Vec<_>>(),
                     &mut error_rect,
                     DT_CENTER | DT_SINGLELINE,
                 );
@@ -810,15 +907,7 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                             }
                             hide_blocking_overlay();
                         } else {
-                            PASSCODE_ERROR.store(true, Ordering::SeqCst);
-                            let _ = InvalidateRect(hwnd, None, false);
-                            let edit_ptr = BLOCKING_EDIT_HWND.load(Ordering::SeqCst);
-                            if !edit_ptr.is_null() {
-                                let edit = HWND(edit_ptr);
-                                SetWindowTextW(edit, w!("")).ok();
-                                let _ = SetFocus(edit);
-                            }
-                            let _ = PlaySoundW(w!("SystemExclamation"), None, SND_ALIAS | SND_ASYNC);
+                            reject_passcode(hwnd);
                         }
                     }
                     ID_EXTEND_15 | ID_EXTEND_30 | ID_EXTEND_60 => {
@@ -836,7 +925,6 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                                 minutes,
                                 REMAINING_SECONDS.load(Ordering::SeqCst),
                             );
-                            PASSCODE_ERROR.store(false, Ordering::SeqCst);
 
                             // Clear the passcode field
                             let edit_ptr = BLOCKING_EDIT_HWND.load(Ordering::SeqCst);
@@ -847,15 +935,7 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                             // Hide overlay and let the user continue
                             hide_blocking_overlay();
                         } else {
-                            PASSCODE_ERROR.store(true, Ordering::SeqCst);
-                            let _ = InvalidateRect(hwnd, None, false);
-                            let edit_ptr = BLOCKING_EDIT_HWND.load(Ordering::SeqCst);
-                            if !edit_ptr.is_null() {
-                                let edit = HWND(edit_ptr);
-                                SetWindowTextW(edit, w!("")).ok();
-                                let _ = SetFocus(edit);
-                            }
-                            let _ = PlaySoundW(w!("SystemExclamation"), None, SND_ALIAS | SND_ASYNC);
+                            reject_passcode(hwnd);
                         }
                     }
                     ID_SHUTDOWN_BUTTON => {
@@ -969,6 +1049,16 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                         bottom: panel_y + scale(200),
                     };
                     let _ = InvalidateRect(hwnd, Some(&countdown_rect), false);
+
+                    // A passcode lockout counts down under the field too;
+                    // once it's over the notice goes away.
+                    if PasscodeNotice::current() == PasscodeNotice::LockedOut {
+                        if passcode_guard::lockout_remaining() == 0 {
+                            PasscodeNotice::None.set();
+                        }
+                        let notice_rect = passcode_notice_rect(panel_x, panel_y, panel_width, panel_height);
+                        let _ = InvalidateRect(hwnd, Some(&notice_rect), false);
+                    }
                 }
                 TIMER_REQUEST_COOLDOWN => {
                     let remaining = REQUEST_COOLDOWN_REMAINING.fetch_sub(1, Ordering::SeqCst) - 1;
@@ -1023,15 +1113,7 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                     }
                     hide_blocking_overlay();
                 } else {
-                    PASSCODE_ERROR.store(true, Ordering::SeqCst);
-                    let _ = InvalidateRect(hwnd, None, false);
-                    let edit_ptr = BLOCKING_EDIT_HWND.load(Ordering::SeqCst);
-                    if !edit_ptr.is_null() {
-                        let edit = HWND(edit_ptr);
-                        SetWindowTextW(edit, w!("")).ok();
-                        let _ = SetFocus(edit);
-                    }
-                    let _ = PlaySoundW(w!("SystemExclamation"), None, SND_ALIAS | SND_ASYNC);
+                    reject_passcode(hwnd);
                 }
             }
             LRESULT(0)
@@ -1546,11 +1628,32 @@ mod tests {
     }
 
     #[test]
-    fn lock_timeout_is_at_least_a_minute() {
-        assert_eq!(effective_lock_timeout(0), 60);
-        assert_eq!(effective_lock_timeout(-600), 60);
-        assert_eq!(effective_lock_timeout(59), 60);
-        assert_eq!(effective_lock_timeout(600), 600);
+    fn lowering_the_limit_caps_remaining_time() {
+        assert_eq!(capped(7200, 3600), Some(3600));
+        assert_eq!(capped(3600, 3600), None);
+        assert_eq!(capped(1800, 3600), None);
+        assert_eq!(capped(-1, 3600), None, "no limit running is left alone");
+        assert_eq!(capped(600, 0), Some(0), "a 0-minute day locks");
+    }
+
+    #[test]
+    fn passcode_notice_follows_the_attempt() {
+        assert_eq!(PasscodeNotice::after(Attempt::Correct), PasscodeNotice::None);
+        assert_eq!(PasscodeNotice::after(Attempt::Wrong { locked_for_secs: 0 }), PasscodeNotice::Incorrect);
+        assert_eq!(PasscodeNotice::after(Attempt::Wrong { locked_for_secs: 30 }), PasscodeNotice::LockedOut);
+        assert_eq!(PasscodeNotice::after(Attempt::LockedOut { secs_remaining: 5 }), PasscodeNotice::LockedOut);
+        assert_eq!(PasscodeNotice::after(Attempt::Unavailable), PasscodeNotice::Unavailable);
+    }
+
+    #[test]
+    fn lockout_notice_shows_the_time_left_until_it_runs_out() {
+        assert_eq!(PasscodeNotice::None.text(30), None);
+        let locked = PasscodeNotice::LockedOut.text(65).unwrap();
+        assert!(locked.ends_with(" 1:05"), "{locked}");
+        assert!(locked.starts_with(i18n::t("passcode.locked")), "{locked}");
+        assert_eq!(PasscodeNotice::LockedOut.text(0), None, "lockout over: nothing to show");
+        assert!(PasscodeNotice::Incorrect.text(0).is_some());
+        assert!(PasscodeNotice::Unavailable.text(0).is_some());
     }
 
     #[test]

@@ -417,14 +417,11 @@ pub fn app_last_started() -> Option<std::time::SystemTime> {
     std::fs::metadata(app_started_marker_path()).ok()?.modified().ok()
 }
 
-/// Get the passcode. Shared machine-wide (see `SHARED_DB_CONNECTION`) so the
+/// Set the passcode. Shared machine-wide (see `SHARED_DB_CONNECTION`) so the
 /// same passcode works no matter which Windows account is logged in, rather
-/// than each account needing its own set separately.
-pub fn get_passcode() -> Option<String> {
-    get_shared_setting("passcode")
-}
-
-/// Set the passcode. Shared machine-wide - see `get_passcode`.
+/// than each account needing its own set separately. Read it with
+/// `read_passcode`/`effective_passcode`; codes typed by a user are checked
+/// through `passcode_guard::attempt`.
 pub fn set_passcode(code: &str) -> bool {
     set_shared_setting("passcode", code)
 }
@@ -437,7 +434,7 @@ const ROTATING_PIN_SECRET: &str = "rotating_pin_secret";
 /// works everywhere the regular passcode does, as an additional valid code
 /// alongside it (the regular passcode always keeps working too, so there's
 /// no lockout risk if the rotating code isn't at hand). Shared machine-wide,
-/// same as the passcode - see `get_passcode`.
+/// same as the passcode - see `set_passcode`.
 pub fn is_rotating_pin_enabled() -> bool {
     get_shared_setting(ROTATING_PIN_ENABLED).map(|s| s == "true").unwrap_or(false)
 }
@@ -474,18 +471,6 @@ pub fn get_rotating_pin() -> String {
         hash = hash.wrapping_mul(0x100000001b3); // FNV prime
     }
     format!("{:04}", hash % 10000)
-}
-
-/// Check an entered code against the passcode and (if enabled) today's
-/// rotating PIN. Use this instead of comparing to `get_passcode()` directly
-/// anywhere a passcode is checked.
-pub fn verify_passcode(entered: &str) -> bool {
-    if let Some(stored) = get_passcode() {
-        if entered == stored {
-            return true;
-        }
-    }
-    is_rotating_pin_enabled() && entered == get_rotating_pin()
 }
 
 /// Get a setting value from the database
@@ -891,7 +876,10 @@ pub fn get_current_weekday() -> u32 {
 // Lock Screen Timeout Functions
 // ============================================================================
 
-/// Get lock screen timeout in seconds (time before shutdown when lock screen is active)
+/// Lock screen timeout in seconds (how long the lock screen counts down
+/// before shutting down or signing out), never less than
+/// `MIN_LOCK_SCREEN_TIMEOUT_SECS`. The one place the stored value is read:
+/// the lock screen uses it as is, and Settings refuses to save less.
 pub fn get_lock_screen_timeout() -> i32 {
     let secs = get_setting("lock_screen_timeout")
         .and_then(|s| s.parse().ok())
@@ -899,19 +887,15 @@ pub fn get_lock_screen_timeout() -> i32 {
     clamp_lock_screen_timeout(secs)
 }
 
-/// The shortest lock-screen shutdown timeout, in seconds. Settings used to
-/// accept 0 minutes, which shut the PC down a second after every block
-/// (including at each logon with no time left); a value below a minute that
-/// is already stored is read as one minute. Negative values (never written
-/// by the app) are left alone.
-pub const MIN_LOCK_SCREEN_TIMEOUT_SECS: i32 = 60;
+/// The shortest lock-screen timeout, in seconds. Settings used to accept 0
+/// minutes, which shut the PC down a second after every block (including at
+/// each logon with no time left); anything shorter that is already stored -
+/// or negative, which the app never writes - is read as one minute.
+pub const MIN_LOCK_SCREEN_TIMEOUT_MINS: i32 = 1;
+const MIN_LOCK_SCREEN_TIMEOUT_SECS: i32 = MIN_LOCK_SCREEN_TIMEOUT_MINS * 60;
 
 fn clamp_lock_screen_timeout(secs: i32) -> i32 {
-    if (0..MIN_LOCK_SCREEN_TIMEOUT_SECS).contains(&secs) {
-        MIN_LOCK_SCREEN_TIMEOUT_SECS
-    } else {
-        secs
-    }
+    secs.max(MIN_LOCK_SCREEN_TIMEOUT_SECS)
 }
 
 // ============================================================================
@@ -1161,9 +1145,9 @@ pub enum PasscodeRead {
 }
 
 /// Read the passcode, telling "nothing stored" apart from "could not read".
-/// Unlike `get_passcode` (which returns `None` for both, and which the
-/// passcode dialog used to treat as "no passcode, let them in"), a query
-/// error here is reported as `Unreadable`. The shared database wins when it
+/// Unlike the old `get_passcode` (which returned `None` for both, and which
+/// the passcode dialog treated as "no passcode, let them in"), a query error
+/// here is reported as `Unreadable`. The shared database wins when it
 /// has the row; when it doesn't (e.g. its one-time migration could not
 /// write), the per-account value is used, as `init_shared_database`'s
 /// migration intends.
@@ -1552,7 +1536,8 @@ mod tests {
         assert_eq!(clamp_lock_screen_timeout(59), 60);
         assert_eq!(clamp_lock_screen_timeout(60), 60);
         assert_eq!(clamp_lock_screen_timeout(600), 600);
-        assert_eq!(clamp_lock_screen_timeout(-1), -1);
+        assert_eq!(clamp_lock_screen_timeout(-1), 60);
+        assert_eq!(clamp_lock_screen_timeout(-600), 60);
     }
 
     #[test]

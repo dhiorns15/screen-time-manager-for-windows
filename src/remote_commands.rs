@@ -408,15 +408,7 @@ pub fn cmd_setlimit(args: &str) -> String {
     // If today's limit was just lowered, cap remaining time to match -
     // mirrors the same adjustment the Settings dialog makes on Save.
     if weekday == database::get_current_weekday() {
-        let new_limit_seconds = (minutes * 60) as i32;
-        let remaining = blocking::get_remaining_seconds();
-        if remaining > new_limit_seconds {
-            blocking::REMAINING_SECONDS.store(new_limit_seconds, Ordering::SeqCst);
-            database::save_remaining_time(new_limit_seconds);
-            unsafe {
-                mini_overlay::update_mini_overlay();
-            }
-        }
+        blocking::cap_remaining_time((minutes * 60) as i32);
     }
 
     format!(

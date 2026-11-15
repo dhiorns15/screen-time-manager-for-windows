@@ -32,8 +32,6 @@ pub enum Attempt {
 }
 
 impl Attempt {
-    // For the lock screen (blocking.rs), which is wired to this separately.
-    #[allow(dead_code)]
     pub fn is_correct(self) -> bool {
         self == Attempt::Correct
     }
@@ -140,7 +138,8 @@ fn now_secs() -> i64 {
 }
 
 /// Check an entered code, with attempt limiting. Every place a passcode is
-/// typed should call this instead of `database::verify_passcode`.
+/// typed calls this (the tray's passcode dialog and the lock screen); there
+/// is deliberately no unlimited check for UI code to use instead.
 pub fn attempt(entered: &str) -> Attempt {
     let now = now_secs();
     let state = load().current(now);
@@ -177,7 +176,6 @@ pub fn attempt(entered: &str) -> Attempt {
 
 /// Seconds left on the current lockout, 0 if entry is open. For showing a
 /// countdown without making an attempt.
-#[allow(dead_code)]
 pub fn lockout_remaining() -> u64 {
     let now = now_secs();
     load().current(now).lockout_remaining(now)
