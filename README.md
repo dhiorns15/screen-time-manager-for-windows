@@ -130,6 +130,7 @@ You can monitor and control screen time from your phone using Telegram. This is 
 - `/setlimit 90` or `/setlimit saturday 180` - Change the daily time limit remotely (today, or a specific day)
 - `/rotatingpin on` and `/getpin` - Optional auto-rotating daily code (see below)
 - `/update` - Install a new version of the app, after the bot tells you one is out (see [Updating](#updating))
+- `/clearlockout` - Let the next passcode be checked straight away after too many wrong codes locked passcode entry
 
 **Setup (one-time):**
 
@@ -141,7 +142,7 @@ You can monitor and control screen time from your phone using Telegram. This is 
 6. In Screen Time Manager settings, scroll to "Telegram Bot" section (or use the **Setup Wizard**, which finds the chat ID for you)
 7. Paste your bot token and chat ID, then enable the bot
 
-The bot starts as soon as you save. Once configured, only you can control the bot - it ignores messages from anyone else. If you set it up in a **group** (for example a family group, so both parents get the alerts), only the group's owner and administrators can send it commands; ordinary members, such as a child you added to the group, can't. The bot never posts a PIN in a group, where everyone in it could read it; ask for `/getpin` in your private chat with the bot instead.
+The bot starts as soon as you save. Once configured, only you can control the bot - it ignores messages from anyone else. If you set it up in a **group** (for example a family group, so both parents get the alerts), only the group's owner and administrators can send it commands; ordinary members, such as a child you added to the group, can't. The bot never posts a PIN in a group, where everyone in it could read it: `/getpin` sent in a group is answered in your private chat with the bot (start one first, since Telegram doesn't let a bot message you until you have), and a `/setpin` message is deleted from the group if the bot is a group admin allowed to delete messages.
 
 The Setup Wizard takes the chat from the first message the bot receives while the wizard is waiting for it, so send that message after you reach that step - anything sent to the bot earlier is ignored.
 
@@ -168,6 +169,7 @@ You can also monitor and control screen time from a Discord channel, using a Dis
 - `!setlimit 90` or `!setlimit saturday 180` - Change the daily time limit remotely (today, or a specific day)
 - `!rotatingpin on` and `!getpin` - Optional auto-rotating daily code (see below)
 - `!update` - Install a new version of the app, after the bot tells you one is out (see [Updating](#updating))
+- `!clearlockout` - Let the next passcode be checked straight away after too many wrong codes locked passcode entry
 - `!help` - See all commands
 
 **Setup (one-time):**
@@ -210,7 +212,7 @@ The watchdog also notices when the app is still there but has stopped working - 
 
 Other alerts you may get:
 
-- **Wrong passcodes** - after five wrong codes in a row (on the lock screen or in the tray's passcode prompt), each further wrong code makes passcode entry wait before it accepts another try (up to 15 minutes), and you get one alert, since someone may be guessing. If it was you, a bot command clears the wait so you can try again straight away.
+- **Wrong passcodes** - after five wrong codes in a row (on the lock screen or in the tray's passcode prompt), each further wrong code makes passcode entry wait before it accepts another try (up to 15 minutes), and you get an alert, since someone may be guessing (and another, at most once an hour, while the wait keeps being pushed to its maximum). While it waits, even the right code is refused, on every account. Send `/clearlockout` (Telegram) or `!clearlockout` (Discord) to clear the wait so the next code is checked straight away.
 - **Clock or time zone changed** - changing the PC's clock or time zone doesn't start a new day with a fresh allowance: the app stays on the day it was on, and tells you. If you changed the time zone on purpose (say, you're travelling with the laptop), open Settings and click Save to accept it.
 - **Damaged settings** - if an account's settings file can't be opened, the app doesn't stop: a damaged file is set aside and replaced with default settings (re-check the limits for that account), and if the file can't be opened at all the app runs on default settings until it can. Either way you're told. The time already used today is carried over, so this doesn't start the day's allowance over.
 
