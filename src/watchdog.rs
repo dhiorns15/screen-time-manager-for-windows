@@ -73,6 +73,8 @@ fn check_app() {
         if let Some(token) = logon_token {
             database::record_confirmed_running(token);
         }
+        // Whatever this watchdog ended earlier has been started again.
+        clear_watchdog_ended_record();
         check_heartbeat(logon_token);
         return;
     }
@@ -116,6 +118,18 @@ fn check_app() {
 
     if database::quit_was_intentional() {
         log_state("intentional_quit", "app not running - last stop was an intentional quit, not alerting");
+        return;
+    }
+
+    // This watchdog ended the app itself (it had stopped responding) and it
+    // hasn't started since: the restart failed, and the admin was already
+    // told so. Keep trying, but don't report our own action as a kill.
+    let ended = std::fs::read_to_string(watchdog_ended_path()).ok().and_then(|s| WatchdogEnded::parse(&s));
+    if let Some(age) = ended.and_then(|e| e.applies(wall_now(), logon_token)) {
+        let relaunched = relaunch_app();
+        log_state(&format!("watchdog_ended_relaunch_{relaunched}"), &format!(
+            "app not running - this watchdog ended it {age}s ago (unresponsive) and it hasn't started since, relaunched={relaunched}, no tamper alert"
+        ));
         return;
     }
 
@@ -524,13 +538,16 @@ fn clear_stale_tracker() {
 /// the session (see `someone_using_session`). Then the app's window is
 /// probed, twice with a pause in between: if it answers, or the heartbeat
 /// moves on meanwhile, nothing is done. Only an app that stays unresponsive
-/// is ended and restarted, and the admin is told once per incident.
+/// is ended and restarted, and the admin is told once per incident. Nothing
+/// is done either while the app is being quit (or the session is ending),
+/// only one run acts on an incident, and after `MAX_HUNG_RESTARTS` restarts
+/// within an hour the app is left alone (see `RestartHistory`).
 fn check_heartbeat(logon_token: Option<i64>) {
     let Some(token) = logon_token else {
         set_last_state("running");
         return;
     };
-    let hb = std::fs::read_to_string(heartbeat_path()).ok().and_then(|s| Heartbeat::parse(&s));
+    let hb = read_heartbeat();
     let now_unbiased = unbiased_now();
 
     match heartbeat_status(hb.as_ref(), token, now_unbiased) {
@@ -547,7 +564,16 @@ fn check_heartbeat(logon_token: Option<i64>) {
         }
         HeartbeatStatus::Stale { age_secs } => {
             let (Some(hb), Some(now_unbiased)) = (hb, now_unbiased) else { return };
-            let prev = std::fs::read_to_string(stale_tracker_path()).ok().and_then(|s| StaleTracker::parse(&s));
+            if database::quit_was_intentional() {
+                // Quitting via the passcode-protected Quit (or the session
+                // is ending) and still holding the mutex while it exits:
+                // not a frozen app to end and restart against that Quit.
+                log_state("hb_stale_quitting", &format!(
+                    "app holds its mutex but its heartbeat is {age_secs}s old - the last stop was an intentional quit or the session is ending, not acting"
+                ));
+                return;
+            }
+            let prev = read_stale_tracker();
             let mut tracker = StaleTracker::observe(prev, &hb, now_unbiased, wall_now());
             if tracker.confirmed() && !tracker.handled {
                 let attended = someone_using_session(
@@ -562,6 +588,28 @@ fn check_heartbeat(logon_token: Option<i64>) {
                     let _ = std::fs::write(stale_tracker_path(), tracker.serialize());
                     log_state("hb_stale_unattended", &format!(
                         "app holds its mutex but its heartbeat is {age_secs}s old - not acting while nobody is using this session (no keyboard/mouse input since, locked, or not at the console)"
+                    ));
+                    return;
+                }
+                // Only one run acts on an incident: the per-minute run and
+                // the delayed logon run can overlap, and a second run acting
+                // on an incident the first just dealt with would find the
+                // relaunched app without a window yet and raise a false alert.
+                let Some(_incident) = FileLock::try_acquire(incident_lock_path(), INCIDENT_LOCK_STALE_SECS) else {
+                    log_state("hb_incident_busy", &format!(
+                        "heartbeat {age_secs}s old - another watchdog run is dealing with it, not acting"
+                    ));
+                    return;
+                };
+                let still_stands = incident_still_stands(
+                    read_stale_tracker(),
+                    read_heartbeat(),
+                    &hb,
+                    unsafe { app_is_running() },
+                );
+                if !still_stands {
+                    log_state("hb_incident_over", &format!(
+                        "heartbeat {age_secs}s old, but by the time this run could act the incident was already dealt with or over - not acting"
                     ));
                     return;
                 }
@@ -633,10 +681,7 @@ fn window_answers(hwnd: windows::Win32::Foundation::HWND) -> bool {
 
 /// Whether the app has written a different heartbeat than `hb` since.
 fn heartbeat_moved_on(hb: &Heartbeat) -> bool {
-    std::fs::read_to_string(heartbeat_path())
-        .ok()
-        .and_then(|s| Heartbeat::parse(&s))
-        .is_some_and(|now| now != *hb)
+    read_heartbeat().is_some_and(|now| now != *hb)
 }
 
 fn handle_unresponsive_app(hb: &Heartbeat, age_secs: u64) {
@@ -660,6 +705,14 @@ fn handle_unresponsive_app(hb: &Heartbeat, age_secs: u64) {
         return;
     }
 
+    // A Quit (or sign-out) during the probes: the app is on its way out.
+    if database::quit_was_intentional() {
+        log_state("hb_stale_quitting", &format!(
+            "heartbeat {age_secs}s old and the app didn't answer, but it is being quit or the session is ending - not acting"
+        ));
+        return;
+    }
+
     // The process to end: the one that owns the unresponsive window, or
     // (no window yet/anymore) the one that wrote the heartbeat.
     let target_pid = window
@@ -673,8 +726,44 @@ fn handle_unresponsive_app(hb: &Heartbeat, age_secs: u64) {
 
     ensure_shared_database();
     let username = current_windows_username();
+    let now = wall_now();
+
+    let history_path = hung_restarts_path();
+    let mut history = std::fs::read_to_string(&history_path)
+        .map(|s| RestartHistory::parse(&s))
+        .unwrap_or_default();
+    match history.decide(now) {
+        HungDecision::Restart => {}
+        decision => {
+            // It keeps freezing again after each restart: stop ending it
+            // (each restart would be another kill and another alert every
+            // few minutes) and say so once.
+            if decision == HungDecision::GiveUpAndAlert {
+                history.gave_up_alerted = Some(now);
+                let _ = std::fs::write(&history_path, history.serialize());
+                queue_alert(&format!(
+                    "⚠️ {} {} {}\n{}",
+                    i18n::t("watchdog.hung.prefix"),
+                    username,
+                    i18n::t("watchdog.hung.gave_up"),
+                    i18n::t("watchdog.hung.suffix"),
+                ));
+            }
+            log_state("hb_gave_up", &format!(
+                "heartbeat {age_secs}s old and the app didn't respond, but it was already restarted {MAX_HUNG_RESTARTS} times within {HUNG_RESTART_WINDOW_SECS}s - leaving it alone (alerted once)"
+            ));
+            return;
+        }
+    }
+
+    // Written before the process is ended, so that the relaunched app
+    // (which clears it as it starts) can't start before it exists.
+    let ended = WatchdogEnded { wall: now, logon_token: hb.logon_token };
+    let _ = std::fs::write(watchdog_ended_path(), ended.serialize());
 
     if unsafe { end_own_app_process(target_pid) } {
+        history.record_restart(now);
+        let _ = std::fs::write(&history_path, history.serialize());
         let relaunched = relaunch_app();
         log_state("hb_restarted", &format!(
             "heartbeat {age_secs}s old and the app didn't respond - ended pid {target_pid}, relaunched={relaunched}, alerting"
@@ -691,17 +780,193 @@ fn handle_unresponsive_app(hb: &Heartbeat, age_secs: u64) {
             status,
             i18n::t("watchdog.hung.suffix"),
         ));
-    } else {
-        log_state("hb_blocked", &format!(
-            "heartbeat {age_secs}s old, mutex held, and no unresponsive app process (pid {target_pid}) to end - something else holds the mutex, alerting"
-        ));
-        queue_alert(&format!(
-            "⚠️ {} {} {}",
-            i18n::t("watchdog.blocked.prefix"),
-            username,
-            i18n::t("watchdog.blocked.suffix"),
-        ));
+        return;
     }
+    clear_watchdog_ended_record();
+
+    // Nothing of ours to end. Before blaming something else for holding
+    // the mutex, make sure the app didn't just exit or come back.
+    if !unsafe { app_is_running() } || heartbeat_moved_on(hb) || database::quit_was_intentional() {
+        log_state("hb_recovered", &format!(
+            "heartbeat {age_secs}s old and the app didn't answer, but it has exited or is running again since - not alerting"
+        ));
+        return;
+    }
+    log_state("hb_blocked", &format!(
+        "heartbeat {age_secs}s old, mutex held, and no unresponsive app process (pid {target_pid}) to end - something else holds the mutex, alerting"
+    ));
+    queue_alert(&format!(
+        "⚠️ {} {} {}",
+        i18n::t("watchdog.blocked.prefix"),
+        username,
+        i18n::t("watchdog.blocked.suffix"),
+    ));
+}
+
+/// Whether the stale-heartbeat incident about `hb` still needs acting on,
+/// checked again once this run has the incident lock: the heartbeat on disk
+/// must still be `hb` (unreadable counts as moved on), no other run may have
+/// handled it already, and the app must still hold its mutex.
+fn incident_still_stands(
+    on_disk: Option<StaleTracker>,
+    current_hb: Option<Heartbeat>,
+    hb: &Heartbeat,
+    app_running: bool,
+) -> bool {
+    let handled_elsewhere = on_disk
+        .is_some_and(|t| t.handled && t.logon_token == hb.logon_token && t.hb_unbiased == hb.unbiased);
+    app_running && current_hb.as_ref() == Some(hb) && !handled_elsewhere
+}
+
+fn read_heartbeat() -> Option<Heartbeat> {
+    std::fs::read_to_string(heartbeat_path()).ok().and_then(|s| Heartbeat::parse(&s))
+}
+
+fn read_stale_tracker() -> Option<StaleTracker> {
+    std::fs::read_to_string(stale_tracker_path()).ok().and_then(|s| StaleTracker::parse(&s))
+}
+
+/// Held while a run acts on a stale-heartbeat incident.
+fn incident_lock_path() -> std::path::PathBuf {
+    data_dir().join("heartbeat_incident.lock")
+}
+
+/// Acting on an incident takes well under a minute (two 5 s probes, a 15 s
+/// pause, a 5 s wait for the process to end, the relaunch); a lock older
+/// than this was left by a run that died.
+const INCIDENT_LOCK_STALE_SECS: u64 = 3 * 60;
+
+// ============================================================================
+// What the watchdog did itself: ended the app, and how often
+// ============================================================================
+
+/// How long a record of the watchdog ending the app keeps a following "not
+/// running" from counting as a kill, if the app doesn't start again before
+/// (its start clears the record, see `clear_watchdog_ended_record`).
+const WATCHDOG_ENDED_MAX_AGE_SECS: i64 = 12 * 60 * 60;
+
+/// Record that this watchdog ended the (unresponsive) app itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WatchdogEnded {
+    /// Wall-clock time it was ended (Unix seconds).
+    wall: i64,
+    /// `session::logon_token` of the session it ran in (0 if unknown).
+    logon_token: i64,
+}
+
+impl WatchdogEnded {
+    fn parse(s: &str) -> Option<Self> {
+        let mut parts = s.split_whitespace();
+        if parts.next()? != "1" {
+            return None;
+        }
+        let ended = WatchdogEnded { wall: parts.next()?.parse().ok()?, logon_token: parts.next()?.parse().ok()? };
+        parts.next().is_none().then_some(ended)
+    }
+
+    fn serialize(&self) -> String {
+        format!("1 {} {}", self.wall, self.logon_token)
+    }
+
+    /// The record's age in seconds if it still explains the app being down
+    /// in session `logon_token`: the same session (or the session can't be
+    /// told right now) and not too old. A clock moved back counts the same
+    /// as forward, so a correction can't turn the watchdog's own action into
+    /// a tamper alert.
+    fn applies(&self, now_wall: i64, logon_token: Option<i64>) -> Option<i64> {
+        let age = now_wall.saturating_sub(self.wall);
+        let same_session = logon_token.is_none_or(|t| t == self.logon_token);
+        (same_session && age.saturating_abs() < WATCHDOG_ENDED_MAX_AGE_SECS).then_some(age)
+    }
+}
+
+fn watchdog_ended_path() -> std::path::PathBuf {
+    data_dir().join("watchdog_ended")
+}
+
+/// Forget that the watchdog ended the app: called by the app as it starts
+/// (main.rs) and by the watchdog when it sees the app running, so the record
+/// only ever covers the gap until the app is running again.
+pub fn clear_watchdog_ended_record() {
+    let _ = std::fs::remove_file(watchdog_ended_path());
+}
+
+/// At most this many restarts of a frozen app within
+/// `HUNG_RESTART_WINDOW_SECS`; after that it's left alone (one alert).
+const MAX_HUNG_RESTARTS: usize = 3;
+const HUNG_RESTART_WINDOW_SECS: i64 = 60 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HungDecision {
+    Restart,
+    /// Too many restarts lately: leave it, and tell the admin.
+    GiveUpAndAlert,
+    /// Too many restarts lately, and the admin was already told.
+    GiveUpQuietly,
+}
+
+/// When the watchdog recently restarted a frozen app (`hung_restarts`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RestartHistory {
+    /// Wall-clock times of the restarts (Unix seconds).
+    restarts: Vec<i64>,
+    /// When the admin was last told the watchdog stopped restarting it.
+    gave_up_alerted: Option<i64>,
+}
+
+/// Whether wall-clock time `t` is within the restart window of `now`, in
+/// either direction (a clock moved back keeps them counting rather than
+/// allowing more restarts).
+fn within_restart_window(t: i64, now: i64) -> bool {
+    now.saturating_sub(t).saturating_abs() < HUNG_RESTART_WINDOW_SECS
+}
+
+impl RestartHistory {
+    /// Lines `r <time>` and `g <time>`; anything else is ignored.
+    fn parse(s: &str) -> Self {
+        let mut history = RestartHistory::default();
+        for line in s.lines() {
+            let mut parts = line.split_whitespace();
+            let (Some(kind), Some(Ok(t)), None) = (parts.next(), parts.next().map(str::parse::<i64>), parts.next()) else {
+                continue;
+            };
+            match kind {
+                "r" => history.restarts.push(t),
+                "g" => history.gave_up_alerted = Some(t),
+                _ => {}
+            }
+        }
+        history
+    }
+
+    fn serialize(&self) -> String {
+        let mut out: String = self.restarts.iter().map(|t| format!("r {t}\n")).collect();
+        if let Some(t) = self.gave_up_alerted {
+            out.push_str(&format!("g {t}\n"));
+        }
+        out
+    }
+
+    fn decide(&self, now: i64) -> HungDecision {
+        let recent = self.restarts.iter().filter(|&&t| within_restart_window(t, now)).count();
+        if recent < MAX_HUNG_RESTARTS {
+            HungDecision::Restart
+        } else if self.gave_up_alerted.is_some_and(|t| within_restart_window(t, now)) {
+            HungDecision::GiveUpQuietly
+        } else {
+            HungDecision::GiveUpAndAlert
+        }
+    }
+
+    /// Note a restart at `now`, forgetting restarts outside the window.
+    fn record_restart(&mut self, now: i64) {
+        self.restarts.retain(|&t| within_restart_window(t, now));
+        self.restarts.push(now);
+    }
+}
+
+fn hung_restarts_path() -> std::path::PathBuf {
+    data_dir().join("hung_restarts")
 }
 
 /// End process `pid` if it is a running copy of this same executable (and
@@ -866,6 +1131,10 @@ fn queue_alert(text: &str) {
         text: text.to_string(),
     };
     let _ = std::fs::create_dir_all(data_dir());
+    // Not while a flush is rewriting the file, or the rewrite would drop
+    // this alert. Appended anyway if the lock can't be had (better a rare
+    // race than a lost alert).
+    let _queue = queue_lock();
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(queue_path()) {
         let _ = writeln!(f, "{}", alert.serialize());
     }
@@ -879,35 +1148,95 @@ pub fn raise_alert(text: &str) {
     std::thread::spawn(flush_pending_alerts);
 }
 
-/// Exclusive right to send from the queue, so two runs (or the app and a
-/// run) never deliver the same alert twice.
-struct FlushLock(std::path::PathBuf);
+/// A lock shared between processes (watchdog runs and the app): a file
+/// created exclusively, removed when dropped. One left behind by a process
+/// that died is taken over once it is `stale_after_secs` old.
+struct FileLock(std::path::PathBuf);
 
-impl FlushLock {
-    fn acquire() -> Option<Self> {
-        let path = data_dir().join("pending_alerts.lock");
+impl FileLock {
+    fn try_acquire(path: std::path::PathBuf, stale_after_secs: u64) -> Option<Self> {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         for _ in 0..2 {
             if std::fs::OpenOptions::new().write(true).create_new(true).open(&path).is_ok() {
-                return Some(FlushLock(path));
+                return Some(FileLock(path));
             }
-            let stale = std::fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.elapsed().ok())
-                .is_some_and(|age| age.as_secs() >= FLUSH_LOCK_STALE_SECS);
-            if !stale {
+            let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            if !lock_is_stale(modified, std::time::SystemTime::now(), stale_after_secs) {
                 return None;
             }
             let _ = std::fs::remove_file(&path);
         }
         None
     }
+
+    /// `try_acquire`, retried for up to `wait` - for locks only ever held
+    /// for a moment.
+    fn acquire_waiting(path: std::path::PathBuf, stale_after_secs: u64, wait: std::time::Duration) -> Option<Self> {
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            if let Some(lock) = Self::try_acquire(path.clone(), stale_after_secs) {
+                return Some(lock);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
 }
 
-impl Drop for FlushLock {
+impl Drop for FileLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+/// How far in the future a lock file's time may be and still count as held
+/// (file time resolution, not clock changes).
+const LOCK_FUTURE_TOLERANCE_SECS: u64 = 5;
+
+/// Whether a lock file last modified at `modified` was left behind. An
+/// unreadable time, or one from the future (the clock was set back after a
+/// run was cut off holding it), counts as stale: otherwise such a lock
+/// would block everything behind it until the clock caught up.
+fn lock_is_stale(modified: Option<std::time::SystemTime>, now: std::time::SystemTime, stale_after_secs: u64) -> bool {
+    let Some(modified) = modified else { return true };
+    match now.duration_since(modified) {
+        Ok(age) => age.as_secs() >= stale_after_secs,
+        Err(ahead) => ahead.duration().as_secs() > LOCK_FUTURE_TOLERANCE_SECS,
+    }
+}
+
+/// Exclusive right to send from the queue, so two runs (or the app and a
+/// run) never deliver the same alert twice. Held for the whole flush.
+fn flush_lock_path() -> std::path::PathBuf {
+    data_dir().join("pending_alerts.lock")
+}
+
+/// Held only while the queue file is read, appended to or rewritten, so an
+/// alert queued during a flush isn't lost when the flush rewrites the file.
+fn queue_lock() -> Option<FileLock> {
+    FileLock::acquire_waiting(data_dir().join("pending_alerts.write.lock"), QUEUE_LOCK_STALE_SECS, QUEUE_LOCK_WAIT)
+}
+const QUEUE_LOCK_STALE_SECS: u64 = 30;
+const QUEUE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The queue after a flush: what is in the file now (`latest`, which may
+/// have gained alerts while sending), with each alert this flush sent from
+/// (`snapshot`) replaced by its outcome (`updated`) - or dropped if it has
+/// left the file meanwhile.
+fn merge_after_send(latest: Vec<PendingAlert>, snapshot: &[PendingAlert], updated: &[PendingAlert], now: i64) -> Vec<PendingAlert> {
+    let merged = latest
+        .into_iter()
+        .filter_map(|a| match updated.iter().find(|u| u.same_alert(&a)) {
+            Some(u) => Some(u.clone()),
+            None if snapshot.iter().any(|s| s.same_alert(&a)) => None,
+            None => Some(a),
+        })
+        .collect();
+    prune_queue(merged, now)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -924,11 +1253,20 @@ enum SendOutcome {
 /// likely offline), leaving the rest for the next run.
 pub fn flush_pending_alerts() {
     let path = queue_path();
-    let Ok(contents) = std::fs::read_to_string(&path) else { return };
+    // Cheap check first, without any lock.
+    if std::fs::read_to_string(&path).map_or(true, |c| c.trim().is_empty()) {
+        return;
+    }
+    let Some(_flush) = FileLock::try_acquire(flush_lock_path(), FLUSH_LOCK_STALE_SECS) else { return };
+    // Read again now that this run alone sends: another flush may have
+    // delivered and rewritten the queue since the check above.
+    let contents = {
+        let _queue = queue_lock();
+        std::fs::read_to_string(&path).unwrap_or_default()
+    };
     if contents.trim().is_empty() {
         return;
     }
-    let Some(_lock) = FlushLock::acquire() else { return };
 
     ensure_shared_database();
     let now = wall_now();
@@ -967,21 +1305,17 @@ pub fn flush_pending_alerts() {
         updated.push(alert);
     }
 
-    // Merge with anything queued while we were sending.
-    let latest = std::fs::read_to_string(&path).map(|s| parse_queue(&s)).unwrap_or_default();
-    let mut merged: Vec<PendingAlert> = latest
-        .into_iter()
-        .filter_map(|a| match updated.iter().find(|u| u.same_alert(&a)) {
-            Some(u) => Some(u.clone()),
-            None if snapshot.iter().any(|s| s.same_alert(&a)) => None,
-            None => Some(a),
-        })
-        .collect();
-    merged = prune_queue(merged, now);
-    if merged.is_empty() {
-        let _ = std::fs::remove_file(&path);
-    } else {
-        let _ = std::fs::write(&path, serialize_queue(&merged));
+    // Merge with anything queued while we were sending; appends wait for
+    // this rewrite (see queue_alert).
+    {
+        let _queue = queue_lock();
+        let latest = std::fs::read_to_string(&path).map(|s| parse_queue(&s)).unwrap_or_default();
+        let merged = merge_after_send(latest, &snapshot, &updated, now);
+        if merged.is_empty() {
+            let _ = std::fs::remove_file(&path);
+        } else {
+            let _ = std::fs::write(&path, serialize_queue(&merged));
+        }
     }
 
     // Logged on change only, in its own state file so it doesn't disturb
@@ -1024,12 +1358,16 @@ fn send_telegram_alert(token: &str, chat_id: i64, text: &str) -> SendOutcome {
 /// One-off Discord message via the REST API - doesn't need the Gateway
 /// connection the main app's bot uses, same approach as the setup wizard.
 fn send_discord_alert(token: &str, channel_id: u64, text: &str) -> SendOutcome {
+    // `ChannelId::new` panics on 0 (and this build aborts on a panic).
+    let Some(channel_id) = std::num::NonZeroU64::new(channel_id) else {
+        return SendOutcome::Rejected;
+    };
     let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
         return SendOutcome::Retry;
     };
     rt.block_on(async {
         let http = serenity::http::Http::new(token);
-        let send = serenity::model::id::ChannelId::new(channel_id).say(&http, text);
+        let send = serenity::model::id::ChannelId::from(channel_id).say(&http, text);
         match tokio::time::timeout(std::time::Duration::from_secs(15), send).await {
             Ok(Ok(_)) => SendOutcome::Sent,
             _ => SendOutcome::Retry,
@@ -1189,5 +1527,107 @@ mod tests {
         let late = a.text_for_delivery(1_000 + 3600);
         assert!(late.starts_with("boom\n🕒 "));
         assert!(late.ends_with("2026-11-15 10:00"));
+    }
+
+    #[test]
+    fn lock_from_the_future_or_unreadable_is_stale() {
+        use std::time::{Duration, SystemTime};
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let secs = Duration::from_secs;
+        assert!(!lock_is_stale(Some(now - secs(10)), now, 300), "held by a live run");
+        assert!(lock_is_stale(Some(now - secs(300)), now, 300), "left by a run that died");
+        // Clock set back an hour after a run was cut off holding it.
+        assert!(lock_is_stale(Some(now + secs(3600)), now, 300));
+        assert!(!lock_is_stale(Some(now + secs(2)), now, 300), "file time resolution");
+        assert!(lock_is_stale(None, now, 300));
+    }
+
+    #[test]
+    fn file_lock_is_exclusive_and_released_on_drop() {
+        let dir = std::env::temp_dir().join(format!("stm-watchdog-lock-test-{}", std::process::id()));
+        let path = dir.join("test.lock");
+        let _ = std::fs::remove_file(&path);
+        let first = FileLock::try_acquire(path.clone(), 300).expect("free lock");
+        assert!(FileLock::try_acquire(path.clone(), 300).is_none(), "already held");
+        drop(first);
+        assert!(FileLock::try_acquire(path.clone(), 300).is_some(), "released on drop");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn alert_queued_during_a_flush_survives_the_rewrite() {
+        let now = 1_700_000_000;
+        let snapshot = vec![alert(now - 60, "sent"), alert(now - 30, "offline")];
+        let updated = vec![
+            PendingAlert { telegram: false, ..alert(now - 60, "sent") },
+            alert(now - 30, "offline"),
+        ];
+        // Re-read after sending: the snapshot plus one appended meanwhile.
+        let latest = vec![alert(now - 60, "sent"), alert(now - 30, "offline"), alert(now - 1, "new")];
+        let merged = merge_after_send(latest, &snapshot, &updated, now);
+        assert_eq!(merged, vec![alert(now - 30, "offline"), alert(now - 1, "new")]);
+        // Something another flush already removed stays removed.
+        let merged = merge_after_send(vec![alert(now - 1, "new")], &snapshot, &updated, now);
+        assert_eq!(merged, vec![alert(now - 1, "new")]);
+    }
+
+    #[test]
+    fn watchdog_ended_record_covers_its_own_session_for_a_while() {
+        let rec = WatchdogEnded { wall: 1_700_000_000, logon_token: 77 };
+        assert_eq!(WatchdogEnded::parse(&rec.serialize()), Some(rec));
+        assert_eq!(WatchdogEnded::parse("1 5"), None);
+        assert_eq!(rec.applies(1_700_000_060, Some(77)), Some(60));
+        assert_eq!(rec.applies(1_700_000_060, Some(78)), None, "another session");
+        assert_eq!(rec.applies(1_700_000_060, None), Some(60), "session unknown right now");
+        assert_eq!(rec.applies(1_700_000_000 + WATCHDOG_ENDED_MAX_AGE_SECS, Some(77)), None, "too old");
+        // Clock corrected backwards: still the watchdog's own doing.
+        assert_eq!(rec.applies(1_700_000_000 - 3600, Some(77)), Some(-3600));
+    }
+
+    #[test]
+    fn frozen_app_is_restarted_a_few_times_an_hour_then_left_with_one_alert() {
+        let t0 = 1_700_000_000;
+        let mut h = RestartHistory::default();
+        for i in 0..MAX_HUNG_RESTARTS as i64 {
+            assert_eq!(h.decide(t0 + i * 480), HungDecision::Restart);
+            h.record_restart(t0 + i * 480);
+        }
+        let later = t0 + 1500;
+        assert_eq!(h.decide(later), HungDecision::GiveUpAndAlert);
+        h.gave_up_alerted = Some(later);
+        assert_eq!(h.decide(later + 600), HungDecision::GiveUpQuietly);
+        // Once the restarts are over an hour old, restarting resumes.
+        assert_eq!(h.decide(t0 + 2 * 480 + HUNG_RESTART_WINDOW_SECS), HungDecision::Restart);
+        // A clock set back doesn't buy more restarts.
+        assert_ne!(h.decide(t0 - 600), HungDecision::Restart);
+        let parsed = RestartHistory::parse(&h.serialize());
+        assert_eq!(parsed, h);
+        assert_eq!(RestartHistory::parse("garbage\nr x\nr 5 6\n"), RestartHistory::default());
+    }
+
+    #[test]
+    fn old_restarts_are_forgotten() {
+        let mut h = RestartHistory { restarts: vec![1_000, 2_000], gave_up_alerted: None };
+        h.record_restart(1_000 + HUNG_RESTART_WINDOW_SECS + 10);
+        assert_eq!(h.restarts, vec![2_000, 1_000 + HUNG_RESTART_WINDOW_SECS + 10]);
+    }
+
+    #[test]
+    fn incident_is_acted_on_only_if_it_still_stands_under_the_lock() {
+        let h = hb(5, 1_000 * S);
+        let mut t = StaleTracker::observe(None, &h, 1_400 * S, 0);
+        assert!(incident_still_stands(Some(t), Some(h), &h, true));
+        assert!(incident_still_stands(None, Some(h), &h, true));
+        // Another run handled it while this one waited.
+        t.handled = true;
+        assert!(!incident_still_stands(Some(t), Some(h), &h, true));
+        // ...but a handled earlier incident doesn't block this one.
+        let other = StaleTracker { hb_unbiased: 900 * S, ..t };
+        assert!(incident_still_stands(Some(other), Some(h), &h, true));
+        // The app was restarted meanwhile (new heartbeat), the heartbeat
+        // can't be read, or the mutex is free (ended, not yet relaunched).
+        assert!(!incident_still_stands(None, Some(hb(5, 1_500 * S)), &h, true));
+        assert!(!incident_still_stands(None, None, &h, true));
+        assert!(!incident_still_stands(None, Some(h), &h, false));
     }
 }

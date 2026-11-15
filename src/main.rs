@@ -111,6 +111,9 @@ fn main() {
         // marker so the watchdog task's suppression only ever covers the gap
         // between a sanctioned Quit and this moment (see database.rs).
         database::clear_intentional_quit_marker();
+        // Likewise the watchdog's note that it ended a frozen copy: from
+        // here on, the app stopping is a stop again (see watchdog.rs).
+        watchdog::clear_watchdog_ended_record();
 
         // Lets the watchdog tell "not restarted yet after an install/update"
         // apart from "restarted since, then stopped again" (see watchdog.rs).

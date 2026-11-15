@@ -578,6 +578,14 @@ fn en(key: &str) -> &'static str {
         "passcode_guard.max.locked" => "Passcode entry is now locked on every account, even for the right code, for",
         "passcode_guard.max.suffix" => "To let the next code through sooner, send /clearlockout (Telegram) or !clearlockout (Discord).",
 
+        // ----- Watchdog restart limit, Settings number checks, wizards, PIN -----
+        "watchdog.hung.gave_up" => "again, after being restarted several times in the last hour. It is being left as it is for now - please check the PC.",
+        "settings.error.minutes_range" => "Please enter a whole number of minutes from {min} to {max}.",
+        "settings.error.discord_channel_id" => "The Discord channel ID must be a number other than 0. In Discord, right-click the channel and choose \"Copy Channel ID\".",
+        "settings.error.discord_user_id" => "The Discord admin user ID must be a number other than 0. In Discord, right-click your username and choose \"Copy User ID\".",
+        "wizard.connect.not_you_again" => "Not your chat? Go Back, then Next, then message the bot again.",
+        "tg.getpin.unavailable" => "(could not be read just now - please try again)",
+
         // Fallback - return empty string for unknown keys (should not happen in practice)
         _ => "",
     }
@@ -1058,6 +1066,14 @@ fn de(key: &str) -> &'static str {
         "passcode_guard.max.locked" => "Die Code-Eingabe ist jetzt auf allen Konten gesperrt, auch für den richtigen Code, für",
         "passcode_guard.max.suffix" => "Um den nächsten Code früher zuzulassen, senden Sie /clearlockout (Telegram) oder !clearlockout (Discord).",
 
+        // ----- Watchdog-Neustartgrenze, Zahlenprüfung, Assistenten, PIN -----
+        "watchdog.hung.gave_up" => "erneut, nachdem er in der letzten Stunde mehrmals neu gestartet wurde. Er wird vorerst so gelassen - bitte den PC überprüfen.",
+        "settings.error.minutes_range" => "Bitte eine ganze Zahl von {min} bis {max} Minuten eingeben.",
+        "settings.error.discord_channel_id" => "Die Discord-Kanal-ID muss eine Zahl außer 0 sein. Klicken Sie in Discord mit der rechten Maustaste auf den Kanal und wählen Sie \"Kanal-ID kopieren\".",
+        "settings.error.discord_user_id" => "Die Discord-Admin-Benutzer-ID muss eine Zahl außer 0 sein. Klicken Sie in Discord mit der rechten Maustaste auf Ihren Benutzernamen und wählen Sie \"Benutzer-ID kopieren\".",
+        "wizard.connect.not_you_again" => "Nicht Ihr Chat? Zurück, dann Weiter, dann dem Bot erneut schreiben.",
+        "tg.getpin.unavailable" => "(konnte gerade nicht gelesen werden - bitte erneut versuchen)",
+
         // Fallback to English
         _ => en(key),
     }
@@ -1109,6 +1125,23 @@ mod tests {
             assert!(!en(key).is_empty(), "missing English text for {key}");
             assert!(!de(key).is_empty(), "missing German text for {key}");
             assert_ne!(en(key), de(key), "German text for {key} is just the English fallback");
+        }
+    }
+
+    /// Keys added for the watchdog/dialog review fixes, same rules as above.
+    #[test]
+    fn watchdog_and_dialog_review_keys_are_translated() {
+        let keys = [
+            "watchdog.hung.gave_up", "settings.error.minutes_range", "settings.error.discord_channel_id",
+            "settings.error.discord_user_id", "wizard.connect.not_you_again", "tg.getpin.unavailable",
+        ];
+        for key in keys {
+            assert!(!en(key).is_empty(), "missing English text for {key}");
+            assert!(!de(key).is_empty(), "missing German text for {key}");
+            assert_ne!(en(key), de(key), "German text for {key} is just the English fallback");
+        }
+        for text in [en("settings.error.minutes_range"), de("settings.error.minutes_range")] {
+            assert!(text.contains("{min}") && text.contains("{max}"));
         }
     }
 }
