@@ -15,12 +15,16 @@ use teloxide::RequestError;
 use crate::database;
 use crate::i18n;
 use crate::remote_commands::{
-    cmd_extend, cmd_getpin, cmd_history, cmd_lock, cmd_msg, cmd_pause, cmd_reduce, cmd_reset,
-    cmd_resume, cmd_rotatingpin, cmd_setlimit, cmd_setmessage, cmd_setpin, cmd_status, cmd_time,
-    cmd_unlock, cmd_update, cmd_weekly, is_stale, now_unix, retry_delay, BotLifecycle,
-    StartAction, WeeklyMarkup,
+    cmd_clearlockout, cmd_extend, cmd_getpin, cmd_history, cmd_lock, cmd_msg, cmd_pause,
+    cmd_reduce, cmd_reset, cmd_resume, cmd_rotatingpin, cmd_setlimit, cmd_setmessage, cmd_setpin,
+    cmd_status, cmd_time, cmd_unlock, cmd_update, cmd_weekly, measure_server_clock, retry_delay,
+    split_message, stale_age, stale_note, BotLifecycle, ChatMarkup, RateLimit, StartAction,
+    WeeklyMarkup, STALE_NOTE_INTERVAL, TELEGRAM_MAX_MESSAGE, TELEGRAM_TIME_URL,
 };
 use crate::time_request;
+
+/// At most one "ignored, too old" reply a minute - see `stale_note`.
+static STALE_NOTES: RateLimit = RateLimit::new(STALE_NOTE_INTERVAL);
 
 /// Whether a bot thread is running, whether it's been told to stop, and
 /// whether a start is queued behind a stop that's still in progress - see
@@ -95,6 +99,8 @@ enum Command {
     Rotatingpin(String),
     #[command(description = "Get today's rotating PIN (if enabled)")]
     Getpin,
+    #[command(description = "Clear the passcode lockout after wrong codes")]
+    Clearlockout,
     #[command(description = "Install the latest version, if a newer one is available")]
     Update,
     #[command(description = "Extend by 30 minutes")]
@@ -355,6 +361,26 @@ async fn connect_and_dispatch(
     *failures = 0;
     CONNECTED.store(true, Ordering::SeqCst);
 
+    // Same listener `dispatch()` would build (deleting any webhook first, or
+    // getUpdates below would be refused).
+    let listener = Polling::builder(bot.clone())
+        .timeout(Duration::from_secs(10))
+        .delete_webhook()
+        .await
+        .build();
+
+    // Drop whatever queued up while no bot was connected (the PC was off,
+    // asleep, offline, or another account had the console): those commands
+    // were meant for then, not for whoever happens to be logged in now.
+    // Done here, before the "started" notice below, rather than with the
+    // listener's `drop_pending_updates`, which only does it on its first
+    // poll - after the notice, so a command sent in reply to the notice was
+    // discarded along with the backlog.
+    drop_backlog(bot).await?;
+
+    // Message ages are judged by Telegram's clock, not the PC's alone.
+    measure_server_clock(TELEGRAM_TIME_URL).await;
+
     // Send startup notification, once per bot generation and only once
     // actually connected. A generation starts whenever the bot (re)starts,
     // including a session-handoff restart under Fast User Switching (see
@@ -374,17 +400,6 @@ async fn connect_and_dispatch(
         }
     }
 
-    // Same listener `dispatch()` would build, plus dropping whatever queued
-    // up while no bot was connected (the PC was off, asleep, offline, or
-    // another account had the console): those commands were meant for then,
-    // not for whoever happens to be logged in now. Teloxide's default keeps
-    // them and replays them all on connect.
-    let listener = Polling::builder(bot.clone())
-        .timeout(Duration::from_secs(10))
-        .drop_pending_updates()
-        .delete_webhook()
-        .await
-        .build();
     dispatcher
         .try_dispatch_with_listener(
             listener,
@@ -393,18 +408,76 @@ async fn connect_and_dispatch(
         .await
 }
 
+/// Make Telegram forget every update waiting for this bot. Offset -1 returns
+/// just the newest one and forgets the rest; asking again from the one after
+/// it confirms that one too. Anything arriving in between is kept (it's
+/// unconfirmed, so the listener's first poll gets it).
+async fn drop_backlog(bot: &Bot) -> Result<(), RequestError> {
+    let newest = bot.get_updates().offset(-1).limit(1).timeout(0).await?;
+    if let Some(update) = newest.last() {
+        bot.get_updates().offset(update.id.as_offset()).limit(1).timeout(0).await?;
+    }
+    Ok(())
+}
+
+/// Wrapper type for the dispatcher's dependency map: how old (seconds) a
+/// message that is too old to act on is.
+#[derive(Clone, Copy, Debug)]
+struct StaleAge(i64);
+
+/// The command a message starts with ("/Start@my_bot extra" -> "start"),
+/// lowercased.
+fn command_name(text: &str) -> Option<String> {
+    let command = text.split_whitespace().next()?.strip_prefix('/')?;
+    Some(command.split('@').next().unwrap_or("").to_ascii_lowercase())
+}
+
+/// Whether `text` is one of the setup commands answered for anyone, which
+/// are never ignored as too old: they change nothing, and are exactly what
+/// someone tries when the bot seems not to respond.
+fn is_setup_command(text: &str) -> bool {
+    command_name(text).is_some_and(|name| name == "start" || name == "chatid")
+}
+
+/// Send a plain-text reply, split into several messages if it's too long
+/// for one.
+async fn send_plain(bot: &Bot, chat_id: ChatId, text: &str) -> ResponseResult<()> {
+    for part in split_message(text, TELEGRAM_MAX_MESSAGE, ChatMarkup::Plain) {
+        bot.send_message(chat_id, part).await?;
+    }
+    Ok(())
+}
+
 fn build_dispatcher(bot: Bot, admin_chat_id: Option<i64>) -> Dispatcher<Bot, RequestError, DefaultKey> {
     // Anything that queued up while the connection was down mid-session
     // (e.g. the PC slept) arrives in a burst on reconnect; dropping
     // pending updates at connect doesn't cover that, so old messages are
-    // also filtered here, before any other handler sees them.
+    // also filtered here, before any other handler sees them. The admin
+    // chat gets a short note (at most one a minute) instead of silence.
     let stale_handler = Update::filter_message()
-        .filter(|msg: Message| is_stale(msg.date.timestamp(), now_unix()))
-        .endpoint(|msg: Message| async move {
+        .filter_map_async(|msg: Message| async move {
+            if msg.text().is_some_and(is_setup_command) {
+                return None;
+            }
+            stale_age(msg.date.timestamp(), TELEGRAM_TIME_URL).await.map(StaleAge)
+        })
+        .endpoint(move |bot: Bot, msg: Message, age: StaleAge| async move {
             eprintln!(
-                "[Telegram] Ignoring message {} from {} - sent too long ago",
-                msg.id, msg.date
+                "[Telegram] Ignoring message {} from {} - sent {}s ago",
+                msg.id, msg.date, age.0
             );
+            if Some(msg.chat.id.0) != admin_chat_id {
+                return Ok(());
+            }
+            let is_setpin = msg.text().and_then(command_name).is_some_and(|name| name == "setpin");
+            if is_setpin && !msg.chat.is_private() {
+                // Not run, but its passcode is still readable in the group
+                // (see `setpin_and_delete`).
+                let _ = bot.delete_message(msg.chat.id, msg.id).await;
+            }
+            if STALE_NOTES.allow() {
+                bot.send_message(msg.chat.id, stale_note(age.0)).await?;
+            }
             Ok(())
         });
 
@@ -430,9 +503,10 @@ fn build_dispatcher(bot: Bot, admin_chat_id: Option<i64>) -> Dispatcher<Bot, Req
                         unsafe {
                             crate::overlay::show_overlay(text, 10);
                         }
-                        bot.send_message(
+                        send_plain(
+                            &bot,
                             msg.chat.id,
-                            format!("📢 {}: \"{}\"", i18n::t("tg.msg.shown"), text)
+                            &format!("📢 {}: \"{}\"", i18n::t("tg.msg.shown"), text),
                         ).await?;
                     }
                 }
@@ -603,10 +677,11 @@ async fn handle_command(
         Command::Unlock => cmd_unlock(),
         Command::Reset => cmd_reset(),
         Command::Setmessage(text) => cmd_setmessage(&text),
-        Command::Setpin(pin) => cmd_setpin(&pin),
+        Command::Setpin(pin) => setpin_and_delete(&bot, &msg, &pin).await,
         Command::Setlimit(args) => cmd_setlimit(&args),
         Command::Rotatingpin(args) => cmd_rotatingpin(&args),
-        Command::Getpin => cmd_getpin(),
+        Command::Getpin => getpin_privately(&bot, &msg).await,
+        Command::Clearlockout => cmd_clearlockout(),
         // Talks to GitHub (and schtasks) - off this single-threaded
         // runtime, so the bot keeps answering meanwhile.
         Command::Update => tokio::task::spawn_blocking(cmd_update)
@@ -623,12 +698,91 @@ async fn handle_command(
         time_request::resolve_if_pending("Telegram", &detail);
     }
 
+    // Long replies (`/weekly` with many accounts) go out as several messages.
     if is_weekly {
-        bot.send_message(msg.chat.id, response).parse_mode(ParseMode::Html).await?;
+        for part in split_message(&response, TELEGRAM_MAX_MESSAGE, ChatMarkup::TelegramHtml) {
+            bot.send_message(msg.chat.id, part).parse_mode(ParseMode::Html).await?;
+        }
     } else {
-        bot.send_message(msg.chat.id, response).await?;
+        send_plain(&bot, msg.chat.id, &response).await?;
     }
     Ok(())
+}
+
+/// Where `/getpin` may put today's code.
+#[derive(Debug, PartialEq, Eq)]
+enum PinDestination {
+    /// The private chat it was asked in - only the admin reads it.
+    ThisChat,
+    /// A group: privately to the user who asked, never into the group.
+    PrivateChatWith(u64),
+    /// A group, asked by an administrator posting anonymously as the group
+    /// (or by a bot): there's nobody to message privately.
+    Nobody,
+}
+
+fn pin_destination(chat_is_private: bool, sender_user: Option<(u64, bool)>, sent_as_chat: bool) -> PinDestination {
+    if chat_is_private {
+        return PinDestination::ThisChat;
+    }
+    match sender_user {
+        Some((user_id, false)) if !sent_as_chat => PinDestination::PrivateChatWith(user_id),
+        _ => PinDestination::Nobody,
+    }
+}
+
+/// `/getpin`: in the usual private chat, the code is the reply. In a group
+/// (which the child may be in too) it is never posted: it goes to the admin
+/// who asked, in their private chat with the bot - which only works once
+/// they have started one, since Telegram doesn't let bots message people
+/// first - and the group only gets a short note. If the rotating PIN is off,
+/// the reply has no code in it and is posted as before.
+async fn getpin_privately(bot: &Bot, msg: &Message) -> String {
+    if !database::is_rotating_pin_enabled() {
+        return cmd_getpin();
+    }
+    let destination = pin_destination(
+        msg.chat.is_private(),
+        msg.from.as_ref().map(|user| (user.id.0, user.is_bot)),
+        msg.sender_chat.is_some(),
+    );
+    match destination {
+        PinDestination::ThisChat => cmd_getpin(),
+        PinDestination::Nobody => format!("❌ {}", i18n::t("tg.getpin.anonymous")),
+        PinDestination::PrivateChatWith(user_id) => {
+            match bot.send_message(UserId(user_id), cmd_getpin()).await {
+                Ok(_) => format!("📬 {}", i18n::t("tg.getpin.sent_private")),
+                Err(e) => {
+                    eprintln!("[Telegram] Couldn't send the PIN privately: {e}");
+                    format!("❌ {}", i18n::t("tg.getpin.private_failed"))
+                }
+            }
+        }
+    }
+}
+
+/// `/setpin`: in a group, the new passcode is in the admin's own message,
+/// which every member can read, so delete it first. That needs the bot to be
+/// a group administrator allowed to delete messages - if it isn't, say so,
+/// so the admin can delete it by hand. (In the private chat only the admin
+/// sees it, so it's left alone there.)
+async fn setpin_and_delete(bot: &Bot, msg: &Message, args: &str) -> String {
+    if msg.chat.is_private() {
+        return cmd_setpin(args);
+    }
+    let deleted = match bot.delete_message(msg.chat.id, msg.id).await {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!("[Telegram] Couldn't delete the /setpin message: {e}");
+            false
+        }
+    };
+    let mut response = cmd_setpin(args);
+    if !deleted {
+        response.push_str("\n⚠️ ");
+        response.push_str(i18n::t("tg.setpin.not_deleted"));
+    }
+    response
 }
 
 #[cfg(test)]
@@ -675,6 +829,33 @@ mod tests {
             AuthDecision::Deny
         );
         assert_eq!(auth_decision(Some(GROUP), GROUP, false, None, None), AuthDecision::Deny);
+    }
+
+    #[test]
+    fn pin_is_never_posted_in_a_group() {
+        assert_eq!(pin_destination(true, Some((PARENT as u64, false)), false), PinDestination::ThisChat);
+        assert_eq!(
+            pin_destination(false, Some((PARENT as u64, false)), false),
+            PinDestination::PrivateChatWith(PARENT as u64)
+        );
+        // Anonymous administrator: `from` is Telegram's GroupAnonymousBot,
+        // `sender_chat` is the group.
+        assert_eq!(pin_destination(false, Some((1_087_968_824, true)), true), PinDestination::Nobody);
+        assert_eq!(pin_destination(false, Some((42, false)), true), PinDestination::Nobody);
+        assert_eq!(pin_destination(false, None, false), PinDestination::Nobody);
+    }
+
+    #[test]
+    fn setup_commands_are_recognised() {
+        assert!(is_setup_command("/start"));
+        assert!(is_setup_command("/chatid"));
+        assert!(is_setup_command("/ChatID@my_family_bot"));
+        assert!(is_setup_command("/start extra words"));
+        assert!(!is_setup_command("/status"));
+        assert!(!is_setup_command("/startx"));
+        assert!(!is_setup_command("start"));
+        assert!(!is_setup_command(""));
+        assert!(!is_setup_command("please /start"));
     }
 }
 

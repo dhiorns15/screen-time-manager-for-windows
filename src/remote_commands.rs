@@ -1,9 +1,9 @@
 //! Platform-agnostic remote command implementations
 //! Shared by both the Telegram and Discord bot integrations
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::blocking;
 use crate::database;
@@ -365,6 +365,17 @@ pub fn cmd_getpin() -> String {
     )
 }
 
+/// Clear the passcode lockout (see `passcode_guard`), so the next code typed
+/// on the PC is checked. Admin-only, like every command but the setup ones:
+/// otherwise a child could keep entry locked indefinitely, even against the
+/// parent's correct code.
+pub fn cmd_clearlockout() -> String {
+    match crate::passcode_guard::clear_lockout() {
+        Some(_) => format!("🔓 {}", i18n::t("bot.clearlockout.cleared")),
+        None => format!("🔓 {}", i18n::t("bot.clearlockout.not_locked")),
+    }
+}
+
 /// Parse a weekday name/abbreviation into the app's 0=Monday..6=Sunday index.
 /// English only, like the rest of the bot command vocabulary.
 fn parse_weekday_arg(s: &str) -> Option<u32> {
@@ -538,13 +549,14 @@ pub fn retry_delay(failures: u32) -> Duration {
 }
 
 /// Commands older than this when they reach the app are dropped rather
-/// than run. Telegram keeps undelivered messages for up to a day, so without
+/// than run. Telegram keeps undelivered messages for up to a day (and
+/// Discord's gateway replays messages missed during a reconnect), so without
 /// this a "/e60" sent while the PC was asleep or offline would run whenever
 /// it next connected - for whichever account happened to be logged in then.
 ///
-/// Measured against the PC's own clock. A child moving the clock forward
-/// could make fresh commands look stale, but that gains nothing over simply
-/// unplugging the network, which already blocks every remote command.
+/// Measured against the chat service's clock (`server_now`), not the PC's
+/// alone: a PC clock that is a few minutes fast used to make every incoming
+/// message look stale and silently disable remote control.
 pub const STALE_COMMAND_SECS: i64 = 5 * 60;
 
 /// Whether a message sent at `sent_unix` (seconds since the Unix epoch, from
@@ -560,6 +572,358 @@ pub fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
+}
+
+// ============================================================================
+// The chat services' clock, for judging how old a message is
+// ============================================================================
+
+/// Server time minus PC time, in seconds, as last measured from a chat
+/// service's HTTP `Date` header (0 until measured, i.e. trust the PC clock).
+/// Shared by both bots: both services keep accurate time.
+static SERVER_CLOCK_OFFSET: AtomicI64 = AtomicI64::new(0);
+
+/// When a stale-looking message last triggered a fresh measurement - see
+/// `stale_age`.
+static LAST_STALE_REMEASURE: Mutex<Option<Instant>> = Mutex::new(None);
+const STALE_REMEASURE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Where each bot reads the server time from. Any response carries a `Date`
+/// header; these don't need the bot token.
+pub const TELEGRAM_TIME_URL: &str = "https://api.telegram.org/";
+pub const DISCORD_TIME_URL: &str = "https://discord.com/api/v10/gateway";
+
+/// Seconds since the Unix epoch by the chat services' clock: the PC's clock
+/// corrected by the last measured offset.
+pub fn server_now() -> i64 {
+    now_unix().saturating_add(SERVER_CLOCK_OFFSET.load(Ordering::SeqCst))
+}
+
+/// Parse an HTTP `Date` header (IMF-fixdate, e.g. "Sun, 06 Nov 1994
+/// 08:49:37 GMT") into seconds since the Unix epoch.
+pub fn parse_http_date(s: &str) -> Option<i64> {
+    let mut parts = s.split_whitespace();
+    let _weekday = parts.next()?;
+    let day: i64 = parts.next()?.parse().ok()?;
+    let month = match parts.next()? {
+        "Jan" => 1, "Feb" => 2, "Mar" => 3, "Apr" => 4, "May" => 5, "Jun" => 6,
+        "Jul" => 7, "Aug" => 8, "Sep" => 9, "Oct" => 10, "Nov" => 11, "Dec" => 12,
+        _ => return None,
+    };
+    let year: i64 = parts.next()?.parse().ok()?;
+    let mut hms = parts.next()?.split(':').map(|p| p.parse::<i64>().ok());
+    let (hour, minute, second) = (hms.next()??, hms.next()??, hms.next()??);
+    if parts.next()? != "GMT" || parts.next().is_some() || hms.next().is_some() {
+        return None;
+    }
+    if !(1..=31).contains(&day) || !(0..24).contains(&hour) || !(0..60).contains(&minute)
+        || !(0..=60).contains(&second) || !(1970..=9999).contains(&year)
+    {
+        return None;
+    }
+    // Days from 1970-01-01 to the civil date (Howard Hinnant's algorithm).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y / 400; // y >= 1969, so no negative-era rounding needed
+    let yoe = y - era * 400;
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hour * 3600 + minute * 60 + second)
+}
+
+/// Server-minus-PC offset from a server timestamp taken somewhere between
+/// the PC times `local_before` and `local_after` (request sent / response
+/// received): compared with the middle of that window.
+pub fn clock_offset(server: i64, local_before: i64, local_after: i64) -> i64 {
+    server - (local_before + (local_after - local_before) / 2)
+}
+
+/// One blocking measurement of the offset against `url`.
+fn probe_clock_offset(url: &str) -> Option<i64> {
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout(Duration::from_secs(10))
+        .build();
+    let before = now_unix();
+    let response = match agent.head(url).call() {
+        Ok(r) | Err(ureq::Error::Status(_, r)) => r,
+        Err(e) => {
+            eprintln!("[Bots] Couldn't read the server time from {url}: {e}");
+            return None;
+        }
+    };
+    let after = now_unix();
+    let server = parse_http_date(response.header("date")?)?;
+    Some(clock_offset(server, before, after))
+}
+
+/// Measure the PC clock's offset against the chat service at `url` and use
+/// it from now on. Keeps the previous offset if the measurement fails. Runs
+/// on its own short-lived thread, so a bot that is told to stop meanwhile
+/// isn't held up by it (the request has its own timeout).
+pub async fn measure_server_clock(url: &'static str) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("clock-probe".into())
+        .spawn(move || {
+            let _ = tx.send(probe_clock_offset(url));
+        });
+    if spawned.is_err() {
+        return;
+    }
+    if let Ok(Some(offset)) = rx.await {
+        let previous = SERVER_CLOCK_OFFSET.swap(offset, Ordering::SeqCst);
+        if offset.abs() > 60 && (offset - previous).abs() > 5 {
+            eprintln!("[Bots] The PC clock is {}s off the chat service's - correcting for it", -offset);
+        }
+    }
+}
+
+/// How old (in seconds) a message sent at `sent_unix` by the server's clock
+/// is, if it is too old to act on - `None` if it is fresh. A message that
+/// looks stale triggers a fresh clock measurement first (at most once a
+/// minute), in case the PC clock was changed since the bot connected.
+pub async fn stale_age(sent_unix: i64, time_url: &'static str) -> Option<i64> {
+    if !is_stale(sent_unix, server_now()) {
+        return None;
+    }
+    let remeasure = LAST_STALE_REMEASURE
+        .lock()
+        .map(|mut last| {
+            let due = last.is_none_or(|t| t.elapsed() >= STALE_REMEASURE_INTERVAL);
+            if due {
+                *last = Some(Instant::now());
+            }
+            due
+        })
+        .unwrap_or(false);
+    if remeasure {
+        measure_server_clock(time_url).await;
+    }
+    let now = server_now();
+    is_stale(sent_unix, now).then(|| now.saturating_sub(sent_unix))
+}
+
+/// Allows something at most once per `interval` - e.g. the "ignored, too
+/// old" note, so a burst of queued messages gets one reply, not one each.
+pub struct RateLimit {
+    last: Mutex<Option<Instant>>,
+    interval: Duration,
+}
+
+impl RateLimit {
+    pub const fn new(interval: Duration) -> Self {
+        Self { last: Mutex::new(None), interval }
+    }
+
+    /// True (and counts as used) if the interval has passed since the last
+    /// time this returned true.
+    pub fn allow(&self) -> bool {
+        self.allow_at(Instant::now())
+    }
+
+    fn allow_at(&self, now: Instant) -> bool {
+        let Ok(mut last) = self.last.lock() else { return false };
+        if last.is_some_and(|t| now.saturating_duration_since(t) < self.interval) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+}
+
+/// How often at most a bot replies that it ignored a stale message.
+pub const STALE_NOTE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Reply to a message that was ignored for being too old (`age_secs` by the
+/// server's clock).
+pub fn stale_note(age_secs: i64) -> String {
+    let age = i32::try_from(age_secs).unwrap_or(i32::MAX);
+    format!(
+        "⏳ {}",
+        join_words(&[i18n::t("bot.stale.prefix"), &format_hm(age), i18n::t("bot.stale.suffix")])
+    )
+}
+
+// ============================================================================
+// Splitting long replies to fit the chat services' message size limits
+// ============================================================================
+
+/// Longest message Telegram accepts (characters after entity parsing).
+pub const TELEGRAM_MAX_MESSAGE: usize = 4096;
+/// Longest message Discord accepts (characters).
+pub const DISCORD_MAX_MESSAGE: usize = 2000;
+
+/// How a reply is formatted, for `split_message`: where code blocks start
+/// and end, and which characters must not be cut apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatMarkup {
+    Plain,
+    /// Telegram `ParseMode::Html` with `<pre>` blocks (see `WeeklyMarkup`).
+    TelegramHtml,
+    /// Discord markdown with ``` code blocks.
+    DiscordMarkdown,
+}
+
+impl ChatMarkup {
+    fn block_open(self) -> &'static str {
+        match self {
+            ChatMarkup::Plain => "",
+            ChatMarkup::TelegramHtml => "<pre>",
+            ChatMarkup::DiscordMarkdown => "```\n",
+        }
+    }
+
+    /// Text that closes an open code block after `piece`.
+    fn block_close(self, piece: &str) -> &'static str {
+        match self {
+            ChatMarkup::Plain => "",
+            ChatMarkup::TelegramHtml => "</pre>",
+            ChatMarkup::DiscordMarkdown if piece.ends_with('\n') => "```",
+            ChatMarkup::DiscordMarkdown => "\n```",
+        }
+    }
+
+    /// Whether a code block is open after `piece`, given whether one was
+    /// open before it.
+    fn open_after(self, piece: &str, open_before: bool) -> bool {
+        match self {
+            ChatMarkup::Plain => false,
+            ChatMarkup::TelegramHtml => match (piece.rfind("<pre>"), piece.rfind("</pre>")) {
+                (None, None) => open_before,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (Some(open), Some(close)) => open > close,
+            },
+            ChatMarkup::DiscordMarkdown => open_before ^ (piece.matches("```").count() % 2 == 1),
+        }
+    }
+}
+
+/// Length as both services may count it: UTF-16 code units, which is never
+/// less than the number of characters.
+fn chat_len(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+/// Byte index at which to end the first part of `s` (which is longer than
+/// `max`): at most `max` long, not inside an HTML tag or entity or a run of
+/// backticks, preferably just after whitespace. Always > 0.
+fn cut_point(s: &str, max: usize, markup: ChatMarkup) -> usize {
+    let (mut used, mut in_tag, mut in_entity) = (0, false, false);
+    let (mut last_fit, mut last_safe, mut last_space) = (0, 0, 0);
+    let mut prev: Option<char> = None;
+    for (i, c) in s.char_indices() {
+        if i > 0 {
+            last_fit = i;
+            let splits_backticks = markup == ChatMarkup::DiscordMarkdown && prev == Some('`') && c == '`';
+            if !in_tag && !in_entity && !splits_backticks {
+                last_safe = i;
+                if prev.is_some_and(char::is_whitespace) {
+                    last_space = i;
+                }
+            }
+        }
+        used += c.len_utf16();
+        if used > max {
+            break;
+        }
+        if markup == ChatMarkup::TelegramHtml {
+            match c {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                '&' => in_entity = true,
+                ';' => in_entity = false,
+                _ => {}
+            }
+        }
+        prev = Some(c);
+    }
+    let cut = if last_space > 0 && last_space * 4 >= last_safe * 3 {
+        last_space
+    } else if last_safe > 0 {
+        last_safe
+    } else {
+        last_fit
+    };
+    if cut > 0 {
+        cut
+    } else {
+        s.chars().next().map_or(s.len(), char::len_utf8)
+    }
+}
+
+/// Split `text` into messages of at most `limit` (as `chat_len` counts it),
+/// so a long reply (e.g. `/weekly` with many accounts) goes out as several
+/// messages instead of being refused. Splits between lines where it can,
+/// keeping a code block together with the line just before it (its
+/// heading); a code block that has to be split is closed at the end of one
+/// message and reopened in the next, so every message is valid markup on
+/// its own. A text that fits is returned unchanged.
+pub fn split_message(text: &str, limit: usize, markup: ChatMarkup) -> Vec<String> {
+    if chat_len(text) <= limit {
+        return vec![text.to_string()];
+    }
+    // Room for reopening and closing a block around any one piece.
+    let piece_max = limit.saturating_sub(16).max(1);
+
+    struct Piece {
+        text: String,
+        open_before: bool,
+        open_after: bool,
+    }
+    let mut pieces = Vec::new();
+    let mut open = false;
+    for line in text.split_inclusive('\n') {
+        let mut rest = line;
+        while !rest.is_empty() {
+            let cut = if chat_len(rest) > piece_max { cut_point(rest, piece_max, markup) } else { rest.len() };
+            let (part, tail) = rest.split_at(cut);
+            let open_after = markup.open_after(part, open);
+            pieces.push(Piece { text: part.to_string(), open_before: open, open_after });
+            open = open_after;
+            rest = tail;
+        }
+    }
+
+    let close_after = |p: &Piece| if p.open_after { markup.block_close(&p.text) } else { "" };
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < pieces.len() {
+        let open_text = if pieces[start].open_before { markup.block_open() } else { "" };
+        let mut used = chat_len(open_text);
+        let mut end = start;
+        // Last place to end this message that is outside any code block
+        // and doesn't separate a block from the line before it.
+        let mut good_end = None;
+        while end < pieces.len() {
+            let piece = &pieces[end];
+            let len = chat_len(&piece.text);
+            if end > start && used + len + chat_len(close_after(piece)) > limit {
+                break;
+            }
+            used += len;
+            end += 1;
+            let next_opens_block = pieces.get(end).is_some_and(|n| !n.open_before && n.open_after);
+            if !piece.open_after && !next_opens_block {
+                good_end = Some(end);
+            }
+        }
+        if end < pieces.len() {
+            end = good_end.unwrap_or(end);
+        }
+        let mut chunk = open_text.to_string();
+        for piece in &pieces[start..end] {
+            chunk.push_str(&piece.text);
+        }
+        chunk.push_str(close_after(&pieces[end - 1]));
+        let chunk = chunk.trim_end_matches('\n');
+        if !chunk.trim().is_empty() {
+            chunks.push(chunk.to_string());
+        }
+        start = end;
+    }
+    chunks
 }
 
 /// What `BotLifecycle::request_start` decided.
@@ -717,6 +1081,147 @@ mod tests {
         assert!(!is_stale(now, 0), "PC clock before 1970");
         assert!(!is_stale(i64::MIN, i64::MIN));
         assert!(is_stale(i64::MIN, i64::MAX), "no overflow");
+    }
+
+    #[test]
+    fn http_dates_parse() {
+        assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+        assert_eq!(parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"), Some(784_111_777));
+        assert_eq!(parse_http_date("Tue, 29 Feb 2028 23:59:59 GMT"), Some(1_835_481_599));
+        assert_eq!(parse_http_date("Sun, 15 Nov 2026 12:00:00 GMT"), Some(1_794_744_000));
+        assert_eq!(parse_http_date("Sun, 15 Nov 2026 12:00:00 CET"), None);
+        assert_eq!(parse_http_date("Sun, 15 Foo 2026 12:00:00 GMT"), None);
+        assert_eq!(parse_http_date("Sun, 15 Nov 2026 25:00:00 GMT"), None);
+        assert_eq!(parse_http_date("Sun, 15 Nov 2026 12:00 GMT"), None);
+        assert_eq!(parse_http_date("Sun, 15 Nov 2026 12:00:00:00 GMT"), None);
+        assert_eq!(parse_http_date("Sun, 15 Nov 2026 12:00:00 GMT extra"), None);
+        assert_eq!(parse_http_date(""), None);
+    }
+
+    /// A PC clock 10 minutes fast: measured against the server, a message
+    /// sent a moment ago is fresh, and one sent 6 minutes ago is not.
+    #[test]
+    fn fast_pc_clock_is_corrected_for() {
+        let server = 1_800_000_000;
+        let pc = server + 600;
+        let offset = clock_offset(server, pc - 1, pc + 1);
+        assert_eq!(offset, -600);
+        let corrected_now = pc + offset;
+        assert!(is_stale(server - 10, pc), "by the PC clock alone everything looks stale");
+        assert!(!is_stale(server - 10, corrected_now));
+        assert!(is_stale(server - 360, corrected_now));
+    }
+
+    #[test]
+    fn rate_limit_allows_once_per_interval() {
+        let limit = RateLimit::new(Duration::from_secs(60));
+        let t = Instant::now();
+        assert!(limit.allow_at(t));
+        assert!(!limit.allow_at(t + Duration::from_secs(1)));
+        assert!(!limit.allow_at(t + Duration::from_secs(59)));
+        assert!(limit.allow_at(t + Duration::from_secs(60)));
+        assert!(!limit.allow_at(t + Duration::from_secs(61)));
+    }
+
+    #[test]
+    fn short_replies_are_not_split() {
+        for markup in [ChatMarkup::Plain, ChatMarkup::TelegramHtml, ChatMarkup::DiscordMarkdown] {
+            assert_eq!(split_message("hello\nworld\n", 100, markup), ["hello\nworld\n"]);
+        }
+    }
+
+    /// A `/weekly`-shaped reply for `users` accounts.
+    fn weekly_like(users: usize, markup: WeeklyMarkup) -> String {
+        let history: Vec<(String, i32, i32)> =
+            (1..=14).map(|d| (format!("2026-11-{d:02}"), 60 + d, d)).collect();
+        let body = (0..users)
+            .map(|i| weekly_table_for(&format!("child_{i}<&>"), &history, markup))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("📊 2-Week Usage\n{body}")
+    }
+
+    fn assert_balanced(chunk: &str, open: &str, close: &str) {
+        assert_eq!(chunk.matches(open).count(), chunk.matches(close).count(), "{chunk}");
+    }
+
+    #[test]
+    fn weekly_for_many_accounts_splits_between_tables_on_telegram() {
+        let text = weekly_like(15, WeeklyMarkup::TelegramHtml);
+        assert!(chat_len(&text) > TELEGRAM_MAX_MESSAGE);
+        let parts = split_message(&text, TELEGRAM_MAX_MESSAGE, ChatMarkup::TelegramHtml);
+        assert!(parts.len() >= 2, "{}", parts.len());
+        for part in &parts {
+            assert!(chat_len(part) <= TELEGRAM_MAX_MESSAGE);
+            assert_balanced(part, "<pre>", "</pre>");
+            // Each message ends after a whole table, and every table keeps
+            // its heading.
+            assert!(part.ends_with("</pre>"), "{part}");
+            assert_eq!(part.matches("👤").count(), part.matches("<pre>").count(), "{part}");
+        }
+        assert_eq!(parts.concat().matches("<pre>").count(), 15);
+        assert_eq!(parts.concat().matches("child_14&lt;&amp;&gt;").count(), 1);
+    }
+
+    #[test]
+    fn weekly_for_many_accounts_splits_between_tables_on_discord() {
+        let text = weekly_like(9, WeeklyMarkup::DiscordMarkdown);
+        assert!(chat_len(&text) > DISCORD_MAX_MESSAGE);
+        let parts = split_message(&text, DISCORD_MAX_MESSAGE, ChatMarkup::DiscordMarkdown);
+        assert!(parts.len() >= 2);
+        for part in &parts {
+            assert!(chat_len(part) <= DISCORD_MAX_MESSAGE);
+            assert_eq!(part.matches("```").count() % 2, 0, "{part}");
+            assert!(part.ends_with("```"), "{part}");
+        }
+        assert_eq!(parts.concat().matches("👤").count(), 9);
+    }
+
+    #[test]
+    fn a_code_block_too_long_for_one_message_is_closed_and_reopened() {
+        let table: String = (0..300).map(|i| format!("row {i:03} &amp; more\n")).collect();
+        let text = format!("head\n<pre>{table}</pre>\ntail");
+        let parts = split_message(&text, 1000, ChatMarkup::TelegramHtml);
+        assert!(parts.len() >= 6);
+        for part in &parts {
+            assert!(chat_len(part) <= 1000);
+            assert_balanced(part, "<pre>", "</pre>");
+        }
+        let rows: usize = parts.iter().map(|p| p.matches("row ").count()).sum();
+        assert_eq!(rows, 300);
+
+        let table: String = (0..300).map(|i| format!("row {i:03}\n")).collect();
+        let text = format!("head\n```\n{table}```\ntail");
+        let parts = split_message(&text, 500, ChatMarkup::DiscordMarkdown);
+        for part in &parts {
+            assert!(chat_len(part) <= 500);
+            assert_eq!(part.matches("```").count() % 2, 0, "{part}");
+        }
+        assert_eq!(parts.iter().map(|p| p.matches("row ").count()).sum::<usize>(), 300);
+    }
+
+    #[test]
+    fn an_overlong_line_is_cut_without_breaking_entities_or_words() {
+        let line = "word &amp; ".repeat(100);
+        let parts = split_message(&line, 120, ChatMarkup::TelegramHtml);
+        assert!(parts.len() > 1);
+        for part in &parts {
+            assert!(chat_len(part) <= 120);
+            assert_eq!(part.matches('&').count(), part.matches("&amp;").count(), "{part}");
+        }
+        assert_eq!(parts.concat().replace(' ', ""), line.replace(' ', ""));
+
+        let plain = "x".repeat(5000);
+        let parts = split_message(&plain, TELEGRAM_MAX_MESSAGE, ChatMarkup::Plain);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts.concat(), plain);
+
+        // Emoji count double (UTF-16), so this can't overshoot either way
+        // the service counts.
+        let emoji = "📊".repeat(1500);
+        for part in split_message(&emoji, DISCORD_MAX_MESSAGE, ChatMarkup::DiscordMarkdown) {
+            assert!(chat_len(&part) <= DISCORD_MAX_MESSAGE);
+        }
     }
 
     #[test]

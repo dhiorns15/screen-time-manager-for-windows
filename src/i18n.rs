@@ -564,6 +564,20 @@ fn en(key: &str) -> &'static str {
         "db.alert.recreated" => "The damaged file was set aside and a new one with default settings was created. Please check the time limits and other settings for this account.",
         "db.alert.temporary" => "It is running with default settings for now, and changes won't be kept. Please check the PC.",
 
+        // ----- Bots: PINs in Telegram groups, stale messages, clearing a passcode lockout -----
+        "tg.getpin.sent_private" => "Sent today's code to you in your private chat with the bot.",
+        "tg.getpin.private_failed" => "Couldn't send you the code privately, so it isn't posted in this group. Open a private chat with the bot and press Start (Telegram only lets a bot message people who have done that), then send /getpin here again.",
+        "tg.getpin.anonymous" => "You're posting anonymously as the group, so the code can't be sent to you privately and isn't posted here. Turn off \"Remain anonymous\" in your admin rights, open a private chat with the bot and press Start, then send /getpin here again.",
+        "tg.setpin.not_deleted" => "Couldn't delete your /setpin message - the bot needs to be a group admin with the \"Delete messages\" right. Please delete it yourself so others in the group can't read the passcode.",
+        "bot.stale.prefix" => "Ignored a message that took",
+        "bot.stale.suffix" => "to arrive - commands older than 5 minutes aren't carried out, in case they were meant for earlier. Send it again if it still applies.",
+        "bot.clearlockout.cleared" => "Passcode lockout cleared - the next code entered on the PC will be checked. Wrong codes still count, so another wrong one locks entry again.",
+        "bot.clearlockout.not_locked" => "Passcode entry isn't locked right now.",
+        "dc.cmd.clearlockout" => "Clear the passcode lockout after wrong codes",
+        "passcode_guard.max.header" => "is still entering wrong passcodes - wrong codes in a row:",
+        "passcode_guard.max.locked" => "Passcode entry is now locked on every account, even for the right code, for",
+        "passcode_guard.max.suffix" => "To let the next code through sooner, send /clearlockout (Telegram) or !clearlockout (Discord).",
+
         // Fallback - return empty string for unknown keys (should not happen in practice)
         _ => "",
     }
@@ -1030,6 +1044,20 @@ fn de(key: &str) -> &'static str {
         "db.alert.recreated" => "Die beschädigte Datei wurde beiseitegelegt und eine neue mit Standardeinstellungen angelegt. Bitte prüfen Sie die Zeitlimits und anderen Einstellungen dieses Kontos.",
         "db.alert.temporary" => "Er läuft vorerst mit Standardeinstellungen, Änderungen werden nicht gespeichert. Bitte den PC überprüfen.",
 
+        // ----- Bots: Codes in Telegram-Gruppen, veraltete Nachrichten, Code-Sperre aufheben -----
+        "tg.getpin.sent_private" => "Der heutige Code wurde Ihnen im privaten Chat mit dem Bot geschickt.",
+        "tg.getpin.private_failed" => "Der Code konnte Ihnen nicht privat geschickt werden, daher wird er in dieser Gruppe nicht angezeigt. Öffnen Sie einen privaten Chat mit dem Bot und tippen Sie auf Starten (Telegram erlaubt einem Bot nur, Personen zu schreiben, die das getan haben), dann senden Sie /getpin hier erneut.",
+        "tg.getpin.anonymous" => "Sie schreiben anonym als Gruppe, daher kann Ihnen der Code nicht privat geschickt werden und wird hier nicht angezeigt. Schalten Sie in Ihren Admin-Rechten \"Anonym bleiben\" aus, öffnen Sie einen privaten Chat mit dem Bot und tippen Sie auf Starten, dann senden Sie /getpin hier erneut.",
+        "tg.setpin.not_deleted" => "Ihre /setpin-Nachricht konnte nicht gelöscht werden - der Bot muss Gruppen-Admin mit dem Recht \"Nachrichten löschen\" sein. Bitte löschen Sie sie selbst, damit andere in der Gruppe den Code nicht lesen können.",
+        "bot.stale.prefix" => "Eine Nachricht wurde ignoriert, die",
+        "bot.stale.suffix" => "unterwegs war - Befehle, die älter als 5 Minuten sind, werden nicht ausgeführt, falls sie für früher gedacht waren. Senden Sie sie erneut, wenn sie noch gilt.",
+        "bot.clearlockout.cleared" => "Code-Sperre aufgehoben - der nächste am PC eingegebene Code wird geprüft. Falsche Codes zählen weiter, ein weiterer falscher Code sperrt die Eingabe also erneut.",
+        "bot.clearlockout.not_locked" => "Die Code-Eingabe ist gerade nicht gesperrt.",
+        "dc.cmd.clearlockout" => "Code-Sperre nach falschen Codes aufheben",
+        "passcode_guard.max.header" => "gibt weiterhin falsche Codes ein - falsche Codes hintereinander:",
+        "passcode_guard.max.locked" => "Die Code-Eingabe ist jetzt auf allen Konten gesperrt, auch für den richtigen Code, für",
+        "passcode_guard.max.suffix" => "Um den nächsten Code früher zuzulassen, senden Sie /clearlockout (Telegram) oder !clearlockout (Discord).",
+
         // Fallback to English
         _ => en(key),
     }
@@ -1064,6 +1092,23 @@ mod tests {
             if !same_in_both.contains(&key) {
                 assert_ne!(en(key), de(key), "German text for {key} is just the English fallback");
             }
+        }
+    }
+
+    /// Keys added for the bot fixes (Telegram PINs in groups, stale
+    /// messages, clearing a passcode lockout).
+    #[test]
+    fn bot_keys_are_translated() {
+        let keys = [
+            "tg.getpin.sent_private", "tg.getpin.private_failed", "tg.getpin.anonymous",
+            "tg.setpin.not_deleted", "bot.stale.prefix", "bot.stale.suffix",
+            "bot.clearlockout.cleared", "bot.clearlockout.not_locked", "dc.cmd.clearlockout",
+            "passcode_guard.max.header", "passcode_guard.max.locked", "passcode_guard.max.suffix",
+        ];
+        for key in keys {
+            assert!(!en(key).is_empty(), "missing English text for {key}");
+            assert!(!de(key).is_empty(), "missing German text for {key}");
+            assert_ne!(en(key), de(key), "German text for {key} is just the English fallback");
         }
     }
 }

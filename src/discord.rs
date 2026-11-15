@@ -1,6 +1,7 @@
 //! Discord bot module for Screen Time Manager
 //! Provides remote monitoring and control via a Discord bot listening in one channel
 
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,11 +13,21 @@ use serenity::client::{Client, Context, EventHandler};
 use crate::database;
 use crate::i18n;
 use crate::remote_commands::{
-    cmd_extend, cmd_getpin, cmd_history, cmd_lock, cmd_msg, cmd_pause, cmd_reduce, cmd_reset,
-    cmd_resume, cmd_rotatingpin, cmd_setlimit, cmd_setmessage, cmd_setpin, cmd_status, cmd_time,
-    cmd_unlock, cmd_update, cmd_weekly, BotLifecycle, StartAction, WeeklyMarkup,
+    cmd_clearlockout, cmd_extend, cmd_getpin, cmd_history, cmd_lock, cmd_msg, cmd_pause,
+    cmd_reduce, cmd_reset, cmd_resume, cmd_rotatingpin, cmd_setlimit, cmd_setmessage, cmd_setpin,
+    cmd_status, cmd_time, cmd_unlock, cmd_update, cmd_weekly, measure_server_clock, retry_delay,
+    split_message, stale_age, stale_note, BotLifecycle, ChatMarkup, RateLimit, StartAction,
+    WeeklyMarkup, DISCORD_MAX_MESSAGE, DISCORD_TIME_URL, STALE_NOTE_INTERVAL,
 };
 use crate::time_request;
+
+/// At most one "ignored, too old" reply a minute - see `stale_note`.
+static STALE_NOTES: RateLimit = RateLimit::new(STALE_NOTE_INTERVAL);
+
+/// How long building the client (which asks Discord for the gateway
+/// address over HTTP, with no timeout of its own) may take before it is
+/// abandoned and retried.
+const CLIENT_BUILD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Whether a bot thread is running, whether it's been told to stop, and
 /// whether a start is queued behind a stop that's still in progress - see
@@ -44,7 +55,7 @@ static BOT_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None)
 /// config, not just the first-ever value, since the admin could change the
 /// configured channel in Settings while a bot generation from before that
 /// change is still using the old one, or across a session-handoff restart.
-static NOTIFY_CHANNEL_ID: Mutex<Option<u64>> = Mutex::new(None);
+static NOTIFY_CHANNEL_ID: Mutex<Option<ChannelId>> = Mutex::new(None);
 
 /// Whether the current bot generation has connected to Discord (its `ready`
 /// event arrived) - so `can_notify` doesn't report a client that is still
@@ -52,7 +63,7 @@ static NOTIFY_CHANNEL_ID: Mutex<Option<u64>> = Mutex::new(None);
 static CONNECTED: AtomicBool = AtomicBool::new(false);
 
 struct Handler {
-    channel_id: u64,
+    channel_id: ChannelId,
     admin_user_id: Option<u64>,
 }
 
@@ -61,6 +72,8 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         eprintln!("[Discord] Bot connected as {}", ready.user.name);
         CONNECTED.store(true, Ordering::SeqCst);
+        // Message ages are judged by Discord's clock, not the PC's alone.
+        measure_server_clock(DISCORD_TIME_URL).await;
         // Fires on every (re)connect, including a session-handoff reconnect
         // under Fast User Switching (see session.rs) - so this doubles as an
         // "active user changed" notice, not just a genuine app startup one.
@@ -70,14 +83,20 @@ impl EventHandler for Handler {
             i18n::t("tg.status.user"),
             crate::remote_commands::current_windows_username(),
         );
-        let _ = ChannelId::new(self.channel_id).say(&ctx.http, text).await;
+        let _ = self.channel_id.say(&ctx.http, text).await;
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
+        // Between a stop (this session lost the console) and the shards
+        // closing, messages can still arrive - they're for the session that
+        // now owns the console, whose own bot handles them.
+        if LIFECYCLE.shutdown_requested() {
+            return;
+        }
         if msg.author.bot {
             return;
         }
-        if msg.channel_id.get() != self.channel_id {
+        if msg.channel_id != self.channel_id {
             return;
         }
         let Some(rest) = msg.content.strip_prefix('!') else {
@@ -109,6 +128,25 @@ impl EventHandler for Handler {
                 return;
             }
             Some(_) => {}
+        }
+
+        // Same age limit as Telegram's (see `STALE_COMMAND_SECS`): Discord's
+        // gateway replays messages missed while reconnecting, which may be
+        // long after they were sent.
+        if let Some(age) = stale_age(msg.timestamp.unix_timestamp(), DISCORD_TIME_URL).await {
+            eprintln!("[Discord] Ignoring message {} - sent {age}s ago", msg.id);
+            if cmd == "setpin" {
+                // Not run, but its passcode is still readable in the channel.
+                let _ = msg.delete(&ctx).await;
+            }
+            if STALE_NOTES.allow() {
+                let _ = msg.channel_id.say(&ctx.http, stale_note(age)).await;
+            }
+            return;
+        }
+        // Checking the age may have taken a moment (a clock measurement).
+        if LIFECYCLE.shutdown_requested() {
+            return;
         }
 
         // Commands that dismiss/grant time on the lock screen resolve any
@@ -147,6 +185,7 @@ impl EventHandler for Handler {
             "setlimit" => cmd_setlimit(args),
             "rotatingpin" => cmd_rotatingpin(args),
             "getpin" => getpin_by_dm(&ctx, &msg).await,
+            "clearlockout" => cmd_clearlockout(),
             // Talks to GitHub (and schtasks) - off this single-threaded
             // runtime, so the gateway connection isn't stalled meanwhile.
             "update" => tokio::task::spawn_blocking(cmd_update)
@@ -163,7 +202,14 @@ impl EventHandler for Handler {
             time_request::resolve_if_pending("Discord", &detail);
         }
 
-        let _ = msg.channel_id.say(&ctx.http, response).await;
+        // Long replies (`!weekly` with many accounts) go out as several
+        // messages.
+        for part in split_message(&response, DISCORD_MAX_MESSAGE, ChatMarkup::DiscordMarkdown) {
+            if let Err(e) = msg.channel_id.say(&ctx.http, part).await {
+                eprintln!("[Discord] Couldn't send a reply: {e}");
+                break;
+            }
+        }
     }
 }
 
@@ -231,6 +277,7 @@ fn help_text() -> String {
         ("!setlimit <mins>", i18n::t("dc.cmd.setlimit")),
         ("!rotatingpin <on|off>", i18n::t("dc.cmd.rotatingpin")),
         ("!getpin", i18n::t("dc.cmd.getpin")),
+        ("!clearlockout", i18n::t("dc.cmd.clearlockout")),
         ("!update", i18n::t("dc.cmd.update")),
         ("!e30", i18n::t("dc.cmd.e30")),
         ("!e60", i18n::t("dc.cmd.e60")),
@@ -263,7 +310,7 @@ fn light_runtime() -> std::io::Result<tokio::runtime::Runtime> {
 /// Settings one bot generation runs with.
 struct Settings {
     token: String,
-    channel_id: u64,
+    channel_id: ChannelId,
     admin_user_id: Option<u64>,
 }
 
@@ -286,7 +333,10 @@ fn load_settings() -> Option<Settings> {
         return None;
     }
 
-    let Some(channel_id) = config.channel_id else {
+    // Built from a NonZeroU64 rather than `ChannelId::new`, which panics on 0
+    // (and a panic aborts the app) - `get_discord_config` already never
+    // returns 0, this just keeps it that way.
+    let Some(channel_id) = config.channel_id.and_then(NonZeroU64::new).map(ChannelId::from) else {
         eprintln!("[Discord] Bot enabled but no channel configured");
         return None;
     };
@@ -374,7 +424,7 @@ pub fn notify_admin(text: &str) {
             let rt = light_runtime().ok();
             if let Some(rt) = rt {
                 rt.block_on(async {
-                    let _ = ChannelId::new(channel_id).say(&http, text).await;
+                    let _ = channel_id.say(&http, text).await;
                 });
             }
         });
@@ -402,9 +452,7 @@ pub fn signal_shutdown() {
             let rt = light_runtime().ok();
             if let Some(rt) = rt {
                 rt.block_on(async {
-                    let _ = ChannelId::new(channel_id)
-                        .say(&http, i18n::t("tg.notify.shutdown"))
-                        .await;
+                    let _ = channel_id.say(&http, i18n::t("tg.notify.shutdown")).await;
                 });
             }
         });
@@ -416,24 +464,41 @@ pub fn signal_shutdown() {
 /// refuses the configuration outright (bad token, Message Content intent
 /// not enabled) - neither of which can change without an app restart.
 ///
-/// Network trouble needs no retry loop here, unlike telegram.rs: serenity
+/// Network trouble needs little retrying here, unlike telegram.rs: serenity
 /// keeps re-queueing the gateway connection every few seconds until it
 /// succeeds, and reconnects by itself after a drop. Building the client
 /// makes no network calls that can fail it either (`get_gateway` falls back
-/// to the default URL). What it does need is a stop that works while still
-/// offline: `shutdown_all` returns early without ending `start()` when no
-/// shard has connected yet, which used to leave this thread - and so the
-/// bot's running state - stuck until the app exited.
+/// to the default URL) - but that call has no timeout, so on a network that
+/// accepts connections and never answers it could hang; building is given
+/// `CLIENT_BUILD_TIMEOUT` (then retried) and is cut short by a stop. Also
+/// needed is a stop that works while still offline: `shutdown_all` returns
+/// early without ending `start()` when no shard has connected yet, which
+/// used to leave this thread - and so the bot's running state - stuck until
+/// the app exited.
 async fn run_bot(settings: Settings) {
     let Settings { token, channel_id, admin_user_id } = settings;
     let intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
-    let handler = Handler { channel_id, admin_user_id };
 
-    let mut client = match Client::builder(&token, intents).event_handler(handler).await {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("[Discord] Failed to create client: {e}");
-            return;
+    let mut failures = 0u32;
+    let mut client = loop {
+        let build = Client::builder(&token, intents).event_handler(Handler { channel_id, admin_user_id });
+        let built = tokio::select! {
+            res = tokio::time::timeout(CLIENT_BUILD_TIMEOUT, build) => res,
+            () = LIFECYCLE.wait_for_shutdown() => return,
+        };
+        match built {
+            Ok(Ok(c)) => break c,
+            Ok(Err(e)) => {
+                eprintln!("[Discord] Failed to create client: {e}");
+                return;
+            }
+            Err(_) => {
+                failures += 1;
+                eprintln!("[Discord] Creating the client timed out (attempt {failures}) - retrying");
+                if !LIFECYCLE.sleep_unless_shutdown(retry_delay(failures)).await {
+                    return;
+                }
+            }
         }
     };
 
