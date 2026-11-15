@@ -1099,13 +1099,33 @@ pub struct DiscordConfig {
 pub fn get_discord_config() -> DiscordConfig {
     DiscordConfig {
         bot_token: get_shared_setting(DISCORD_BOT_TOKEN),
-        channel_id: get_shared_setting(DISCORD_CHANNEL_ID)
-            .and_then(|s| s.parse::<u64>().ok()),
-        admin_user_id: get_shared_setting(DISCORD_ADMIN_USER_ID)
-            .and_then(|s| s.parse::<u64>().ok()),
+        channel_id: get_shared_setting(DISCORD_CHANNEL_ID).and_then(|s| parse_discord_id(&s)),
+        admin_user_id: get_shared_setting(DISCORD_ADMIN_USER_ID).and_then(|s| parse_discord_id(&s)),
         enabled: get_shared_setting(DISCORD_ENABLED)
             .map(|s| s == "true")
             .unwrap_or(false),
+    }
+}
+
+/// A stored Discord ID. Never 0: serenity's `ChannelId::new`/`UserId::new`
+/// panic on 0, and a panic aborts the app (release builds use
+/// `panic = "abort"`), so "0" typed into Settings counts as not configured.
+fn parse_discord_id(s: &str) -> Option<u64> {
+    s.parse::<u64>().ok().filter(|&id| id != 0)
+}
+
+#[cfg(test)]
+mod discord_id_tests {
+    use super::parse_discord_id;
+
+    #[test]
+    fn zero_and_junk_are_not_ids() {
+        assert_eq!(parse_discord_id("123456789012345678"), Some(123_456_789_012_345_678));
+        assert_eq!(parse_discord_id("0"), None);
+        assert_eq!(parse_discord_id("000"), None);
+        assert_eq!(parse_discord_id(""), None);
+        assert_eq!(parse_discord_id("-5"), None);
+        assert_eq!(parse_discord_id("abc"), None);
     }
 }
 
