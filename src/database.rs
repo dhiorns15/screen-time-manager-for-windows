@@ -801,15 +801,144 @@ fn monotonic_now_ms() -> i64 {
     unsafe { GetTickCount64() as i64 }
 }
 
-/// Re-point the clock anchor at the current (trusted) wall-clock/date, and
-/// clear any tamper flag - called whenever the wall clock is judged trustworthy.
-fn resync_clock_anchor(now_wall: i64, now_tick: i64, date: &str) {
-    set_setting("clock_anchor_wall_secs", &now_wall.to_string());
-    set_setting("clock_anchor_tick_ms", &now_tick.to_string());
-    set_setting("clock_anchor_date", date);
-    if get_setting("clock_tamper_active").as_deref() == Some("1") {
-        set_setting("clock_tamper_active", "0");
-        set_setting("clock_tamper_alerted", "0");
+/// Where the wall clock and `GetTickCount64` were at the last check that
+/// trusted the clock, the date then, and the logon session
+/// (`session::logon_token`) that check ran in. Kept in the per-account
+/// database, so with Fast User Switching each account has its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClockAnchor {
+    wall_secs: i64,
+    tick_ms: i64,
+    date: String,
+    /// `None` for an anchor written by a version before 1.0.1, or while the
+    /// session couldn't be identified.
+    logon_token: Option<i64>,
+}
+
+/// The clock-tamper episode state: whether one is going on, whether the
+/// admin was alerted about it, and how far the clock was moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ClockTamper {
+    active: bool,
+    alerted: bool,
+    drift_secs: Option<i64>,
+}
+
+/// The clocks as read now.
+#[derive(Debug, Clone, Copy)]
+struct ClockReading {
+    wall_secs: i64,
+    tick_ms: i64,
+    /// This session's `session::logon_token`; `None` if it can't be read.
+    logon_token: Option<i64>,
+}
+
+/// What `check_clock` decided: the date "today" is, the anchor to store
+/// (`None` to keep the stored one), and the tamper state to store.
+#[derive(Debug, PartialEq, Eq)]
+struct ClockCheck {
+    date: String,
+    anchor: Option<ClockAnchor>,
+    tamper: ClockTamper,
+}
+
+const CLOCK_ANCHOR_WALL_KEY: &str = "clock_anchor_wall_secs";
+const CLOCK_ANCHOR_TICK_KEY: &str = "clock_anchor_tick_ms";
+const CLOCK_ANCHOR_DATE_KEY: &str = "clock_anchor_date";
+const CLOCK_ANCHOR_LOGON_KEY: &str = "clock_anchor_logon_token";
+const CLOCK_TAMPER_ACTIVE_KEY: &str = "clock_tamper_active";
+const CLOCK_TAMPER_ALERTED_KEY: &str = "clock_tamper_alerted";
+const CLOCK_TAMPER_DRIFT_KEY: &str = "clock_tamper_drift_secs";
+
+/// Judge the wall clock against the stored anchor (see `effective_today_date`).
+///
+/// `GetTickCount64` only means something within one boot, and a reboot can't
+/// be told from the tick alone: an app started later in the new boot than
+/// the anchor was taken in the old one sees the tick still ahead of it, and
+/// used to read the whole time it was not running as the clock being moved -
+/// "today" stayed pinned to that old date from then on. So the anchor is
+/// only compared within the logon session that took it, which lies within
+/// one boot. In any other session (after a sign-out or a reboot, including a
+/// Fast Startup one, which signs everyone out), for an anchor without a
+/// session (an older version's),
+/// with the tick gone backwards, or when this session can't be identified,
+/// the clock is accepted as it is: re-anchored, and any tamper episode ended
+/// without an alert - the same as the reboot case always was.
+fn check_clock(anchor: Option<&ClockAnchor>, tamper: ClockTamper, now: ClockReading, today: &str) -> ClockCheck {
+    let comparable = anchor.filter(|a| {
+        now.logon_token.is_some() && a.logon_token == now.logon_token && now.tick_ms >= a.tick_ms
+    });
+    if let Some(a) = comparable {
+        // Saturating: the anchor comes from the database, which can be edited.
+        let expected_wall = a.wall_secs.saturating_add(now.tick_ms.saturating_sub(a.tick_ms) / 1000);
+        let drift = now.wall_secs.saturating_sub(expected_wall);
+        if drift.abs() > CLOCK_DRIFT_TOLERANCE_SECS {
+            return ClockCheck {
+                date: a.date.clone(),
+                anchor: None,
+                // A new episode is alerted on even if a stale "alerted" was left behind.
+                tamper: ClockTamper { active: true, alerted: tamper.active && tamper.alerted, drift_secs: Some(drift) },
+            };
+        }
+    }
+    ClockCheck {
+        date: today.to_string(),
+        anchor: Some(ClockAnchor {
+            wall_secs: now.wall_secs,
+            tick_ms: now.tick_ms,
+            date: today.to_string(),
+            logon_token: now.logon_token,
+        }),
+        tamper: ClockTamper { active: false, alerted: false, drift_secs: tamper.drift_secs },
+    }
+}
+
+/// The drift to alert the admin about, if a tamper episode is going on and
+/// hasn't been alerted on yet.
+fn pending_clock_tamper_alert(tamper: &ClockTamper) -> Option<i64> {
+    if tamper.active && !tamper.alerted {
+        tamper.drift_secs
+    } else {
+        None
+    }
+}
+
+fn load_clock_anchor() -> Option<ClockAnchor> {
+    let parse = |key: &str| get_setting(key).and_then(|s| s.parse::<i64>().ok());
+    Some(ClockAnchor {
+        wall_secs: parse(CLOCK_ANCHOR_WALL_KEY)?,
+        tick_ms: parse(CLOCK_ANCHOR_TICK_KEY)?,
+        date: get_setting(CLOCK_ANCHOR_DATE_KEY)?,
+        logon_token: parse(CLOCK_ANCHOR_LOGON_KEY),
+    })
+}
+
+fn store_clock_anchor(anchor: &ClockAnchor) {
+    set_setting(CLOCK_ANCHOR_WALL_KEY, &anchor.wall_secs.to_string());
+    set_setting(CLOCK_ANCHOR_TICK_KEY, &anchor.tick_ms.to_string());
+    set_setting(CLOCK_ANCHOR_DATE_KEY, &anchor.date);
+    set_setting(CLOCK_ANCHOR_LOGON_KEY, &anchor.logon_token.map(|t| t.to_string()).unwrap_or_default());
+}
+
+fn load_clock_tamper() -> ClockTamper {
+    ClockTamper {
+        active: get_setting(CLOCK_TAMPER_ACTIVE_KEY).as_deref() == Some("1"),
+        alerted: get_setting(CLOCK_TAMPER_ALERTED_KEY).as_deref() == Some("1"),
+        drift_secs: get_setting(CLOCK_TAMPER_DRIFT_KEY).and_then(|s| s.parse().ok()),
+    }
+}
+
+/// Write the parts of `new` that differ from `old` (what's stored now).
+fn store_clock_tamper(old: &ClockTamper, new: &ClockTamper) {
+    let flag = |on: bool| if on { "1" } else { "0" };
+    if new.active != old.active {
+        set_setting(CLOCK_TAMPER_ACTIVE_KEY, flag(new.active));
+    }
+    if new.alerted != old.alerted {
+        set_setting(CLOCK_TAMPER_ALERTED_KEY, flag(new.alerted));
+    }
+    if let Some(drift) = new.drift_secs.filter(|_| new.drift_secs != old.drift_secs) {
+        set_setting(CLOCK_TAMPER_DRIFT_KEY, &drift.to_string());
     }
 }
 
@@ -820,13 +949,15 @@ fn resync_clock_anchor(now_wall: i64, now_tick: i64, date: &str) {
 /// daily allowance: change the date, then get the app to restart (kill it -
 /// the watchdog relaunches it within a minute anyway) so the loaded state
 /// finds no row for the "new" date and grants a full day. To catch that, a
-/// monotonic anchor (wall-clock time + `GetTickCount64` uptime, which only
-/// moves via an actual reboot, not the Date & Time settings) is persisted
-/// alongside every save. If the real wall clock ever strays more than
+/// monotonic anchor (wall-clock time + `GetTickCount64` uptime, which the
+/// Date & Time settings can't move) is persisted alongside every save,
+/// together with the logon session it was taken in. If, in that same
+/// session, the real wall clock ever strays more than
 /// `CLOCK_DRIFT_TOLERANCE_SECS` from where the anchor says it should be,
 /// that's not elapsed time - it's the clock being moved - so "today" stays
 /// pinned to the last known-good date until the real clock drifts back
-/// within tolerance on its own.
+/// within tolerance on its own. In any other session the clock is accepted
+/// (see `check_clock`).
 ///
 /// A time-zone change moves the local date without moving the clock, so the
 /// anchor can't see it; the date this starts from is already the one in the
@@ -834,40 +965,19 @@ fn resync_clock_anchor(now_wall: i64, now_tick: i64, date: &str) {
 /// a changed zone - before or after a reboot - moves nothing here.
 pub fn effective_today_date() -> String {
     let today = remembered_zone_today_date();
-    let now_wall = wall_clock_now_secs();
-    let now_tick = monotonic_now_ms();
-
-    let anchor = get_setting("clock_anchor_wall_secs")
-        .and_then(|s| s.parse::<i64>().ok())
-        .zip(get_setting("clock_anchor_tick_ms").and_then(|s| s.parse::<i64>().ok()))
-        .zip(get_setting("clock_anchor_date"));
-
-    let Some(((anchor_wall, anchor_tick), anchor_date)) = anchor else {
-        // First run ever - nothing to compare against yet.
-        resync_clock_anchor(now_wall, now_tick, &today);
-        return today;
+    let now = ClockReading {
+        wall_secs: wall_clock_now_secs(),
+        tick_ms: monotonic_now_ms(),
+        // 0 isn't a logon time: treat it as unknown, like the watchdog does.
+        logon_token: crate::session::logon_token().filter(|&t| t != 0),
     };
-
-    if now_tick < anchor_tick {
-        // The machine rebooted since the last anchor, so the tick counter
-        // reset and can't sanity-check the wall clock across that gap.
-        // Accept the current time and start fresh from here.
-        resync_clock_anchor(now_wall, now_tick, &today);
-        return today;
+    let tamper = load_clock_tamper();
+    let check = check_clock(load_clock_anchor().as_ref(), tamper, now, &today);
+    if let Some(anchor) = &check.anchor {
+        store_clock_anchor(anchor);
     }
-
-    // Saturating: the anchor comes from the database, which can be edited.
-    let expected_wall = anchor_wall.saturating_add(now_tick.saturating_sub(anchor_tick) / 1000);
-    let drift = now_wall.saturating_sub(expected_wall);
-
-    if drift.abs() <= CLOCK_DRIFT_TOLERANCE_SECS {
-        resync_clock_anchor(now_wall, now_tick, &today);
-        today
-    } else {
-        set_setting("clock_tamper_active", "1");
-        set_setting("clock_tamper_drift_secs", &drift.to_string());
-        anchor_date
-    }
+    store_clock_tamper(&tamper, &check.tamper);
+    check.date
 }
 
 /// Returns the drift (signed seconds) the first time a clock-tamper episode
@@ -875,14 +985,8 @@ pub fn effective_today_date() -> String {
 /// re-notifying on every periodic save while the clock stays off. `None` both
 /// while no episode is active and after one has already been alerted on.
 pub fn take_pending_clock_tamper_alert() -> Option<i64> {
-    if get_setting("clock_tamper_active").as_deref() != Some("1") {
-        return None;
-    }
-    if get_setting("clock_tamper_alerted").as_deref() == Some("1") {
-        return None;
-    }
-    let drift: i64 = get_setting("clock_tamper_drift_secs")?.parse().ok()?;
-    set_setting("clock_tamper_alerted", "1");
+    let drift = pending_clock_tamper_alert(&load_clock_tamper())?;
+    set_setting(CLOCK_TAMPER_ALERTED_KEY, "1");
     Some(drift)
 }
 
@@ -2140,6 +2244,261 @@ mod timekeeping_tests {
         assert_eq!(parse_inflight_pause("2026-11-15|130"), None);
         assert_eq!(parse_inflight_pause("garbage|130|1794750000"), None);
         assert_eq!(parse_inflight_pause(""), None);
+    }
+}
+
+#[cfg(test)]
+mod clock_anchor_tests {
+    use super::*;
+
+    /// The stored anchor and tamper state, updated the way
+    /// `effective_today_date` and `take_pending_clock_tamper_alert` update
+    /// the database.
+    #[derive(Default, Clone)]
+    struct Stored {
+        anchor: Option<ClockAnchor>,
+        tamper: ClockTamper,
+    }
+
+    impl Stored {
+        fn today(&mut self, now: ClockReading, today: &str) -> String {
+            let check = check_clock(self.anchor.as_ref(), self.tamper, now, today);
+            if let Some(anchor) = check.anchor {
+                self.anchor = Some(anchor);
+            }
+            self.tamper = check.tamper;
+            check.date
+        }
+
+        fn take_alert(&mut self) -> Option<i64> {
+            let drift = pending_clock_tamper_alert(&self.tamper)?;
+            self.tamper.alerted = true;
+            Some(drift)
+        }
+    }
+
+    const DAY: i64 = 86_400;
+    const HOUR_MS: i64 = 3_600_000;
+
+    fn secs(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) -> i64 {
+        civil_to_secs(y, mo, d, h, mi, s)
+    }
+
+    /// A session's logon token: its logon time as a FILETIME.
+    fn logon_at(epoch_secs: i64) -> Option<i64> {
+        Some((epoch_secs + 11_644_473_600) * 10_000_000)
+    }
+
+    fn reading(wall_secs: i64, tick_ms: i64, logon_token: Option<i64>) -> ClockReading {
+        ClockReading { wall_secs, tick_ms, logon_token }
+    }
+
+    fn anchor(wall_secs: i64, tick_ms: i64, date: &str, logon_token: Option<i64>) -> ClockAnchor {
+        ClockAnchor { wall_secs, tick_ms, date: date.into(), logon_token }
+    }
+
+    // The field case: the anchor was last written on 2026-11-01 at tick
+    // 42,406 ms (the app started 42 s after boot and was quit soon after).
+    // The PC rebooted during the two weeks the app stayed quit, and the app
+    // was started again on 2026-11-15 hours into the new boot.
+    const FIELD_ANCHOR_TICK: i64 = 42_406;
+    const FIELD_DRIFT: i64 = 1_222_712;
+    fn field_boot_1() -> i64 { secs(2026, 11, 1, 8, 59, 18) }
+    fn field_anchor_wall() -> i64 { field_boot_1() + FIELD_ANCHOR_TICK / 1000 }
+    fn field_now_tick() -> i64 { 6 * HOUR_MS + 1_234 }
+    fn field_now_wall() -> i64 { field_anchor_wall() + (field_now_tick() - FIELD_ANCHOR_TICK) / 1000 + FIELD_DRIFT }
+
+    #[test]
+    fn field_case_numbers() {
+        // Hours into a boot on 2026-11-15, with the tick above the anchor's.
+        assert!(field_now_tick() > FIELD_ANCHOR_TICK);
+        let (y, m, d) = civil_from_days(field_now_wall().div_euclid(DAY));
+        assert_eq!((y, m, d), (2026, 11, 15));
+        // Compared as one boot, the gap is the reported "clock moved forward".
+        let same_session = check_clock(
+            Some(&anchor(field_anchor_wall(), FIELD_ANCHOR_TICK, "2026-11-01", logon_at(field_boot_1() + 30))),
+            ClockTamper::default(),
+            reading(field_now_wall(), field_now_tick(), logon_at(field_boot_1() + 30)),
+            "2026-11-15",
+        );
+        assert_eq!(same_session.tamper.drift_secs, Some(FIELD_DRIFT));
+        assert_eq!(same_session.date, "2026-11-01");
+    }
+
+    #[test]
+    fn a_later_start_in_a_new_boot_is_not_taken_for_a_clock_change() {
+        let boot_2_logon = field_now_wall() - field_now_tick() / 1000 + 25;
+        let mut stored = Stored {
+            anchor: Some(anchor(field_anchor_wall(), FIELD_ANCHOR_TICK, "2026-11-01", logon_at(field_boot_1() + 30))),
+            ..Default::default()
+        };
+        let now = reading(field_now_wall(), field_now_tick(), logon_at(boot_2_logon));
+        assert_eq!(stored.today(now, "2026-11-15"), "2026-11-15");
+        assert_eq!(stored.tamper, ClockTamper::default());
+        assert_eq!(stored.take_alert(), None);
+        assert_eq!(stored.anchor, Some(anchor(field_now_wall(), field_now_tick(), "2026-11-15", logon_at(boot_2_logon))));
+
+        // Midnight comes as usual from there.
+        let tomorrow = reading(field_now_wall() + 12 * 3600, field_now_tick() + 12 * HOUR_MS, logon_at(boot_2_logon));
+        assert_eq!(stored.today(tomorrow, "2026-11-16"), "2026-11-16");
+        assert_eq!(stored.take_alert(), None);
+    }
+
+    #[test]
+    fn an_install_stuck_by_1_0_0_is_released_on_the_first_check() {
+        // What 1.0.0 left behind: the 2026-11-01 anchor without a session,
+        // and an alerted tamper episode that pinned the date.
+        let mut stored = Stored {
+            anchor: Some(anchor(field_anchor_wall(), FIELD_ANCHOR_TICK, "2026-11-01", None)),
+            tamper: ClockTamper { active: true, alerted: true, drift_secs: Some(FIELD_DRIFT) },
+        };
+        let logon = logon_at(field_now_wall() - field_now_tick() / 1000 + 25);
+        let now_wall = field_now_wall() + DAY;
+        let now_tick = field_now_tick() + DAY * 1000;
+
+        assert_eq!(stored.today(reading(now_wall, now_tick, logon), "2026-11-16"), "2026-11-16");
+        assert!(!stored.tamper.active && !stored.tamper.alerted);
+        assert_eq!(stored.take_alert(), None, "the stale episode is never alerted on");
+        assert_eq!(stored.anchor, Some(anchor(now_wall, now_tick, "2026-11-16", logon)));
+
+        // Later checks in this session stay on the real date, with no alert.
+        let later = reading(now_wall + 600, now_tick + 600_000, logon);
+        assert_eq!(stored.today(later, "2026-11-16"), "2026-11-16");
+        assert_eq!(stored.take_alert(), None);
+    }
+
+    #[test]
+    fn small_drift_in_the_same_session_is_accepted() {
+        let logon = logon_at(secs(2026, 11, 16, 7, 0, 0));
+        let wall = secs(2026, 11, 16, 9, 0, 0);
+        for drift in [0, 600, -600, CLOCK_DRIFT_TOLERANCE_SECS, -CLOCK_DRIFT_TOLERANCE_SECS] {
+            let mut stored = Stored { anchor: Some(anchor(wall, 2 * HOUR_MS, "2026-11-16", logon)), ..Default::default() };
+            let now = reading(wall + 3600 + drift, 3 * HOUR_MS, logon);
+            assert_eq!(stored.today(now, "2026-11-16"), "2026-11-16", "drift {drift}");
+            assert!(!stored.tamper.active);
+            assert_eq!(stored.anchor, Some(anchor(wall + 3600 + drift, 3 * HOUR_MS, "2026-11-16", logon)), "re-anchored");
+        }
+    }
+
+    #[test]
+    fn a_clock_moved_in_the_same_session_pins_the_date_and_alerts_once() {
+        let logon = logon_at(secs(2026, 11, 16, 7, 0, 0));
+        let wall = secs(2026, 11, 16, 20, 0, 0);
+        let stored_anchor = anchor(wall, 13 * HOUR_MS, "2026-11-16", logon);
+        for (drift, new_date) in [(2 * DAY, "2026-11-18"), (CLOCK_DRIFT_TOLERANCE_SECS + 1, "2026-11-16"), (-DAY, "2026-11-15")] {
+            let mut stored = Stored { anchor: Some(stored_anchor.clone()), ..Default::default() };
+            let now = reading(wall + 60 + drift, 13 * HOUR_MS + 60_000, logon);
+            assert_eq!(stored.today(now, new_date), "2026-11-16", "drift {drift}");
+            assert_eq!(stored.anchor, Some(stored_anchor.clone()), "the anchor is kept");
+            assert_eq!(stored.take_alert(), Some(drift));
+            assert_eq!(stored.take_alert(), None, "one alert per episode");
+
+            // Still pinned while the clock stays moved; released once it's put back.
+            let later = reading(wall + 120 + drift, 13 * HOUR_MS + 120_000, logon);
+            assert_eq!(stored.today(later, new_date), "2026-11-16");
+            assert_eq!(stored.take_alert(), None);
+            let put_back = reading(wall + 180, 13 * HOUR_MS + 180_000, logon);
+            assert_eq!(stored.today(put_back, "2026-11-16"), "2026-11-16");
+            assert_eq!(stored.tamper, ClockTamper { active: false, alerted: false, drift_secs: Some(drift) });
+        }
+    }
+
+    #[test]
+    fn restarting_the_app_in_the_same_session_keeps_a_moved_clock_caught() {
+        let logon = logon_at(secs(2026, 11, 16, 7, 0, 0));
+        let wall = secs(2026, 11, 16, 20, 0, 0);
+        let mut stored = Stored { anchor: Some(anchor(wall, 13 * HOUR_MS, "2026-11-16", logon)), ..Default::default() };
+
+        // Moved a day forward, then the app is killed before the alert goes out.
+        let moved = reading(wall + 30 + DAY, 13 * HOUR_MS + 30_000, logon);
+        assert_eq!(stored.today(moved, "2026-11-17"), "2026-11-16");
+
+        // The restarted app: same session, later tick.
+        let restarted = reading(wall + 90 + DAY, 13 * HOUR_MS + 90_000, logon);
+        assert_eq!(stored.today(restarted, "2026-11-17"), "2026-11-16");
+        assert_eq!(stored.take_alert(), Some(DAY));
+
+        // And again after the alert went out: still pinned, not alerted again.
+        let again = reading(wall + 150 + DAY, 13 * HOUR_MS + 150_000, logon);
+        assert_eq!(stored.today(again, "2026-11-17"), "2026-11-16");
+        assert_eq!(stored.take_alert(), None);
+    }
+
+    #[test]
+    fn a_new_session_is_accepted_whatever_the_tick() {
+        let old_logon = logon_at(secs(2026, 11, 16, 7, 0, 0));
+        let wall = secs(2026, 11, 16, 20, 0, 0);
+        let stored_anchor = anchor(wall, 2 * HOUR_MS, "2026-11-16", old_logon);
+        let moved = Stored {
+            anchor: Some(stored_anchor.clone()),
+            tamper: ClockTamper { active: true, alerted: true, drift_secs: Some(DAY) },
+        };
+        // After a reboot, below and above the anchor's tick; after a sign-out
+        // and back in (same boot, tick still running).
+        for (new_logon, tick) in [
+            (secs(2026, 11, 17, 8, 0, 0), 40_000),
+            (secs(2026, 11, 17, 8, 0, 0), 9 * HOUR_MS),
+            (secs(2026, 11, 16, 21, 0, 0), 3 * HOUR_MS + 60_000),
+        ] {
+            for start in [Stored { anchor: Some(stored_anchor.clone()), ..Default::default() }, moved.clone()] {
+                let mut stored = start;
+                let now = reading(new_logon + 120, tick, logon_at(new_logon));
+                let today = if new_logon > secs(2026, 11, 17, 0, 0, 0) { "2026-11-17" } else { "2026-11-16" };
+                assert_eq!(stored.today(now, today), today);
+                assert!(!stored.tamper.active && !stored.tamper.alerted);
+                assert_eq!(stored.take_alert(), None);
+                assert_eq!(stored.anchor, Some(anchor(new_logon + 120, tick, today, logon_at(new_logon))));
+            }
+        }
+    }
+
+    #[test]
+    fn a_tick_gone_backwards_is_accepted() {
+        let logon = logon_at(secs(2026, 11, 16, 7, 0, 0));
+        let wall = secs(2026, 11, 16, 20, 0, 0);
+        let mut stored = Stored { anchor: Some(anchor(wall, 13 * HOUR_MS, "2026-11-16", logon)), ..Default::default() };
+        let now = reading(wall + 2 * DAY, 60_000, logon);
+        assert_eq!(stored.today(now, "2026-11-18"), "2026-11-18");
+        assert!(!stored.tamper.active);
+    }
+
+    #[test]
+    fn without_a_session_the_clock_is_accepted() {
+        let logon = logon_at(secs(2026, 11, 16, 7, 0, 0));
+        let wall = secs(2026, 11, 16, 20, 0, 0);
+        let mut stored = Stored {
+            anchor: Some(anchor(wall, 13 * HOUR_MS, "2026-11-16", logon)),
+            tamper: ClockTamper { active: true, alerted: false, drift_secs: Some(DAY) },
+        };
+
+        // This session can't be identified now: accepted, anchored without one.
+        let now = reading(wall + DAY + 60, 13 * HOUR_MS + 60_000, None);
+        assert_eq!(stored.today(now, "2026-11-17"), "2026-11-17");
+        assert_eq!(stored.take_alert(), None);
+        assert_eq!(stored.anchor, Some(anchor(wall + DAY + 60, 13 * HOUR_MS + 60_000, "2026-11-17", None)));
+
+        // An anchor without a session is accepted again once it can be.
+        let later = reading(wall + 3 * DAY, 13 * HOUR_MS + 120_000, logon);
+        assert_eq!(stored.today(later, "2026-11-19"), "2026-11-19");
+        assert_eq!(stored.anchor.as_ref().and_then(|a| a.logon_token), logon);
+
+        // No anchor at all (first run, or a recreated database): accepted.
+        let mut fresh = Stored::default();
+        assert_eq!(fresh.today(reading(wall, 13 * HOUR_MS, logon), "2026-11-16"), "2026-11-16");
+        assert_eq!(fresh.anchor, Some(anchor(wall, 13 * HOUR_MS, "2026-11-16", logon)));
+    }
+
+    #[test]
+    fn a_stale_alerted_flag_does_not_hide_a_new_episode() {
+        let logon = logon_at(secs(2026, 11, 16, 7, 0, 0));
+        let wall = secs(2026, 11, 16, 20, 0, 0);
+        let mut stored = Stored {
+            anchor: Some(anchor(wall, 13 * HOUR_MS, "2026-11-16", logon)),
+            tamper: ClockTamper { active: false, alerted: true, drift_secs: Some(5 * DAY) },
+        };
+        let moved = reading(wall + 60 + DAY, 13 * HOUR_MS + 60_000, logon);
+        assert_eq!(stored.today(moved, "2026-11-17"), "2026-11-16");
+        assert_eq!(stored.take_alert(), Some(DAY));
     }
 }
 
