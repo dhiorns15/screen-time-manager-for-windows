@@ -433,33 +433,96 @@ pub fn reduce_time(minutes: i32) {
 /// Set the remaining time back to today's full limit (bot `reset`, Stats
 /// "Reset Timer"), saved at once. Returns the limit in seconds.
 pub fn reset_to_daily_limit() -> i32 {
+    use crate::database;
     crate::mini_overlay::roll_over_if_due();
-    let limit_minutes = crate::database::get_daily_limit(crate::database::get_current_weekday());
-    let limit_seconds = (limit_minutes * 60) as i32;
+    let _serial = LIMIT_CHANGE.lock().unwrap();
+    let limit_minutes = database::get_daily_limit(database::get_current_weekday());
+    let limit_seconds = minutes_to_secs(limit_minutes);
     REMAINING_SECONDS.store(limit_seconds, Ordering::SeqCst);
     crate::mini_overlay::persist_remaining();
+    // The remaining time now reflects this limit (see reconcile_todays_limit).
+    let date = database::with_counters_date(|tracked| {
+        database::counters_save_date(tracked.as_deref(), database::effective_today_date)
+    });
+    database::set_applied_limit(&date, limit_minutes);
     unsafe { crate::mini_overlay::update_mini_overlay() };
     limit_seconds
 }
 
-/// Remaining time capped to a new daily limit, or `None` if it's already
-/// within it (including "no limit running", which is negative).
-fn capped(current: i32, limit_seconds: i32) -> Option<i32> {
-    (current > limit_seconds).then_some(limit_seconds)
+/// Minutes to seconds, saturating (a limit comes from the database).
+fn minutes_to_secs(minutes: u32) -> i32 {
+    i32::try_from(minutes.saturating_mul(60)).unwrap_or(i32::MAX)
 }
 
-/// Cap the remaining time to `limit_seconds` (a daily limit that was just
-/// lowered), atomically as above, so a countdown tick or an extension on
-/// another thread can't be lost between the check and the store. Saves and
-/// redraws if it changed anything; returns whether it did.
-pub fn cap_remaining_time(limit_seconds: i32) -> bool {
+/// Remaining time after today's limit changed from `old_seconds` to
+/// `new_seconds`: moved by the difference, never below zero - so raising the
+/// limit gives the extra time, lowering it takes it away, and extensions
+/// granted earlier stay. `None` if nothing changes: the same limit, or "no
+/// limit running" (negative). (It used to be capped to the full new limit,
+/// on every Settings Save: an earlier extension vanished when any setting
+/// was saved, and lowering 120 to 60 minutes after an hour's use changed
+/// nothing.) Lowering to below what's left gives 0, and raising again later
+/// starts from that 0.
+fn after_limit_change(current: i32, old_seconds: i32, new_seconds: i32) -> Option<i32> {
+    if old_seconds == new_seconds || current < 0 {
+        return None;
+    }
+    let moved = current.saturating_add(new_seconds.saturating_sub(old_seconds)).max(0);
+    (moved != current).then_some(moved)
+}
+
+/// Whether a change to the remaining time takes the lock screen down: time
+/// is left now and it's up because time had run out.
+fn lifts_out_of_time_lock(remaining: i32, overlay_up: bool) -> bool {
+    remaining > 0 && overlay_up
+}
+
+/// Serializes limit changes (Settings on the UI thread, `setlimit` on a bot
+/// thread), so one change is never applied twice.
+static LIMIT_CHANGE: Mutex<()> = Mutex::new(());
+
+/// Today's limit may just have changed (Settings Save, bot `setlimit` - for
+/// any weekday): move the remaining time by the difference from the limit
+/// it reflects (`database::get_applied_limit`), save it, and take an
+/// out-of-time lock screen down if that left time. A limit that didn't
+/// change, or another weekday's, changes nothing. Returns whether the
+/// remaining time changed.
+pub fn apply_todays_limit_change() -> bool {
+    crate::mini_overlay::roll_over_if_due();
+    reconcile_todays_limit()
+}
+
+/// `apply_todays_limit_change` without the rollover check - for startup and
+/// the rollover itself. The first time a day is seen, its current limit is
+/// recorded as the one its remaining time reflects.
+pub fn reconcile_todays_limit() -> bool {
+    use crate::database;
+    let _serial = LIMIT_CHANGE.lock().unwrap();
+    let date = database::with_counters_date(|tracked| {
+        database::counters_save_date(tracked.as_deref(), database::effective_today_date)
+    });
+    let new_limit = database::get_daily_limit(database::get_current_weekday());
+    let Some(old_limit) = database::get_applied_limit(&date) else {
+        database::set_applied_limit(&date, new_limit);
+        return false;
+    };
+    if old_limit == new_limit {
+        return false;
+    }
     let changed = REMAINING_SECONDS
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| capped(current, limit_seconds))
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            after_limit_change(current, minutes_to_secs(old_limit), minutes_to_secs(new_limit))
+        })
         .is_ok();
+    database::set_applied_limit(&date, new_limit);
     if changed {
         crate::mini_overlay::persist_remaining();
         unsafe {
             crate::mini_overlay::update_mini_overlay();
+            // No time left: the accounting tick locks within a second.
+            if lifts_out_of_time_lock(REMAINING_SECONDS.load(Ordering::SeqCst), is_blocking_overlay_visible()) {
+                hide_blocking_overlay();
+            }
         }
     }
     changed
@@ -1756,14 +1819,83 @@ mod tests {
         assert_eq!(REMAINING.load(Ordering::SeqCst), 1_000_000 - 10_000 + 4 * 1_000 * 60);
     }
 
-    #[test]
-    fn lowering_the_limit_caps_remaining_time() {
-        assert_eq!(capped(7200, 3600), Some(3600));
-        assert_eq!(capped(3600, 3600), None);
-        assert_eq!(capped(1800, 3600), None);
-        assert_eq!(capped(-1, 3600), None, "no limit running is left alone");
-        assert_eq!(capped(600, 0), Some(0), "a 0-minute day locks");
+    /// Today's remaining time and the limit it reflects, changed the way
+    /// `reconcile_todays_limit` changes them on a Save or `setlimit`.
+    struct Day {
+        remaining: i32,
+        applied_limit: i32,
     }
+
+    impl Day {
+        fn new(limit_mins: i32) -> Self {
+            Day { remaining: limit_mins * 60, applied_limit: limit_mins * 60 }
+        }
+        fn set_limit(&mut self, limit_mins: i32) {
+            if let Some(r) = after_limit_change(self.remaining, self.applied_limit, limit_mins * 60) {
+                self.remaining = r;
+            }
+            self.applied_limit = limit_mins * 60;
+        }
+        fn mins(&self) -> i32 {
+            self.remaining / 60
+        }
+    }
+
+    #[test]
+    fn an_extension_survives_saving_other_settings() {
+        let mut day = Day::new(120);
+        day.remaining = 30 * 60; // 90 minutes used
+        day.remaining = extended(day.remaining, 60 * 60); // parent grants an hour
+        day.set_limit(120); // Settings saved for something else
+        assert_eq!(day.mins(), 90, "the extension is kept");
+        // Another weekday's limit changed: today's stays 120
+        day.set_limit(120);
+        assert_eq!(day.mins(), 90);
+    }
+
+    #[test]
+    fn lowering_the_limit_after_use_takes_the_difference() {
+        let mut day = Day::new(120);
+        day.remaining -= 60 * 60; // an hour used
+        day.set_limit(60);
+        assert_eq!(day.remaining, 0, "an hour of a one-hour day is used up: the tick locks");
+
+        let mut day = Day::new(120);
+        day.remaining -= 30 * 60;
+        day.set_limit(90);
+        assert_eq!(day.mins(), 60);
+    }
+
+    #[test]
+    fn raising_the_limit_while_locked_out_gives_the_extra_time() {
+        let mut day = Day::new(60);
+        day.remaining = 0; // out of time, locked
+        day.set_limit(90);
+        assert_eq!(day.mins(), 30);
+        assert!(lifts_out_of_time_lock(day.remaining, true));
+    }
+
+    #[test]
+    fn lowering_the_limit_to_zero_locks() {
+        let mut day = Day::new(120);
+        day.remaining -= 10 * 60;
+        day.set_limit(0);
+        assert_eq!(day.remaining, 0, "the tick locks");
+        assert!(!lifts_out_of_time_lock(day.remaining, true));
+        // Raising it again starts from that 0
+        day.set_limit(30);
+        assert_eq!(day.mins(), 30);
+    }
+
+    #[test]
+    fn an_unchanged_limit_changes_nothing() {
+        assert_eq!(after_limit_change(1234, 7200, 7200), None);
+        assert_eq!(after_limit_change(0, 3600, 3600), None, "no lock lifted either");
+        assert_eq!(after_limit_change(-1, 3600, 7200), None, "no limit running is left alone");
+        assert_eq!(after_limit_change(0, 3600, 1800), None, "already 0 stays 0");
+        assert_eq!(after_limit_change(i32::MAX - 5, 0, 86_400 * 60), Some(i32::MAX), "saturates");
+    }
+
 
     #[test]
     fn passcode_notice_follows_the_attempt() {

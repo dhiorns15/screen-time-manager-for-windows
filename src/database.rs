@@ -771,7 +771,7 @@ pub fn prune_old_daily_data() {
 
     if let Ok(guard) = DB_CONNECTION.lock() {
         if let Some(conn) = guard.as_ref() {
-            for prefix in ["remaining_time_", "session_active_", "pause_used_", "pause_log_"] {
+            for prefix in ["remaining_time_", "session_active_", "pause_used_", "pause_log_", "limit_applied_"] {
                 let pattern = format!("{}%", prefix);
                 let _ = conn.execute(
                     "DELETE FROM settings WHERE key LIKE ?1 AND substr(key, ?2) < ?3",
@@ -1088,6 +1088,17 @@ pub fn save_remaining_time_for(date: &str, seconds: i32) {
 /// The remaining time saved for `date`, if any.
 pub fn load_remaining_time_for(date: &str) -> Option<i32> {
     get_setting(&format!("remaining_time_{}", date)).and_then(|s| s.parse().ok())
+}
+
+/// The daily limit (minutes) that `date`'s remaining time currently
+/// reflects - what a later change of the day's limit is measured against
+/// (see `blocking::apply_todays_limit_change`).
+pub fn get_applied_limit(date: &str) -> Option<u32> {
+    get_setting(&format!("limit_applied_{}", date)).and_then(|s| s.parse().ok())
+}
+
+pub fn set_applied_limit(date: &str, minutes: u32) {
+    set_setting(&format!("limit_applied_{}", date), &minutes.to_string());
 }
 
 /// Get the current weekday (0 = Monday, 6 = Sunday) - of the day in the time
@@ -1606,6 +1617,7 @@ pub fn restore_today_from_shared_mirror(date: &str) -> Option<i32> {
     save_session_active_time_for(date, restore.active);
     save_pause_used_for(date, restore.paused);
     save_remaining_time_for(date, restore.remaining);
+    set_applied_limit(date, limit_minutes);
     Some(restore.remaining)
 }
 

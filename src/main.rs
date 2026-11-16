@@ -227,6 +227,10 @@ fn main() {
         });
         let session_active = database::get_session_active_time_for(&today);
         mini_overlay::start_day(&today, remaining, session_active);
+        // Follow a limit changed after today's time was saved (or record the
+        // limit it reflects - see there).
+        blocking::reconcile_todays_limit();
+        let remaining = blocking::get_remaining_seconds();
 
         // The always-on per-second tick (countdown, rollover, idle, bots)
         mini_overlay::start_accounting(hwnd);

@@ -1381,13 +1381,9 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                             }
                         }
 
-                        // If today's limit was lowered, cap remaining time to the new limit
-                        {
-                            use crate::database::{get_current_weekday, get_daily_limit};
-                            let new_limit_seconds = i32::try_from(get_daily_limit(get_current_weekday()).saturating_mul(60))
-                                .unwrap_or(i32::MAX);
-                            crate::blocking::cap_remaining_time(new_limit_seconds);
-                        }
+                        // If today's limit changed, move the remaining time
+                        // by the difference (nothing if it didn't change)
+                        crate::blocking::apply_todays_limit_change();
 
                         if !handles.warning1_minutes.0.is_null() {
                             let mut buffer = [0u16; 16];

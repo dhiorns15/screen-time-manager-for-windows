@@ -559,11 +559,10 @@ pub fn cmd_setlimit(args: &str) -> String {
 
     database::set_daily_limit(weekday, minutes);
 
-    // If today's limit was just lowered, cap remaining time to match -
-    // mirrors the same adjustment the Settings dialog makes on Save.
-    if weekday == database::get_current_weekday() {
-        blocking::cap_remaining_time((minutes * 60) as i32);
-    }
+    // If that changed today's limit, move the remaining time by the
+    // difference - the same adjustment the Settings dialog makes on Save.
+    // Another weekday's limit leaves today's time alone.
+    blocking::apply_todays_limit_change();
 
     format!(
         "📅 {} {} {} {}",

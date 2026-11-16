@@ -506,7 +506,7 @@ unsafe fn check_day_rollover(force: bool) {
             if tracked.is_none() {
                 *tracked = Some(today);
             }
-            return None;
+            return false;
         }
         // The old day's last counted seconds go under the old day.
         if let Some(old) = tracked.as_deref() {
@@ -520,10 +520,16 @@ unsafe fn check_day_rollover(force: bool) {
         REMAINING_SECONDS.store(remaining, Ordering::SeqCst);
         SESSION_ACTIVE_SECONDS.store(database::get_session_active_time_for(&today), Ordering::SeqCst);
         *tracked = Some(today);
-        Some(remaining)
+        true
     });
-    let Some(remaining) = new_day else { return };
+    if !new_day {
+        return;
+    }
     persist_day_counters();
+    // The new day's remaining time follows a limit changed since it was
+    // saved (or records the limit it reflects).
+    crate::blocking::reconcile_todays_limit();
+    let remaining = REMAINING_SECONDS.load(Ordering::SeqCst);
 
     update_mini_overlay();
     if remaining > 0 {
