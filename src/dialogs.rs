@@ -8,12 +8,12 @@ use std::sync::Mutex;
 use windows::{
     core::{w, PCWSTR},
     Win32::{
-        Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
+        Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
         Graphics::Gdi::{
             BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject,
             DrawTextW, DT_CALCRECT, Ellipse, EndPaint, FillRect, GetMonitorInfoW, GetStockObject, GetSysColorBrush,
-            InvalidateRect, LineTo, MonitorFromWindow, MoveToEx, SelectObject, SetBkColor,
-            SetBkMode, SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER,
+            InvalidateRect, LineTo, MonitorFromWindow, MoveToEx, ScreenToClient, SelectObject, SetBkColor,
+            SetBkMode, SetTextColor, SetViewportOrgEx, DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER,
             DT_WORDBREAK, FW_BOLD, FW_NORMAL, GetSysColor, HDC, HGDIOBJ, MONITORINFO, COLOR_BTNFACE,
             MONITOR_DEFAULTTOPRIMARY, PAINTSTRUCT, PS_SOLID, SYSTEM_FONT, TRANSPARENT,
         },
@@ -1964,6 +1964,205 @@ unsafe fn settings_scroll_to(hwnd: HWND, target: i32) {
     SetScrollInfo(hwnd, SB_VERT, &info, true);
 }
 
+// ============================================================================
+// Setup wizards on small or highly scaled screens
+// ============================================================================
+
+/// A setup wizard that didn't fit on the screen and scrolls instead (see
+/// `fit_wizard_dialog`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WizardScroll {
+    /// Client height the wizard's pages and buttons are laid out for.
+    content_height: i32,
+    /// How far the content is scrolled up, in pixels.
+    pos: i32,
+    /// The Cancel/Back/Next buttons, kept at the bottom of the window
+    /// whatever the scroll position.
+    buttons: [i32; 3],
+}
+
+thread_local! {
+    /// Scrolling wizards, by window.
+    static WIZARD_SCROLL: RefCell<Vec<(usize, WizardScroll)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn wizard_scroll(hwnd: HWND) -> Option<WizardScroll> {
+    WIZARD_SCROLL.with(|s| s.borrow().iter().find(|(h, _)| *h == hwnd.0 as usize).map(|(_, state)| *state))
+}
+
+fn set_wizard_scroll(hwnd: HWND, state: Option<WizardScroll>) {
+    WIZARD_SCROLL.with(|s| {
+        let mut s = s.borrow_mut();
+        s.retain(|(h, _)| *h != hwnd.0 as usize);
+        if let Some(state) = state {
+            s.push((hwnd.0 as usize, state));
+        }
+    });
+}
+
+/// How far a wizard's content is scrolled up (0 if it doesn't scroll), for
+/// placing a control created while it is scrolled.
+fn wizard_scroll_pos(hwnd: HWND) -> i32 {
+    wizard_scroll(hwnd).map_or(0, |s| s.pos)
+}
+
+/// Start painting a wizard page: if the wizard scrolls, draw in content
+/// coordinates (shifted by the scroll position) on a client rectangle as
+/// tall as the content, so the pages paint exactly as when it fits.
+unsafe fn begin_wizard_paint(hwnd: HWND, hdc: HDC, rect: &mut RECT) {
+    if let Some(state) = wizard_scroll(hwnd) {
+        rect.bottom = state.content_height;
+        let _ = SetViewportOrgEx(hdc, 0, -state.pos, None);
+    }
+}
+
+/// Keep a setup wizard on the monitor's work area, so its buttons can
+/// always be reached.
+///
+/// The wizards are created at a fixed size (scaled with the DPI) centred on
+/// the whole screen, taskbar included. At 175-200% on a 1080p or 1200p
+/// display that is taller than the work area, and the Back/Next/Finish row
+/// at the bottom ended up behind the taskbar or off the screen. As Settings
+/// does (`fit_settings_dialog`, same arithmetic in `settings_window_layout`):
+/// a wizard that fits keeps its size and is only moved if it hangs off the
+/// work area; one that doesn't is made as tall as the work area, widened by
+/// a vertical scroll bar, and its page (laid out for the original height)
+/// scrolls, while its row of `buttons` stays at the bottom of the window,
+/// where it is when the page is scrolled to the end.
+unsafe fn fit_wizard_dialog(dlg: HWND, buttons: [i32; 3]) {
+    let mut client: RECT = zeroed();
+    let mut window: RECT = zeroed();
+    if GetClientRect(dlg, &mut client).is_err() || GetWindowRect(dlg, &mut window).is_err() {
+        return;
+    }
+    let width = window.right - window.left;
+    let height = window.bottom - window.top;
+    let frame_width = width - client.right;
+    let frame_height = height - client.bottom;
+    let content_height = client.bottom;
+
+    let mut monitor_info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..zeroed() };
+    let monitor = MonitorFromWindow(dlg, MONITOR_DEFAULTTOPRIMARY);
+    if !GetMonitorInfoW(monitor, &mut monitor_info).as_bool() {
+        return;
+    }
+    let work = monitor_info.rcWork;
+
+    let layout = settings_window_layout(
+        client.right,
+        content_height,
+        frame_width,
+        frame_height,
+        work.bottom - work.top,
+        GetSystemMetrics(SM_CXVSCROLL),
+    );
+    if !layout.scroll {
+        let (x, y) = position_within(window.left, window.top, width, height, &work);
+        if (x, y) != (window.left, window.top) {
+            let _ = SetWindowPos(dlg, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        return;
+    }
+
+    let state = WizardScroll { content_height, pos: 0, buttons };
+    set_wizard_scroll(dlg, Some(state));
+    let style = GetWindowLongPtrW(dlg, GWL_STYLE);
+    SetWindowLongPtrW(dlg, GWL_STYLE, style | WS_VSCROLL.0 as isize);
+    let x = work.left + ((work.right - work.left - layout.width) / 2).max(0);
+    let _ = SetWindowPos(dlg, None, x, work.top, layout.width, layout.height, SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    pin_wizard_buttons(dlg, &state);
+
+    let mut client_after: RECT = zeroed();
+    let _ = GetClientRect(dlg, &mut client_after);
+    let info = SCROLLINFO {
+        cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+        fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+        nMin: 0,
+        nMax: content_height - 1,
+        nPage: client_after.bottom.max(1) as u32,
+        nPos: 0,
+        nTrackPos: 0,
+    };
+    SetScrollInfo(dlg, SB_VERT, &info, true);
+}
+
+/// Put a scrolling wizard's buttons at the bottom of its window, the same
+/// distance from the bottom edge as in the layout (`create_wizard_buttons`).
+unsafe fn pin_wizard_buttons(hwnd: HWND, state: &WizardScroll) {
+    let mut client: RECT = zeroed();
+    if GetClientRect(hwnd, &mut client).is_err() {
+        return;
+    }
+    for id in state.buttons {
+        let Ok(button) = GetDlgItem(hwnd, id) else { continue };
+        let mut r: RECT = zeroed();
+        if GetWindowRect(button, &mut r).is_err() {
+            continue;
+        }
+        let mut corner = POINT { x: r.left, y: r.top };
+        let _ = ScreenToClient(hwnd, &mut corner);
+        let _ = SetWindowPos(button, None, corner.x, client.bottom - scale(60), 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+/// Top-left corner for a `width` x `height` window at (`left`, `top`),
+/// moved as little as needed to lie within `work` (to its top-left if it
+/// is bigger than `work`).
+fn position_within(left: i32, top: i32, width: i32, height: i32, work: &RECT) -> (i32, i32) {
+    let x = left.min(work.right - width).max(work.left);
+    let y = top.min(work.bottom - height).max(work.top);
+    (x, y)
+}
+
+/// WM_VSCROLL and WM_MOUSEWHEEL for a setup wizard. `false` if the wizard
+/// doesn't scroll (the message is then left to DefWindowProc).
+unsafe fn handle_wizard_scroll(hwnd: HWND, msg: u32, wparam: WPARAM) -> bool {
+    let Some(state) = wizard_scroll(hwnd) else {
+        return false;
+    };
+    let target = if msg == WM_VSCROLL {
+        let mut info = SCROLLINFO {
+            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+            fMask: SIF_ALL,
+            ..zeroed()
+        };
+        let _ = GetScrollInfo(hwnd, SB_VERT, &mut info);
+        let page = info.nPage as i32;
+        match SCROLLBAR_COMMAND((wparam.0 & 0xFFFF) as i32) {
+            SB_LINEUP => state.pos - scale(24),
+            SB_LINEDOWN => state.pos + scale(24),
+            SB_PAGEUP => state.pos - page,
+            SB_PAGEDOWN => state.pos + page,
+            SB_THUMBTRACK | SB_THUMBPOSITION => info.nTrackPos,
+            SB_TOP => 0,
+            SB_BOTTOM => i32::MAX,
+            _ => state.pos,
+        }
+    } else {
+        let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+        state.pos - delta * scale(72) / 120
+    };
+
+    let mut client: RECT = zeroed();
+    let _ = GetClientRect(hwnd, &mut client);
+    let new_pos = target.clamp(0, (state.content_height - client.bottom).max(0));
+    let dy = state.pos - new_pos;
+    if dy != 0 {
+        let state = WizardScroll { pos: new_pos, ..state };
+        set_wizard_scroll(hwnd, Some(state));
+        ScrollWindowEx(hwnd, 0, dy, None, None, None, None, SW_SCROLLCHILDREN | SW_INVALIDATE | SW_ERASE);
+        pin_wizard_buttons(hwnd, &state);
+        let info = SCROLLINFO {
+            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+            fMask: SIF_POS,
+            nPos: new_pos,
+            ..zeroed()
+        };
+        SetScrollInfo(hwnd, SB_VERT, &info, true);
+    }
+    true
+}
+
 /// Show today's stats dialog
 pub unsafe fn show_stats_dialog(parent_hwnd: HWND) {
     let dialog_class = w!("ScreenTimeStatsDialog");
@@ -2401,6 +2600,7 @@ pub unsafe fn show_telegram_wizard(parent_hwnd: HWND) -> bool {
 
     if let Ok(hwnd) = wizard_hwnd {
         WIZARD_HWND.store(hwnd.0, AtomicOrdering::SeqCst);
+        fit_wizard_dialog(hwnd, [ID_WIZARD_CANCEL, ID_WIZARD_BACK, ID_WIZARD_NEXT]);
         run_owned_modal(hwnd, parent_hwnd);
     }
 
@@ -2440,6 +2640,7 @@ unsafe extern "system" fn wizard_proc(
             close_modal(hwnd);
             LRESULT(0)
         }
+        WM_VSCROLL | WM_MOUSEWHEEL if handle_wizard_scroll(hwnd, msg, wparam) => LRESULT(0),
         WM_DESTROY => {
             // Also when Settings, its owner, is destroyed.
             end_modal(hwnd);
@@ -2448,6 +2649,7 @@ unsafe extern "system" fn wizard_proc(
             LRESULT(0)
         }
         WM_NCDESTROY => {
+            set_wizard_scroll(hwnd, None);
             release_gdi(hwnd);
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
@@ -2545,6 +2747,7 @@ unsafe fn paint_wizard(hwnd: HWND) {
 
     let mut rect: RECT = zeroed();
     GetClientRect(hwnd, &mut rect).ok();
+    begin_wizard_paint(hwnd, hdc, &mut rect);
     let width = rect.right;
 
     // Background
@@ -2824,7 +3027,7 @@ unsafe fn paint_step_token(hdc: HDC, hwnd: HWND, rect: &RECT) {
             w!(""),
             WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_CENTER as u32 | ES_AUTOHSCROLL as u32),
             edit_x,
-            y,
+            y - wizard_scroll_pos(hwnd),
             edit_width,
             scale(35),
             hwnd,
@@ -3421,6 +3624,7 @@ pub unsafe fn show_discord_wizard(parent_hwnd: HWND) -> bool {
 
     if let Ok(hwnd) = wizard_hwnd {
         DC_WIZARD_HWND.store(hwnd.0, AtomicOrdering::SeqCst);
+        fit_wizard_dialog(hwnd, [ID_DC_WIZARD_CANCEL, ID_DC_WIZARD_BACK, ID_DC_WIZARD_NEXT]);
         run_owned_modal(hwnd, parent_hwnd);
     }
     DC_WIZARD_HWND.store(std::ptr::null_mut(), AtomicOrdering::SeqCst);
@@ -3453,12 +3657,14 @@ unsafe extern "system" fn dc_wizard_proc(
             close_modal(hwnd);
             LRESULT(0)
         }
+        WM_VSCROLL | WM_MOUSEWHEEL if handle_wizard_scroll(hwnd, msg, wparam) => LRESULT(0),
         WM_DESTROY => {
             // Also when Settings, its owner, is destroyed.
             end_modal(hwnd);
             LRESULT(0)
         }
         WM_NCDESTROY => {
+            set_wizard_scroll(hwnd, None);
             release_gdi(hwnd);
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
@@ -3555,6 +3761,7 @@ unsafe fn paint_dc_wizard(hwnd: HWND) {
 
     let mut rect: RECT = zeroed();
     GetClientRect(hwnd, &mut rect).ok();
+    begin_wizard_paint(hwnd, hdc, &mut rect);
     let width = rect.right;
 
     // Background
@@ -3764,7 +3971,7 @@ unsafe fn paint_dc_step_token(hdc: HDC, hwnd: HWND, rect: &RECT) {
             w!(""),
             WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_CENTER as u32 | ES_AUTOHSCROLL as u32),
             edit_x,
-            y,
+            y - wizard_scroll_pos(hwnd),
             edit_width,
             scale(35),
             hwnd,
@@ -3861,7 +4068,7 @@ unsafe fn paint_dc_step_ids(hdc: HDC, hwnd: HWND, rect: &RECT) {
         let _ = CreateWindowExW(
             WS_EX_CLIENTEDGE, w!("EDIT"), w!(""),
             WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32 | ES_NUMBER as u32),
-            rect.left + scale(120), y, edit_width, scale(28),
+            rect.left + scale(120), y - wizard_scroll_pos(hwnd), edit_width, scale(28),
             hwnd, HMENU(ID_DC_WIZARD_CHANNEL_EDIT as _), hinstance, None,
         );
         let edit_font = track_gdi(hwnd, CreateFontW(scale(14), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Consolas")));
@@ -3891,7 +4098,7 @@ unsafe fn paint_dc_step_ids(hdc: HDC, hwnd: HWND, rect: &RECT) {
         let _ = CreateWindowExW(
             WS_EX_CLIENTEDGE, w!("EDIT"), w!(""),
             WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32 | ES_NUMBER as u32),
-            rect.left + scale(120), y, edit_width, scale(28),
+            rect.left + scale(120), y - wizard_scroll_pos(hwnd), edit_width, scale(28),
             hwnd, HMENU(ID_DC_WIZARD_USER_EDIT as _), hinstance, None,
         );
         let edit_font = track_gdi(hwnd, CreateFontW(scale(14), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Consolas")));
@@ -4339,5 +4546,66 @@ mod tests {
         // 1080p at 125%: everything scaled by 1.25, work area 1020.
         let scaled = settings_window_layout(490, 1240, 10, 39, 1020, 21);
         assert_eq!(scaled, SettingsWindowLayout { width: 521, height: 1020, scroll: true });
+    }
+
+    /// The wizards' outer size is scale(480) x scale(520) (Telegram) and
+    /// scale(580) (Discord), centred on the whole screen. Frame taken as
+    /// 8 x 32 px at 100% scaled with the DPI (14 x 56 at 175%, 16 x 64 at
+    /// 200%), the scroll bar as 17 px scaled (30 / 34), and a 48 px taskbar
+    /// scaled (84 / 96) at the bottom.
+    #[test]
+    fn wizards_fit_the_work_area_at_high_scaling() {
+        let work = |w: i32, h: i32| RECT { left: 0, top: 0, right: w, bottom: h };
+        let centred = |screen: i32, size: i32| (screen - size) / 2;
+
+        // 1080p at 175%: work area 1080 - 84 = 996.
+        // Telegram 840 x 910 (client 826 x 854) fits, and its screen-centred
+        // position (y 85, bottom 995) is already inside: left as it was.
+        assert_eq!(
+            settings_window_layout(826, 854, 14, 56, 996, 30),
+            SettingsWindowLayout { width: 840, height: 910, scroll: false }
+        );
+        assert_eq!(position_within(540, centred(1080, 910), 840, 910, &work(1920, 996)), (540, 85));
+        // Discord 840 x 1015 (client 959) doesn't: 996 tall with a scroll
+        // bar (client 940, 19 px to scroll), 870 wide.
+        assert_eq!(
+            settings_window_layout(826, 959, 14, 56, 996, 30),
+            SettingsWindowLayout { width: 870, height: 996, scroll: true }
+        );
+
+        // 1080p at 200%: work area 984. Telegram 960 x 1040 (client 976) and
+        // Discord 960 x 1160 (client 1096) both scroll, 994 wide.
+        assert_eq!(
+            settings_window_layout(944, 976, 16, 64, 984, 34),
+            SettingsWindowLayout { width: 994, height: 984, scroll: true }
+        );
+        assert_eq!(
+            settings_window_layout(944, 1096, 16, 64, 984, 34),
+            SettingsWindowLayout { width: 994, height: 984, scroll: true }
+        );
+
+        // 1200p at 200%: work area 1104. Telegram (1040) fits, but centred on
+        // the screen (y 80) its bottom (1120) was 16 px behind the taskbar:
+        // moved up to 64. Discord (1160) scrolls.
+        assert_eq!(
+            settings_window_layout(944, 976, 16, 64, 1104, 34),
+            SettingsWindowLayout { width: 960, height: 1040, scroll: false }
+        );
+        assert_eq!(position_within(480, centred(1200, 1040), 960, 1040, &work(1920, 1104)), (480, 64));
+        assert!(settings_window_layout(944, 1096, 16, 64, 1104, 34).scroll);
+
+        // 1200p at 175%: work area 1116; both fit where they are created.
+        assert!(!settings_window_layout(826, 959, 14, 56, 1116, 30).scroll);
+        assert_eq!(position_within(540, centred(1200, 1015), 840, 1015, &work(1920, 1116)), (540, 92));
+
+        // 100% on 1080p: unchanged.
+        assert!(!settings_window_layout(472, 548, 8, 32, 1032, 17).scroll);
+        assert_eq!(position_within(720, 250, 480, 580, &work(1920, 1032)), (720, 250));
+
+        // A taskbar at the top or left: moved down / right onto the work area.
+        let top_bar = RECT { left: 0, top: 96, right: 1920, bottom: 1200 };
+        assert_eq!(position_within(480, 80, 960, 1040, &top_bar), (480, 96));
+        let left_bar = RECT { left: 96, top: 0, right: 1920, bottom: 1200 };
+        assert_eq!(position_within(40, 80, 960, 1040, &left_bar), (96, 80));
     }
 }
