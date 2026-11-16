@@ -6,7 +6,8 @@
 //! Each run is a brief, separate process: it checks whether the main app's
 //! single-instance mutex is currently held, and if not - and the app wasn't
 //! stopped intentionally via the passcode-protected Quit menu item - relaunches
-//! it and alerts the configured admin via Telegram/Discord. This exists
+//! it (through the main app's own scheduled task, confirming it came up - see
+//! `relaunch_app`) and alerts the configured admin via Telegram/Discord. This exists
 //! because a standard Windows user can always kill their own processes
 //! (admin rights aren't required to end-task something running in your own
 //! session), so the enforcement can't rely solely on the tray app staying alive.
@@ -23,11 +24,12 @@
 use windows::{
     core::{w, PCWSTR, PWSTR},
     Win32::{
-        Foundation::{CloseHandle, GetLastError, BOOL, ERROR_ALREADY_EXISTS, LPARAM, WPARAM},
+        Foundation::{CloseHandle, BOOL, ERROR_FILE_NOT_FOUND, LPARAM, WPARAM},
         System::Threading::{
-            CreateMutexW, GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW,
+            GetCurrentProcessId, OpenMutexW, OpenProcess, QueryFullProcessImageNameW,
             TerminateProcess, WaitForSingleObject, PROCESS_NAME_WIN32,
             PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+            SYNCHRONIZATION_SYNCHRONIZE,
         },
         UI::WindowsAndMessaging::{
             FindWindowW, GetWindowThreadProcessId, SendMessageTimeoutW, SMTO_BLOCK, WM_NULL,
@@ -95,9 +97,11 @@ fn check_app() {
             ));
             return;
         }
-        let relaunched = relaunch_app();
+        let relaunch = relaunch_app();
+        let relaunched = relaunch.confirmed;
         log_state(&format!("post_install_relaunch_{relaunched}"), &format!(
-            "app not running - install/update finished {marker_age}s ago, relaunched={relaunched}, no tamper alert"
+            "app not running - install/update finished {marker_age}s ago, relaunched={relaunched} ({}), no tamper alert",
+            relaunch.detail
         ));
         return;
     }
@@ -126,18 +130,20 @@ fn check_app() {
     // told so. Keep trying, but don't report our own action as a kill.
     let ended = std::fs::read_to_string(watchdog_ended_path()).ok().and_then(|s| WatchdogEnded::parse(&s));
     if let Some(age) = ended.and_then(|e| e.applies(wall_now(), logon_token)) {
-        let relaunched = relaunch_app();
+        let relaunch = relaunch_app();
+        let relaunched = relaunch.confirmed;
         log_state(&format!("watchdog_ended_relaunch_{relaunched}"), &format!(
-            "app not running - this watchdog ended it {age}s ago (unresponsive) and it hasn't started since, relaunched={relaunched}, no tamper alert"
+            "app not running - this watchdog ended it {age}s ago (unresponsive) and it hasn't started since, relaunched={relaunched} ({}), no tamper alert",
+            relaunch.detail
         ));
         return;
     }
 
-    let relaunched = relaunch_app();
+    let relaunch = relaunch_app();
     ensure_shared_database();
-    log(&format!("app not running - relaunched={relaunched}, sending tamper alert"));
+    log(&format!("app not running - relaunched={} ({}), sending tamper alert", relaunch.confirmed, relaunch.detail));
     set_last_state("tamper");
-    send_tamper_alert(relaunched);
+    send_tamper_alert(relaunch.confirmed);
 }
 
 /// How long after setup touches `updating.marker` (next to the exe, see
@@ -256,19 +262,26 @@ fn log_state(key: &str, msg: &str) {
     }
 }
 
+/// Whether the app holds its single-instance mutex in this session.
 unsafe fn app_is_running() -> bool {
-    let mutex_name: Vec<u16> = MUTEX_NAME.encode_utf16().chain(std::iter::once(0)).collect();
-    match CreateMutexW(None, BOOL::from(true), PCWSTR(mutex_name.as_ptr())) {
+    named_mutex_exists(MUTEX_NAME)
+}
+
+/// Whether a mutex called `name` exists in this session's namespace. Only
+/// opens it, never creates it: creating it (even for a moment) would make an
+/// app starting at that instant find it taken and exit with "Already
+/// running" - which matters now that the relaunch below polls this.
+unsafe fn named_mutex_exists(name: &str) -> bool {
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    match OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, PCWSTR(wide.as_ptr())) {
         Ok(h) => {
-            let already_running = GetLastError() == ERROR_ALREADY_EXISTS;
             let _ = CloseHandle(h);
-            already_running
-        }
-        Err(_) => {
-            // Couldn't even attempt the check - assume running rather than
-            // risk spawning a duplicate instance or a false alert.
             true
         }
+        // Couldn't tell (e.g. access denied: it exists but isn't ours) -
+        // assume running rather than risk a duplicate instance or a false
+        // alert.
+        Err(e) => e.code() != ERROR_FILE_NOT_FOUND.to_hresult(),
     }
 }
 
@@ -276,40 +289,207 @@ unsafe fn app_is_running() -> bool {
 /// (installer/screen-time-manager.iss, from installer/task-main.xml).
 const MAIN_TASK_NAME: &str = "ScreenTimeManager";
 
-fn relaunch_app() -> bool {
-    // Ask Task Scheduler to start the app's own registered task rather than
-    // spawning it as a direct child of this watchdog check: a direct child
-    // inherits the watchdog task's Job Object (and any policy Windows
-    // applies to it), and CREATE_BREAKAWAY_FROM_JOB only works if that job
-    // explicitly allows breakaway - it doesn't here, so CreateProcess just
-    // fails outright. The main task has its own separate job with no
-    // execution time limit, so this sidesteps the problem entirely.
-    if relaunch_via_scheduled_task() {
-        return true;
-    }
-    // Fallback for the unlikely case the scheduled task isn't registered
-    // (e.g. a dev build run without the installer) - not ideal if this process happens
-    // to be job-limited, but better than not relaunching at all.
-    relaunch_by_spawning()
+/// How long a relaunch waits for the app to take its mutex before it counts
+/// as failed. The app takes it first thing; Task Scheduler usually starts it
+/// within a second or two. Bounded well inside the watchdog task's 5-minute
+/// execution limit, and short enough that the next per-minute run doesn't
+/// start while this one is still waiting.
+const RELAUNCH_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const RELAUNCH_CONFIRM_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// What a relaunch did. `confirmed` is the only thing reported as "restarted"
+/// (in the log and in alerts): the app was seen holding its mutex in this
+/// session afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Relaunch {
+    confirmed: bool,
+    detail: String,
 }
 
-fn relaunch_via_scheduled_task() -> bool {
+/// Start the app through its own scheduled task and wait (bounded) until it
+/// is running in this session.
+///
+/// Never a direct spawn: a child of this watchdog check runs inside the
+/// watchdog task's job and is ended with it - first by the task's execution
+/// limit (the 2026-07 relaunch/die loop), and in 1.0.1 a moment after the
+/// check finished (the 2026-11-16 field report: "relaunched=true" with no app
+/// running). CREATE_BREAKAWAY_FROM_JOB fails outright there. The main task has
+/// its own job and no execution limit. If the task can't be started (not
+/// registered, e.g. a dev build run without the installer, or not runnable by
+/// this account), the relaunch fails and says so.
+fn relaunch_app() -> Relaunch {
+    relaunch_with(start_main_task, || {
+        wait_until(RELAUNCH_CONFIRM_TIMEOUT, RELAUNCH_CONFIRM_POLL, || unsafe { app_is_running() })
+    })
+}
+
+/// `relaunch_app`'s decision, given how to start the task (`Ok` says how it
+/// was asked to start, `Err` why it couldn't be) and how to wait for the app
+/// (time it took to come up, or `None`).
+fn relaunch_with(
+    start: impl FnOnce() -> Result<String, String>,
+    wait_for_app: impl FnOnce() -> Option<std::time::Duration>,
+) -> Relaunch {
+    match start() {
+        Err(why) => Relaunch {
+            confirmed: false,
+            detail: format!("could not start the {MAIN_TASK_NAME} task: {why}"),
+        },
+        Ok(how) => match wait_for_app() {
+            Some(after) => Relaunch {
+                confirmed: true,
+                detail: format!("{how}; the app was running {:.1}s later", after.as_secs_f32()),
+            },
+            None => Relaunch {
+                confirmed: false,
+                detail: format!(
+                    "{how}, but the app was not running in this session {}s later",
+                    RELAUNCH_CONFIRM_TIMEOUT.as_secs()
+                ),
+            },
+        },
+    }
+}
+
+/// Poll `ready` every `poll` until it's true (returns how long that took) or
+/// `timeout` has passed (`None`). Checks once more at the deadline.
+fn wait_until(
+    timeout: std::time::Duration,
+    poll: std::time::Duration,
+    mut ready: impl FnMut() -> bool,
+) -> Option<std::time::Duration> {
+    let started = std::time::Instant::now();
+    loop {
+        if ready() {
+            return Some(started.elapsed());
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return None;
+        }
+        std::thread::sleep(poll.min(timeout - elapsed));
+    }
+}
+
+/// Ask Task Scheduler to start the main task in this process's own session.
+///
+/// The task's principal is the BUILTIN\Users group, and nothing documents
+/// which session a plain on-demand run of a group task starts in. `RunEx`
+/// with TASK_RUN_USE_SESSION_ID is documented to start it "interactively as
+/// the user who is logged on to the specified session" - this one. Only if
+/// that call fails does this fall back to `schtasks /Run` (a plain `Run`),
+/// whose session is up to Task Scheduler; the caller confirms either way.
+/// Running the task at all needs the execute right setup grants standard
+/// accounts on it (installer/task-main.xml).
+fn start_main_task() -> Result<String, String> {
+    let session = crate::session::own_session_id();
+    let run_ex = match session {
+        Some(id) if id > 0 => match task_scheduler::run_task_in_session(MAIN_TASK_NAME, id) {
+            Ok(()) => return Ok(format!("started the {MAIN_TASK_NAME} task in session {id}")),
+            Err(e) => format!("RunEx in session {id}: {e}"),
+        },
+        Some(id) => format!("not trying RunEx from session {id}"),
+        None => "not trying RunEx: this session's id is unknown".to_string(),
+    };
+    match schtasks_run(MAIN_TASK_NAME) {
+        Ok(()) => Ok(format!("started the {MAIN_TASK_NAME} task with schtasks /Run ({run_ex})")),
+        Err(e) => Err(format!("{run_ex}; {e}")),
+    }
+}
+
+fn schtasks_run(task: &str) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     // schtasks is a console program and this process has no console -
     // without this a console window flashes up in the user's session.
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-    std::process::Command::new("schtasks")
-        .args(["/Run", "/TN", MAIN_TASK_NAME])
+    let output = std::process::Command::new("schtasks")
+        .args(["/Run", "/TN", task])
         .creation_flags(CREATE_NO_WINDOW)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .output()
+        .map_err(|e| format!("schtasks: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let said = String::from_utf8_lossy(&output.stderr);
+    let said = said.trim();
+    let said = if said.is_empty() { String::from_utf8_lossy(&output.stdout).trim().to_string() } else { said.to_string() };
+    Err(format!("schtasks /Run failed ({}): {said}", output.status))
 }
 
-fn relaunch_by_spawning() -> bool {
-    let Ok(exe) = std::env::current_exe() else { return false };
-    std::process::Command::new(exe).spawn().is_ok()
+/// The Task Scheduler's COM interface, for what `schtasks` can't do: start a
+/// task in a given session.
+mod task_scheduler {
+    use windows::core::{BSTR, VARIANT};
+    use windows::Win32::Security::PSECURITY_DESCRIPTOR;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoInitializeSecurity, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_PKT_PRIVACY, RPC_C_IMP_LEVEL_IMPERSONATE,
+    };
+    use windows::Win32::System::TaskScheduler::{IRegisteredTask, ITaskService, TaskScheduler, TASK_RUN_USE_SESSION_ID};
+
+    /// COM for this thread, for as long as it lives.
+    struct Com {
+        initialized: bool,
+    }
+
+    impl Com {
+        fn init() -> Self {
+            let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+            if initialized {
+                // As in Microsoft's Task Scheduler samples. Fails harmlessly
+                // if this process already set (or used) COM security.
+                let _ = unsafe {
+                    CoInitializeSecurity(
+                        PSECURITY_DESCRIPTOR::default(),
+                        -1,
+                        None,
+                        None,
+                        RPC_C_AUTHN_LEVEL_PKT_PRIVACY,
+                        RPC_C_IMP_LEVEL_IMPERSONATE,
+                        None,
+                        EOAC_NONE,
+                        None,
+                    )
+                };
+            }
+            Com { initialized }
+        }
+    }
+
+    impl Drop for Com {
+        fn drop(&mut self) {
+            if self.initialized {
+                unsafe { CoUninitialize() };
+            }
+        }
+    }
+
+    /// Look up the task called `name` in the root folder and hand it to `f`.
+    /// The COM objects are all released before COM is uninitialized.
+    pub(super) fn with_task<R>(name: &str, f: impl FnOnce(&IRegisteredTask) -> windows::core::Result<R>) -> Result<R, String> {
+        let _com = Com::init();
+        let run = || -> windows::core::Result<R> {
+            let service: ITaskService = unsafe { CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER) }?;
+            let empty = VARIANT::default();
+            unsafe { service.Connect(&empty, &empty, &empty, &empty) }?;
+            let folder = unsafe { service.GetFolder(&BSTR::from("\\")) }?;
+            let task = unsafe { folder.GetTask(&BSTR::from(name)) }?;
+            f(&task)
+        };
+        run().map_err(|e| format!("{} (0x{:08X})", e.message(), e.code().0))
+    }
+
+    /// Start the task `name` as whoever is signed in to session `session`
+    /// (which must be > 0). Returns once Task Scheduler has accepted the
+    /// request; that doesn't mean it ran (a disabled task, say, isn't run
+    /// and still succeeds here).
+    pub(super) fn run_task_in_session(name: &str, session: u32) -> Result<(), String> {
+        let session = i32::try_from(session).map_err(|_| format!("session {session} out of range"))?;
+        with_task(name, |task| {
+            unsafe { task.RunEx(&VARIANT::default(), TASK_RUN_USE_SESSION_ID.0, session, &BSTR::new()) }.map(|_| ())
+        })
+    }
 }
 
 fn send_tamper_alert(relaunched: bool) {
@@ -764,9 +944,11 @@ fn handle_unresponsive_app(hb: &Heartbeat, age_secs: u64) {
     if unsafe { end_own_app_process(target_pid) } {
         history.record_restart(now);
         let _ = std::fs::write(&history_path, history.serialize());
-        let relaunched = relaunch_app();
+        let relaunch = relaunch_app();
+        let relaunched = relaunch.confirmed;
         log_state("hb_restarted", &format!(
-            "heartbeat {age_secs}s old and the app didn't respond - ended pid {target_pid}, relaunched={relaunched}, alerting"
+            "heartbeat {age_secs}s old and the app didn't respond - ended pid {target_pid}, relaunched={relaunched} ({}), alerting",
+            relaunch.detail
         ));
         let status = if relaunched {
             i18n::t("watchdog.hung.restarted")
@@ -831,9 +1013,10 @@ fn incident_lock_path() -> std::path::PathBuf {
     data_dir().join("heartbeat_incident.lock")
 }
 
-/// Acting on an incident takes well under a minute (two 5 s probes, a 15 s
-/// pause, a 5 s wait for the process to end, the relaunch); a lock older
-/// than this was left by a run that died.
+/// Acting on an incident takes about a minute at most (two 5 s probes, a
+/// 15 s pause, a 5 s wait for the process to end, the relaunch and up to
+/// `RELAUNCH_CONFIRM_TIMEOUT` waiting for the app); a lock older than this
+/// was left by a run that died.
 const INCIDENT_LOCK_STALE_SECS: u64 = 3 * 60;
 
 // ============================================================================
@@ -1610,6 +1793,73 @@ mod tests {
         let mut h = RestartHistory { restarts: vec![1_000, 2_000], gave_up_alerted: None };
         h.record_restart(1_000 + HUNG_RESTART_WINDOW_SECS + 10);
         assert_eq!(h.restarts, vec![2_000, 1_000 + HUNG_RESTART_WINDOW_SECS + 10]);
+    }
+
+    #[test]
+    fn relaunch_counts_only_when_the_app_was_seen_running() {
+        let started = || Ok("started the task in session 3".to_string());
+        let r = relaunch_with(started, || Some(std::time::Duration::from_millis(1500)));
+        assert!(r.confirmed);
+        assert_eq!(r.detail, "started the task in session 3; the app was running 1.5s later");
+
+        // Task Scheduler took the request, but the app never came up (the
+        // 1.0.1 field case, and a disabled task, look like this).
+        let r = relaunch_with(started, || None);
+        assert!(!r.confirmed);
+        assert!(r.detail.contains("was not running in this session 30s later"), "{}", r.detail);
+
+        // The task couldn't be started: no point waiting.
+        let r = relaunch_with(|| Err("Access is denied.".to_string()), || panic!("waited for an app nobody started"));
+        assert!(!r.confirmed);
+        assert_eq!(r.detail, "could not start the ScreenTimeManager task: Access is denied.");
+    }
+
+    #[test]
+    fn waiting_for_the_app_is_bounded() {
+        use std::time::Duration;
+        let mut calls = 0;
+        let found = wait_until(Duration::from_secs(5), Duration::from_millis(1), || {
+            calls += 1;
+            calls == 3
+        });
+        assert!(found.is_some());
+        assert_eq!(calls, 3);
+
+        let mut calls = 0;
+        let started = std::time::Instant::now();
+        let found = wait_until(Duration::from_millis(60), Duration::from_millis(10), || {
+            calls += 1;
+            false
+        });
+        assert_eq!(found, None);
+        assert!(started.elapsed() >= Duration::from_millis(60));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(calls >= 2, "checked again at the deadline");
+    }
+
+    #[test]
+    fn mutex_check_only_looks_and_never_creates() {
+        use windows::Win32::System::Threading::CreateMutexW;
+        let name = format!("ScreenTimeManager_WatchdogTest_{}", std::process::id());
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            assert!(!named_mutex_exists(&name));
+            // Looking must not have left one behind for the app to trip on.
+            assert!(!named_mutex_exists(&name));
+            let held = CreateMutexW(None, BOOL::from(true), PCWSTR(wide.as_ptr())).expect("create test mutex");
+            assert!(named_mutex_exists(&name));
+            let _ = CloseHandle(held);
+            assert!(!named_mutex_exists(&name));
+        }
+    }
+
+    #[test]
+    fn task_scheduler_lookup_reports_a_missing_task() {
+        // Read-only: looks a task up, never runs or changes one.
+        let missing = task_scheduler::with_task("ScreenTimeManager-no-such-task-for-tests", |_| Ok(()));
+        let err = missing.expect_err("found a task that doesn't exist");
+        // ERROR_FILE_NOT_FOUND as an HRESULT.
+        assert!(err.contains("0x80070002"), "{err}");
     }
 
     #[test]

@@ -14,7 +14,7 @@ use windows::Win32::System::RemoteDesktop::{
 use windows::Win32::System::Threading::GetCurrentProcessId;
 
 /// This process's session id, if it can be determined.
-fn own_session_id() -> Option<u32> {
+pub fn own_session_id() -> Option<u32> {
     let mut my_session_id = 0u32;
     unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut my_session_id) }.ok()?;
     Some(my_session_id)
