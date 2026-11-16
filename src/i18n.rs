@@ -634,6 +634,12 @@ fn en(key: &str) -> &'static str {
         "tray.pause_wait" => "Pause (wait {mins}m)",
         "stats.minutes" => "min",
 
+        // ----- Telegram wizard: why no message is coming through -----
+        "wizard.connect.error.token" => "Telegram doesn't accept this bot token. Go Back and paste the token from BotFather again.",
+        "wizard.connect.error.conflict" => "Something else is already reading this bot's messages - this bot set up on another PC or account, or a webhook. Stop it there, or create a new bot. Still trying...",
+        "wizard.connect.error.network" => "Can't reach Telegram - please check the internet connection. Still trying...",
+        "wizard.connect.error.other" => "Telegram reported a problem. Still trying...",
+
         // Fallback - return empty string for unknown keys (should not happen in practice)
         _ => "",
     }
@@ -1169,6 +1175,12 @@ fn de(key: &str) -> &'static str {
         "tray.pause_cooldown" => "Pause (Wartezeit {mins} Min)",
         "tray.pause_wait" => "Pause (in {mins} Min möglich)",
         "stats.minutes" => "Min",
+
+        // ----- Telegram-Assistent: warum keine Nachricht ankommt -----
+        "wizard.connect.error.token" => "Telegram akzeptiert dieses Bot-Token nicht. Gehen Sie zurück und fügen Sie das Token von BotFather erneut ein.",
+        "wizard.connect.error.conflict" => "Etwas anderes liest bereits die Nachrichten dieses Bots - dieser Bot auf einem anderen PC oder Konto, oder ein Webhook. Beenden Sie es dort oder erstellen Sie einen neuen Bot. Neuer Versuch läuft...",
+        "wizard.connect.error.network" => "Telegram ist nicht erreichbar - bitte die Internetverbindung prüfen. Neuer Versuch läuft...",
+        "wizard.connect.error.other" => "Telegram hat ein Problem gemeldet. Neuer Versuch läuft...",
 
         // Fallback to English
         _ => en(key),

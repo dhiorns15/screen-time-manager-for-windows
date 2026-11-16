@@ -2592,6 +2592,7 @@ pub unsafe fn show_telegram_wizard(parent_hwnd: HWND) -> bool {
     set_wizard_chat(None);
     WIZARD_POLLING = false;
     WIZARD_SAVED = false;
+    WIZARD_PAUSED_BOT = false;
 
     let hinstance = GetModuleHandleW(None).unwrap();
     let wizard_class = w!("ScreenTimeTelegramWizard");
@@ -2627,6 +2628,12 @@ pub unsafe fn show_telegram_wizard(parent_hwnd: HWND) -> bool {
     }
 
     WIZARD_HWND.store(std::ptr::null_mut(), AtomicOrdering::SeqCst);
+    // Start the bot the wizard paused again, unless Settings will (it
+    // restarts it after a save) or is gone (the app is quitting).
+    if WIZARD_PAUSED_BOT && !WIZARD_SAVED && IsWindow(parent_hwnd).as_bool() {
+        crate::session::restart_remote_bots(true, false);
+    }
+    WIZARD_PAUSED_BOT = false;
     WIZARD_SAVED
 }
 
@@ -3159,6 +3166,23 @@ unsafe fn paint_step_connect(hdc: HDC, rect: &RECT) {
         DrawTextW(hdc, &mut i18n::t("wizard.connect.not_you_again").encode_utf16().collect::<Vec<_>>(), &mut hint_rect, DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         SelectObject(hdc, status_font);
         let _ = DeleteObject(hint_font);
+    } else if let Some(error) = WIZARD_POLL_STATUS.lock().ok().and_then(|s| s.visible_error().cloned()) {
+        // Telegram refuses, or can't be reached: say so (detection keeps
+        // trying), instead of the waiting message.
+        let mut text = i18n::t(poll_error_key(&error)).to_string();
+        if let Some(detail) = poll_error_detail(&error) {
+            text.push('\n');
+            text.push_str(&detail);
+        }
+        let error_font = CreateFontW(scale(13), 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"));
+        SelectObject(hdc, error_font);
+        SetTextColor(hdc, COLORREF(COLOR_ERROR));
+        // Room down to just above the buttons (they start 60 px above the
+        // bottom; this page's status line is at 341 of 488 at 100%).
+        let mut error_rect = RECT { left: rect.left, top: y, right: rect.right, bottom: y + scale(84) };
+        DrawTextW(hdc, &mut text.encode_utf16().collect::<Vec<_>>(), &mut error_rect, DT_CENTER | DT_WORDBREAK);
+        SelectObject(hdc, status_font);
+        let _ = DeleteObject(error_font);
     } else {
         // Waiting...
         SetTextColor(hdc, COLORREF(0x00FF9800));
@@ -3338,6 +3362,13 @@ unsafe fn handle_wizard_command(hwnd: HWND, id: i32) {
                 if WIZARD_STEP == 4 {
                     set_wizard_chat(None);
                     WIZARD_POLL_GENERATION.fetch_add(1, AtomicOrdering::SeqCst);
+                    if let Ok(mut status) = WIZARD_POLL_STATUS.lock() {
+                        *status = PollStatus::new();
+                    }
+                    let wizard_token_ref = std::ptr::addr_of!(WIZARD_TOKEN);
+                    if let Some(token) = (*wizard_token_ref).as_deref() {
+                        pause_own_bot_for(token);
+                    }
                 }
                 if WIZARD_STEP == 4 && !WIZARD_POLLING {
                     WIZARD_POLLING = true;
@@ -3426,67 +3457,158 @@ fn wizard_poll_once(token: &str, generation: u32) {
         .and_then(|b| *b)
         .filter(|(g, _)| *g == generation)
         .map(|(_, newest)| newest);
-    match baseline {
-        None => {
-            if let Some(newest) = fetch_newest_update_id(token) {
-                if current() {
-                    if let Ok(mut b) = WIZARD_BASELINE.lock() {
-                        *b = Some((generation, newest));
-                    }
+    let result = match baseline {
+        None => fetch_newest_update_id(token).map(|newest| {
+            if current() {
+                if let Ok(mut b) = WIZARD_BASELINE.lock() {
+                    *b = Some((generation, newest));
                 }
             }
-        }
-        Some(after) => {
-            if let Some(chat) = fetch_chat_after(token, after) {
+        }),
+        Some(after) => fetch_chat_after(token, after).map(|chat| {
+            if let Some(chat) = chat {
                 if current() {
                     set_wizard_chat(Some(chat));
-                    let wizard_hwnd = WIZARD_HWND.load(AtomicOrdering::SeqCst);
-                    if !wizard_hwnd.is_null() {
-                        let _ = unsafe { InvalidateRect(HWND(wizard_hwnd), None, true) };
-                    }
                 }
+            }
+        }),
+    };
+    if current() {
+        if let Ok(mut status) = WIZARD_POLL_STATUS.lock() {
+            status.record(result);
+        }
+        let wizard_hwnd = WIZARD_HWND.load(AtomicOrdering::SeqCst);
+        if !wizard_hwnd.is_null() {
+            let _ = unsafe { InvalidateRect(HWND(wizard_hwnd), None, true) };
+        }
+    }
+}
+
+/// Why a request to Telegram for the wizard failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PollError {
+    /// Telegram answered with an error, e.g. 401 for a revoked or mistyped
+    /// token, 409 when something else is reading the bot's messages.
+    Api { code: u16, description: String },
+    /// No answer (offline, timeout), or not one Telegram would give.
+    Network,
+}
+
+/// How the wizard's requests to Telegram are going, for the "connect"
+/// page. The wizard used to show only "waiting for your message" whatever
+/// happened, so a revoked or mistyped token, or a second reader of the
+/// bot's messages, meant waiting forever with no clue why.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PollStatus {
+    /// Requests in a row that failed (any success resets it).
+    failures: u32,
+    /// The latest failure.
+    last_error: Option<PollError>,
+}
+
+impl PollStatus {
+    const fn new() -> Self {
+        Self { failures: 0, last_error: None }
+    }
+
+    fn record(&mut self, result: Result<(), PollError>) {
+        match result {
+            Ok(()) => *self = Self::new(),
+            Err(e) => {
+                self.failures = self.failures.saturating_add(1);
+                self.last_error = Some(e);
             }
         }
     }
+
+    /// The error to show, if any. A token Telegram refuses (401, 404) is
+    /// shown at once - it won't fix itself; anything else only once it has
+    /// failed three times in a row (about 6 seconds), so a single dropped
+    /// request, or the moment this PC's own bot takes to stop, doesn't flash
+    /// an error.
+    fn visible_error(&self) -> Option<&PollError> {
+        let error = self.last_error.as_ref()?;
+        let definite = matches!(error, PollError::Api { code: 401 | 404, .. });
+        (definite || self.failures >= 3).then_some(error)
+    }
+}
+
+static WIZARD_POLL_STATUS: Mutex<PollStatus> = Mutex::new(PollStatus::new());
+
+/// The i18n key of the advice shown for `error`.
+fn poll_error_key(error: &PollError) -> &'static str {
+    match error {
+        PollError::Api { code: 401 | 404, .. } => "wizard.connect.error.token",
+        PollError::Api { code: 409, .. } => "wizard.connect.error.conflict",
+        PollError::Api { .. } => "wizard.connect.error.other",
+        PollError::Network => "wizard.connect.error.network",
+    }
+}
+
+/// What Telegram said, for showing under the advice: "Telegram: 401
+/// Unauthorized", shortened to fit. `None` without an answer from Telegram.
+fn poll_error_detail(error: &PollError) -> Option<String> {
+    const MAX_CHARS: usize = 90;
+    let PollError::Api { code, description } = error else {
+        return None;
+    };
+    let full = format!("Telegram: {code} {}", description.trim());
+    let full = full.trim_end();
+    if full.chars().count() <= MAX_CHARS {
+        return Some(full.to_string());
+    }
+    let cut: String = full.chars().take(MAX_CHARS - 3).collect();
+    Some(format!("{}...", cut.trim_end()))
 }
 
 /// Most updates one `getUpdates` call returns (Telegram's default limit).
 const TELEGRAM_UPDATES_PAGE: usize = 100;
 
-fn telegram_get_updates(token: &str, query: &str) -> Option<Vec<TelegramUpdate>> {
+fn telegram_get_updates(token: &str, query: &str) -> Result<Vec<TelegramUpdate>, PollError> {
     let url = format!("https://api.telegram.org/bot{token}/getUpdates?timeout=0{query}");
-    let response = ureq::get(&url).timeout(std::time::Duration::from_secs(3)).call().ok()?;
-    parse_updates(&response.into_string().ok()?)
+    match ureq::get(&url).timeout(std::time::Duration::from_secs(3)).call() {
+        Ok(response) => {
+            let status = response.status();
+            let body = response.into_string().map_err(|_| PollError::Network)?;
+            parse_updates_response(status, &body)
+        }
+        // Telegram's error replies (4xx) carry its explanation in the body.
+        Err(ureq::Error::Status(status, response)) => {
+            parse_updates_response(status, &response.into_string().unwrap_or_default())
+        }
+        Err(ureq::Error::Transport(_)) => Err(PollError::Network),
+    }
 }
 
-/// The newest update id waiting for the bot (`Some(None)` if none), or
-/// `None` if Telegram couldn't be asked. Read without an offset, which
-/// leaves the updates for whoever else reads them (an already-running bot
-/// with this token); only if a full page is waiting - nobody is reading
-/// them - is the newest one asked for directly, which drops the rest.
-fn fetch_newest_update_id(token: &str) -> Option<Option<i64>> {
+/// The newest update id waiting for the bot (`None` if none). Read without
+/// an offset, which leaves the updates for whoever else reads them; only if
+/// a full page is waiting - nobody is reading them - is the newest one
+/// asked for directly, which drops the rest.
+fn fetch_newest_update_id(token: &str) -> Result<Option<i64>, PollError> {
     let updates = telegram_get_updates(token, "")?;
     if updates.len() < TELEGRAM_UPDATES_PAGE {
-        return Some(newest_update_id(&updates));
+        return Ok(newest_update_id(&updates));
     }
-    Some(newest_update_id(&telegram_get_updates(token, "&offset=-1&limit=1")?))
+    Ok(newest_update_id(&telegram_get_updates(token, "&offset=-1&limit=1")?))
 }
 
-/// The chat of the newest update after `after` (any update if `None`).
-/// Read without an offset like `fetch_newest_update_id`; only if a full
-/// page of older updates hides newer ones are those older ones (all
-/// waiting since before detection started) skipped with an offset.
-fn fetch_chat_after(token: &str, after: Option<i64>) -> Option<DetectedChat> {
+/// The chat of the newest update after `after` (any update if `None`), if
+/// there is one yet. Read without an offset like `fetch_newest_update_id`;
+/// only if a full page of older updates hides newer ones are those older
+/// ones (all waiting since before detection started) skipped with an offset.
+fn fetch_chat_after(token: &str, after: Option<i64>) -> Result<Option<DetectedChat>, PollError> {
     let updates = telegram_get_updates(token, "")?;
     if let Some(chat) = latest_chat_after(&updates, after) {
-        return Some(chat);
+        return Ok(Some(chat));
     }
-    let after_id = after?;
+    let Some(after_id) = after else {
+        return Ok(None);
+    };
     if updates.len() < TELEGRAM_UPDATES_PAGE {
-        return None;
+        return Ok(None);
     }
     let newer = telegram_get_updates(token, &format!("&offset={}", after_id.saturating_add(1)))?;
-    latest_chat_after(&newer, after)
+    Ok(latest_chat_after(&newer, after))
 }
 
 /// One update from a `getUpdates` response: its id and, if it came from a
@@ -3499,15 +3621,42 @@ struct TelegramUpdate {
 
 /// The updates in a `getUpdates` response; `None` if it isn't one (an
 /// error reply, or not JSON).
+#[cfg(test)]
 fn parse_updates(body: &str) -> Option<Vec<TelegramUpdate>> {
-    let json: serde_json::Value = serde_json::from_str(body).ok()?;
-    let updates = json.get("result")?.as_array()?;
-    Some(
-        updates
-            .iter()
-            .filter_map(|u| Some(TelegramUpdate { id: u.get("update_id")?.as_i64()?, chat: parse_update_chat(u) }))
-            .collect(),
-    )
+    parse_updates_response(200, body).ok()
+}
+
+/// The updates in a `getUpdates` response with HTTP `status`, or why there
+/// are none: Telegram's own error (`"ok": false`, its code and
+/// description), or, for anything that isn't a Telegram reply, the HTTP
+/// status (or `Network` if that was a success).
+fn parse_updates_response(status: u16, body: &str) -> Result<Vec<TelegramUpdate>, PollError> {
+    let json: Option<serde_json::Value> = serde_json::from_str(body).ok();
+    if let Some(json) = &json {
+        let ok = json.get("ok").and_then(serde_json::Value::as_bool);
+        if ok != Some(false) {
+            if let Some(updates) = json.get("result").and_then(serde_json::Value::as_array) {
+                return Ok(updates
+                    .iter()
+                    .filter_map(|u| Some(TelegramUpdate { id: u.get("update_id")?.as_i64()?, chat: parse_update_chat(u) }))
+                    .collect());
+            }
+        }
+        if ok == Some(false) {
+            let code = json
+                .get("error_code")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|c| u16::try_from(c).ok())
+                .unwrap_or(status);
+            let description = json.get("description").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+            return Err(PollError::Api { code, description });
+        }
+    }
+    if status >= 400 {
+        Err(PollError::Api { code: status, description: String::new() })
+    } else {
+        Err(PollError::Network)
+    }
 }
 
 fn newest_update_id(updates: &[TelegramUpdate]) -> Option<i64> {
@@ -3544,6 +3693,32 @@ fn parse_update_chat(update: &serde_json::Value) -> Option<DetectedChat> {
         name = "?".to_string();
     }
     Some(DetectedChat { id, name })
+}
+
+/// Whether this run of the wizard paused this PC's Telegram bot (see
+/// `pause_own_bot_for`).
+static mut WIZARD_PAUSED_BOT: bool = false;
+
+/// Whether the wizard, about to look for the parent's message with `token`,
+/// must first pause the bot this app runs with `config`: the same bot,
+/// switched on. Telegram gives a bot's messages to one reader at a time.
+fn must_pause_own_bot(config: &crate::database::TelegramConfig, token: &str) -> bool {
+    config.enabled && config.bot_token.as_deref().map(str::trim) == Some(token.trim())
+}
+
+/// Re-running the wizard with the bot this app is already running used to
+/// wait forever: the running bot took the parent's message (and answered it
+/// as a command), and the two readers' requests cut each other off with
+/// "409 Conflict". So that bot is paused while the wizard listens, and
+/// started again when the wizard closes - by Settings, with what the wizard
+/// saved, or by `show_telegram_wizard` if it saved nothing. Remote control
+/// is off only while the wizard is open; the bot sends its usual "started"
+/// message when it comes back.
+unsafe fn pause_own_bot_for(token: &str) {
+    if !WIZARD_PAUSED_BOT && must_pause_own_bot(&get_telegram_config(), token) {
+        crate::telegram::stop_bot_thread();
+        WIZARD_PAUSED_BOT = true;
+    }
 }
 
 /// Save wizard configuration to database
@@ -4490,6 +4665,71 @@ mod tests {
         assert_eq!(latest_chat_after(&updates, None).map(|c| c.id), Some(2));
         // An error reply is not "no updates".
         assert_eq!(parse_updates(r#"{"ok":false,"error_code":409}"#), None);
+    }
+
+    #[test]
+    fn telegram_errors_are_reported_not_taken_for_no_messages() {
+        // A revoked or mistyped token.
+        let revoked = parse_updates_response(401, r#"{"ok":false,"error_code":401,"description":"Unauthorized"}"#);
+        assert_eq!(revoked, Err(PollError::Api { code: 401, description: "Unauthorized".into() }));
+        // A token Telegram can't even parse: 404 with Telegram's body.
+        let garbled = parse_updates_response(404, r#"{"ok":false,"error_code":404,"description":"Not Found"}"#);
+        assert_eq!(poll_error_key(&garbled.unwrap_err()), "wizard.connect.error.token");
+        // Another reader of the bot's messages.
+        let conflict = parse_updates_response(
+            409,
+            r#"{"ok":false,"error_code":409,"description":"Conflict: terminated by other getUpdates request; make sure that only one bot instance is running"}"#,
+        )
+        .unwrap_err();
+        assert_eq!(poll_error_key(&conflict), "wizard.connect.error.conflict");
+        assert_eq!(
+            poll_error_detail(&conflict).unwrap(),
+            "Telegram: 409 Conflict: terminated by other getUpdates request; make sure that only one..."
+        );
+        assert!(poll_error_detail(&conflict).unwrap().chars().count() <= 90);
+        // Not Telegram's reply at all (a proxy's error page, garbage).
+        assert_eq!(parse_updates_response(502, "<html>Bad gateway</html>"), Err(PollError::Api { code: 502, description: String::new() }));
+        assert_eq!(parse_updates_response(200, "not json"), Err(PollError::Network));
+        assert_eq!(poll_error_key(&PollError::Network), "wizard.connect.error.network");
+        assert_eq!(poll_error_detail(&PollError::Network), None);
+        assert_eq!(poll_error_detail(&PollError::Api { code: 500, description: String::new() }).as_deref(), Some("Telegram: 500"));
+        // A real reply still reads as before.
+        let ok = parse_updates_response(200, r#"{"ok":true,"result":[{"update_id":3,"message":{"chat":{"id":9,"first_name":"P","type":"private"}}}]}"#);
+        assert_eq!(ok.unwrap().len(), 1);
+        assert_eq!(parse_updates_response(200, r#"{"ok":true,"result":[]}"#), Ok(vec![]));
+    }
+
+    #[test]
+    fn a_bad_token_shows_at_once_other_errors_once_they_persist() {
+        let mut status = PollStatus::new();
+        assert_eq!(status.visible_error(), None);
+
+        // Offline, or the paused bot's last request crossing ours: not
+        // shown for one or two failures, shown from the third.
+        status.record(Err(PollError::Network));
+        status.record(Err(PollError::Api { code: 409, description: "Conflict".into() }));
+        assert_eq!(status.visible_error(), None);
+        status.record(Err(PollError::Network));
+        assert_eq!(status.visible_error(), Some(&PollError::Network));
+
+        // Any success clears it.
+        status.record(Ok(()));
+        assert_eq!(status, PollStatus::new());
+
+        // A refused token is shown on the first failure.
+        status.record(Err(PollError::Api { code: 401, description: "Unauthorized".into() }));
+        assert!(status.visible_error().is_some());
+    }
+
+    #[test]
+    fn the_wizard_pauses_this_pcs_bot_only_when_it_is_the_same_bot() {
+        use crate::database::TelegramConfig;
+        let running = TelegramConfig { bot_token: Some("123:abc".into()), admin_chat_id: Some(5), enabled: true };
+        assert!(must_pause_own_bot(&running, "123:abc"));
+        assert!(must_pause_own_bot(&TelegramConfig { bot_token: Some(" 123:abc\n".into()), ..running.clone() }, "123:abc"));
+        assert!(!must_pause_own_bot(&running, "999:other"), "a new bot doesn't conflict");
+        assert!(!must_pause_own_bot(&TelegramConfig { enabled: false, ..running.clone() }, "123:abc"), "not running");
+        assert!(!must_pause_own_bot(&TelegramConfig { bot_token: None, ..running }, "123:abc"));
     }
 
     #[test]
