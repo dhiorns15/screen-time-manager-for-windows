@@ -29,7 +29,7 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --locked --release
         env:
-          # Also writes target/release/screen-time-manager.pdb, published below so the addresses in
+          # Also writes target/release/screen_time_manager.pdb, published below so the addresses in
           # Windows crash reports can be looked up. The exe only names the file, not the path it was
           # built in.
           CARGO_PROFILE_RELEASE_STRIP: none
@@ -48,7 +48,7 @@ jobs:
           $files = @(Get-ChildItem target/installer/*-windows-x64-setup.exe | ForEach-Object FullName)
           if ($files.Count -ne 1) { throw "Expected one setup in target/installer, found $($files.Count)" }
           # Only for looking up crash report addresses, so a release goes out without it if need be.
-          if (Test-Path target/release/screen-time-manager.pdb) { $files += "target/release/screen-time-manager.pdb" } else { Write-Warning "No screen-time-manager.pdb to publish" }
+          if (Test-Path target/release/screen_time_manager.pdb) { $files += "target/release/screen_time_manager.pdb" } else { Write-Warning "No screen_time_manager.pdb to publish" }
           gh release create $env:GITHUB_REF_NAME @files --title "Screen Time Manager $env:GITHUB_REF_NAME" --notes-file notes.md
 
   # Updates the previous release to this one through the app's updater, as installed copies will.
