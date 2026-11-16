@@ -644,6 +644,10 @@ fn en(key: &str) -> &'static str {
         "settings.error.message_empty" => "A message can't be empty. Type the text to show, or press Cancel to keep the one you had.",
         "settings.error.telegram_chat_id" => "The Telegram chat ID must be a whole number other than 0 (a group's ID starts with a minus sign). The setup wizard can find it for you.",
 
+        // ----- Installer/watchdog review fixes -----
+        "update.notify.downgraded" => "Screen Time Manager was changed to an older version:",
+        "watchdog.restart_pending" => "and was asked to start again, but hadn't started 30 seconds later - the watchdog keeps checking and will report if it doesn't come back.",
+
         // Fallback - return empty string for unknown keys (should not happen in practice)
         _ => "",
     }
@@ -1189,6 +1193,10 @@ fn de(key: &str) -> &'static str {
         // ----- Einstellungen: geleerte Nachrichten, Gruppen-Chat-IDs -----
         "settings.error.message_empty" => "Eine Nachricht darf nicht leer sein. Geben Sie den anzuzeigenden Text ein, oder klicken Sie auf Abbrechen, um die bisherige zu behalten.",
         "settings.error.telegram_chat_id" => "Die Telegram-Chat-ID muss eine ganze Zahl außer 0 sein (die ID einer Gruppe beginnt mit einem Minuszeichen). Der Einrichtungsassistent kann sie für Sie ermitteln.",
+
+        // ----- Installer-/Watchdog-Korrekturen -----
+        "update.notify.downgraded" => "Bildschirmzeit Manager wurde auf eine ältere Version umgestellt:",
+        "watchdog.restart_pending" => "und sollte neu starten, lief aber 30 Sekunden später noch nicht - der Watchdog prüft weiter und meldet sich, falls er nicht wiederkommt.",
 
         // Fallback to English
         _ => en(key),

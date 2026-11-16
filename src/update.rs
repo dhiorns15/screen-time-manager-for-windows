@@ -608,12 +608,25 @@ fn announce_version_change() {
                 // Nothing recorded yet = a first install (or the first
                 // version with this feature) - not an update.
                 if let Some(Some(previous)) = database::swap_shared_setting(LAST_RUNNING_VERSION_KEY, &current) {
-                    let text = format!("✅ {} v{previous} → v{current}", i18n::t("update.notify.updated"));
-                    send_claimed_announcement(&text);
+                    if let Some(text) = version_change_text(&previous, Version::current()) {
+                        send_claimed_announcement(&text);
+                    }
                 }
                 return;
             }
         }
+    }
+}
+
+/// The admin's notice that the running version changed from `previous` (as
+/// stored in the shared database) to `current`, if there's anything to say.
+/// The stored version survives an uninstall, so a reinstall of an older
+/// release lands here too: that is said as it is, not as an update.
+fn version_change_text(previous: &str, current: Version) -> Option<String> {
+    match Version::parse(previous) {
+        Some(p) if p == current => None,
+        Some(p) if p > current => Some(format!("⬇️ {} v{p} → v{current}", i18n::t("update.notify.downgraded"))),
+        _ => Some(format!("✅ {} v{} → v{current}", i18n::t("update.notify.updated"), previous.trim())),
     }
 }
 
@@ -1065,6 +1078,21 @@ mod tests {
         let (reminder, _) = update_message_texts(UpdateMessage::Reminder, latest, installed, None);
         assert!(announcement.starts_with("⬆️ A new version"), "{announcement}");
         assert_eq!(reminder, "⏰ Reminder: Screen Time Manager has an update waiting: v1.1.0\nInstalled: v1.0.1\nSend /update to install it.");
+    }
+
+    #[test]
+    fn version_change_is_worded_by_direction() {
+        let now = v("1.0.3");
+        assert_eq!(version_change_text("1.0.2", now).as_deref(), Some("✅ Screen Time Manager was updated: v1.0.2 → v1.0.3"));
+        // The recorded version outlives an uninstall: a reinstall of an
+        // older release isn't an update.
+        assert_eq!(
+            version_change_text("1.1.0", now).as_deref(),
+            Some("⬇️ Screen Time Manager was changed to an older version: v1.1.0 → v1.0.3")
+        );
+        assert_eq!(version_change_text("1.0.3", now), None);
+        // Something unrecognisable recorded: said as before.
+        assert_eq!(version_change_text("dev", now).as_deref(), Some("✅ Screen Time Manager was updated: vdev → v1.0.3"));
     }
 
     #[test]
