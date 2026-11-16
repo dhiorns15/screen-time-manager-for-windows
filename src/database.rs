@@ -551,11 +551,26 @@ pub fn get_daily_limit(weekday: u32) -> u32 {
         4 => "limit_friday",
         5 => "limit_saturday",
         6 => "limit_sunday",
-        _ => return 120,
+        _ => return DEFAULT_DAILY_LIMIT_MINUTES,
     };
-    get_setting(key)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(120)
+    minutes_or(get_setting(key).as_deref(), DEFAULT_DAILY_LIMIT_MINUTES)
+}
+
+/// First-run defaults that the readers also fall back to when a stored
+/// value is missing, empty or not a number - the two must agree.
+const DEFAULT_DAILY_LIMIT_MINUTES: u32 = 120;
+const DEFAULT_WARNING1_MINUTES: u32 = 10;
+const DEFAULT_WARNING2_MINUTES: u32 = 5;
+
+/// Default minutes for warning 1 or 2 (see `get_warning_config`).
+fn default_warning_minutes(warning_num: u32) -> u32 {
+    if warning_num == 1 { DEFAULT_WARNING1_MINUTES } else { DEFAULT_WARNING2_MINUTES }
+}
+
+/// A stored minutes value, or `default` if it's missing, empty or not a
+/// number.
+fn minutes_or(stored: Option<&str>, default: u32) -> u32 {
+    stored.and_then(|s| s.parse().ok()).unwrap_or(default)
 }
 
 /// Set daily limit for a specific weekday (0 = Monday, 6 = Sunday)
@@ -579,9 +594,9 @@ pub fn get_warning_config(warning_num: u32) -> (u32, String) {
     let minutes_key = format!("warning{}_minutes", warning_num);
     let message_key = format!("warning{}_message", warning_num);
 
-    let minutes = get_setting(&minutes_key)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
+    // Used to default to 5 for both, so a missing or empty first warning
+    // fired together with the second.
+    let minutes = minutes_or(get_setting(&minutes_key).as_deref(), default_warning_minutes(warning_num));
     let message = get_setting(&message_key)
         .unwrap_or_else(|| format!("{} minutes remaining!", minutes));
 
@@ -2577,6 +2592,28 @@ mod tests {
         assert_eq!(clamp_lock_screen_timeout(-600), 60);
         assert_eq!(clamp_lock_screen_timeout(i32::MIN), 60, "negative never means \"never\"");
         assert_eq!(clamp_lock_screen_timeout(i32::MAX), i32::MAX);
+    }
+
+    #[test]
+    fn readers_fall_back_to_the_first_run_defaults() {
+        let conn = Connection::open_in_memory().unwrap();
+        prepare_settings_connection(&conn).unwrap();
+        let stored = |key: &str| -> String {
+            conn.query_row("SELECT value FROM settings WHERE key = ?1", params![key], |r| r.get(0)).unwrap()
+        };
+        for key in WEEKDAY_KEYS {
+            assert_eq!(minutes_or(Some(&stored(key)), 0), DEFAULT_DAILY_LIMIT_MINUTES, "{key}");
+        }
+        assert_eq!(minutes_or(Some(&stored("warning1_minutes")), 0), default_warning_minutes(1));
+        assert_eq!(minutes_or(Some(&stored("warning2_minutes")), 0), default_warning_minutes(2));
+        assert_ne!(default_warning_minutes(1), default_warning_minutes(2), "the warnings don't fire together");
+
+        // Missing, empty or junk values read as those defaults
+        assert_eq!(minutes_or(None, default_warning_minutes(1)), 10);
+        assert_eq!(minutes_or(Some(""), default_warning_minutes(1)), 10);
+        assert_eq!(minutes_or(Some(""), DEFAULT_DAILY_LIMIT_MINUTES), 120);
+        assert_eq!(minutes_or(Some("abc"), default_warning_minutes(2)), 5);
+        assert_eq!(minutes_or(Some("45"), DEFAULT_DAILY_LIMIT_MINUTES), 45);
     }
 
     #[test]
