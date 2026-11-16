@@ -358,6 +358,7 @@ function StandardAccountProbe {
         New-Item -ItemType Directory $probeDir | Out-Null
         icacls $probeDir /grant "${user}:(OI)(CI)M" | Out-Null
         $out = "$probeDir\result.json"
+        Add-Type -Namespace Probe -Name Native -OutputAssembly "$probeDir\probe-native.dll" -MemberDefinition '[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);'
         Set-Content "$probeDir\probe.ps1" -Encoding ASCII -Value @'
 param([string]$Out, [string]$Shared)
 $r = [ordered]@{}
@@ -392,12 +393,19 @@ try { Remove-Item -LiteralPath $file -ErrorAction Stop; $r.sharedDeleteFile = 'a
 try { New-Item -ItemType Directory (Join-Path $Shared "probe-$PID") -ErrorAction Stop | Out-Null; $r.sharedSubfolder = 'allowed' } catch { $r.sharedSubfolder = 'denied' }
 # Opening the folder itself for delete (= delete or rename it), change permissions, take ownership;
 # sharing everything, so only the permissions can refuse it.
-Add-Type -Namespace Probe -Name Native -MemberDefinition '[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);'
+# The helper (CreateFile) was compiled by the caller: this account, with no session of its own,
+# can't be relied on to run the C# compiler. A check that didn't run says so, rather than reading
+# as "allowed" or "denied".
 foreach ($right in @(@('sharedDelete', 0x10000), @('sharedAcl', 0x40000), @('sharedOwner', 0x80000))) {
-    # OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS (to open a folder) | FILE_FLAG_OPEN_REPARSE_POINT.
-    $h = [Probe.Native]::CreateFile($Shared, [uint32]$right[1], 7, [IntPtr]::Zero, 3, 0x02200000, [IntPtr]::Zero)
-    $r[$right[0]] = if ($h.IsInvalid) { 'denied' } else { 'allowed' }
-    $h.Dispose()
+    try {
+        if (!('Probe.Native' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'probe-native.dll') -ErrorAction Stop }
+        # OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS (to open a folder) | FILE_FLAG_OPEN_REPARSE_POINT.
+        $h = [Probe.Native]::CreateFile($Shared, [uint32]$right[1], 7, [IntPtr]::Zero, 3, 0x02200000, [IntPtr]::Zero)
+        $code = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        # 5: ERROR_ACCESS_DENIED.
+        $r[$right[0]] = if (!$h.IsInvalid) { 'allowed' } elseif ($code -eq 5) { 'denied' } else { "failed: Windows error $code" }
+        $h.Dispose()
+    } catch { $r[$right[0]] = "error: $_" }
 }
 $r | ConvertTo-Json | Set-Content $Out
 '@
@@ -546,7 +554,7 @@ try {
         Check ($probe.sharedWrite -eq 'allowed') "A standard account could not create and change a file in $sharedDir ($($probe.sharedWrite))"
         Check ($probe.sharedDeleteFile -eq 'allowed') "A standard account could not delete its file in $sharedDir ($($probe.sharedDeleteFile))"
         foreach ($what in 'sharedSubfolder', 'sharedDelete', 'sharedAcl', 'sharedOwner') {
-            Check ($probe.$what -eq 'denied') "A standard account could do $what on $sharedDir"
+            Check ($probe.$what -eq 'denied') "A standard account was not denied $what on $sharedDir ($($probe.$what))"
         }
         CheckSharedFolder
         # Where Task Scheduler started the main task for an account that has no session of its own
