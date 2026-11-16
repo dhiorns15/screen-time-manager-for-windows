@@ -44,6 +44,11 @@ use crate::remote_commands::current_windows_username;
 
 pub const WATCHDOG_ARG: &str = "--watchdog-check";
 
+/// The main task's argument (installer/task-main.xml): a copy started through
+/// the task that finds the app already running in its session exits without
+/// the "already running" box (see main.rs).
+pub const QUIET_IF_RUNNING_ARG: &str = "--quiet-if-running";
+
 /// How long after this session's own logon to hold off on relaunch/alert if
 /// the app has *never once* been confirmed running yet this session. The
 /// main app task's own -AtLogOn trigger (see installer/task-main.xml) is what's actually
@@ -77,12 +82,38 @@ fn check_app() {
         }
         // Whatever this watchdog ended earlier has been started again.
         clear_watchdog_ended_record();
+        if let Some(pending) = read_pending_relaunch() {
+            clear_pending_relaunch();
+            if let Some(age) = unbiased_now().and_then(|now| pending.age_secs(now)) {
+                log(&format!("the app a watchdog run asked Task Scheduler to start {age}s ago is running"));
+            }
+        }
         check_heartbeat(logon_token);
         return;
     }
 
     // Not running: whatever a stale heartbeat was about is over.
     clear_stale_tracker();
+
+    // An earlier run asked Task Scheduler to start the app and it hadn't
+    // come up by the time that run stopped waiting. Give it a while longer
+    // before starting another copy or reporting anything.
+    if let Some(pending) = read_pending_relaunch() {
+        let started_wall = database::app_last_started().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs() as i64);
+        match pending.state(logon_token, unbiased_now(), read_heartbeat().as_ref(), started_wall) {
+            PendingState::Waiting { age_secs } => {
+                log_state("relaunch_pending", &format!(
+                    "app not running - a watchdog run asked Task Scheduler to start it {age_secs}s ago and it may still be starting; not starting another copy or alerting for up to {RELAUNCH_PENDING_MAX_SECS}s"
+                ));
+                return;
+            }
+            PendingState::Expired { age_secs } => {
+                clear_pending_relaunch();
+                log(&format!("the app a watchdog run asked Task Scheduler to start {age_secs}s ago never came up"));
+            }
+            PendingState::CameUp | PendingState::NotThisSession => clear_pending_relaunch(),
+        }
+    }
 
     // Just installed or updated: setup stopped the app (or it never ran)
     // and isn't what starts it again - this check is. Comes before the
@@ -98,7 +129,7 @@ fn check_app() {
             return;
         }
         let relaunch = relaunch_app();
-        let relaunched = relaunch.confirmed;
+        let relaunched = relaunch.outcome.word();
         log_state(&format!("post_install_relaunch_{relaunched}"), &format!(
             "app not running - install/update finished {marker_age}s ago, relaunched={relaunched} ({}), no tamper alert",
             relaunch.detail
@@ -131,7 +162,7 @@ fn check_app() {
     let ended = std::fs::read_to_string(watchdog_ended_path()).ok().and_then(|s| WatchdogEnded::parse(&s));
     if let Some(age) = ended.and_then(|e| e.applies(wall_now(), logon_token)) {
         let relaunch = relaunch_app();
-        let relaunched = relaunch.confirmed;
+        let relaunched = relaunch.outcome.word();
         log_state(&format!("watchdog_ended_relaunch_{relaunched}"), &format!(
             "app not running - this watchdog ended it {age}s ago (unresponsive) and it hasn't started since, relaunched={relaunched} ({}), no tamper alert",
             relaunch.detail
@@ -141,9 +172,9 @@ fn check_app() {
 
     let relaunch = relaunch_app();
     ensure_shared_database();
-    log(&format!("app not running - relaunched={} ({}), sending tamper alert", relaunch.confirmed, relaunch.detail));
+    log(&format!("app not running - relaunched={} ({}), sending tamper alert", relaunch.outcome.word(), relaunch.detail));
     set_last_state("tamper");
-    send_tamper_alert(relaunch.confirmed);
+    send_tamper_alert(relaunch.outcome);
 }
 
 /// How long after setup touches `updating.marker` (next to the exe, see
@@ -161,19 +192,99 @@ const UPDATE_MARKER_MAX_AGE_SECS: u64 = 300;
 ///   so the ordinary startup grace below applies to it instead (relaunching
 ///   here too could race that launch into an "Already running" message).
 fn pending_post_install_relaunch() -> Option<u64> {
-    let marker = crate::update::update_marker_modified()?;
-    // A marker "from the future" (clock moved back) counts as stale.
-    let age = std::time::SystemTime::now().duration_since(marker).ok()?.as_secs();
+    let (marker, text) = crate::update::read_update_marker()?;
+    let stamp = InstallStamp::parse(&text);
+    let boot = current_boot_id();
+    let now_unbiased = unbiased_now();
+    // A marker "from the future" (clock moved back) has no wall-clock age.
+    let wall_age = std::time::SystemTime::now().duration_since(marker).ok().map(|d| d.as_secs());
+    let age = install_marker_age(stamp, boot, now_unbiased, wall_age)?;
     if age >= UPDATE_MARKER_MAX_AGE_SECS {
         return None;
     }
-    if database::app_last_started().is_some_and(|started| started >= marker) {
+    if database::app_last_started().is_some_and(|started| started >= marker)
+        || started_since_install(stamp, boot, now_unbiased, read_heartbeat().as_ref())
+    {
         return None;
     }
     if crate::session::seconds_since_logon().is_some_and(|since_logon| since_logon >= 0 && (since_logon as u64) < age) {
         return None;
     }
     Some(age)
+}
+
+/// When setup wrote `updating.marker`, in terms no clock change affects:
+/// Windows' boot counter and the PC's awake time (QueryUnbiasedInterruptTime)
+/// at that moment. Written by setup (from the release that added this on)
+/// as `boot=<n> unbiased=<n>` after a readable date; markers without it -
+/// older setups, or setup's crash recovery task - are judged by file time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InstallStamp {
+    boot_id: u32,
+    unbiased: u64,
+}
+
+impl InstallStamp {
+    fn parse(text: &str) -> Option<Self> {
+        let field = |name: &str| text.split_whitespace().find_map(|w| w.strip_prefix(name));
+        Some(InstallStamp { boot_id: field("boot=")?.parse().ok()?, unbiased: field("unbiased=")?.parse().ok()? })
+    }
+}
+
+/// How old the install marker is, in seconds. From its boot stamp when it
+/// was written in this boot (awake time since then - a clock set forward or
+/// back right after the install changes nothing); none at all when it was
+/// written in an earlier boot (the app is started at sign-in then, not by
+/// this); otherwise (no stamp, or the boot can't be told) by its file time.
+fn install_marker_age(stamp: Option<InstallStamp>, boot: Option<u32>, now_unbiased: Option<u64>, wall_age: Option<u64>) -> Option<u64> {
+    match (stamp, boot, now_unbiased) {
+        (Some(s), Some(b), Some(now)) if s.boot_id == b => now.checked_sub(s.unbiased).map(|d| d / TICKS_PER_SEC),
+        (Some(s), Some(b), _) if s.boot_id != b => None,
+        _ => wall_age,
+    }
+}
+
+/// Whether the app has written a heartbeat since the install marker's stamp
+/// (same boot, later awake time): it has started since the install. Read
+/// alongside `database::app_last_started`, which goes by the wall clock.
+fn started_since_install(stamp: Option<InstallStamp>, boot: Option<u32>, now_unbiased: Option<u64>, hb: Option<&Heartbeat>) -> bool {
+    match (stamp, boot, now_unbiased, hb) {
+        (Some(s), Some(b), Some(now), Some(hb)) => s.boot_id == b && hb.unbiased >= s.unbiased && hb.unbiased <= now,
+        _ => false,
+    }
+}
+
+/// Windows' count of boots (`BootId`, the same value setup reads for the
+/// marker). Readable by every account.
+fn current_boot_id() -> Option<u32> {
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegGetValueW(
+            key: isize,
+            sub_key: PCWSTR,
+            value: PCWSTR,
+            flags: u32,
+            kind: *mut u32,
+            data: *mut core::ffi::c_void,
+            size: *mut u32,
+        ) -> u32;
+    }
+    const HKEY_LOCAL_MACHINE: isize = 0x8000_0002_u32 as i32 as isize;
+    const RRF_RT_REG_DWORD: u32 = 0x10;
+    let mut value = 0u32;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            w!(r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters"),
+            w!("BootId"),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            &mut value as *mut u32 as *mut core::ffi::c_void,
+            &mut size,
+        )
+    };
+    (status == 0).then_some(value)
 }
 
 fn data_dir() -> std::path::PathBuf {
@@ -289,20 +400,47 @@ unsafe fn named_mutex_exists(name: &str) -> bool {
 /// (installer/screen-time-manager.iss, from installer/task-main.xml).
 const MAIN_TASK_NAME: &str = "ScreenTimeManager";
 
-/// How long a relaunch waits for the app to take its mutex before it counts
-/// as failed. The app takes it first thing; Task Scheduler usually starts it
-/// within a second or two. Bounded well inside the watchdog task's 5-minute
-/// execution limit, and short enough that the next per-minute run doesn't
-/// start while this one is still waiting.
+/// How long a relaunch waits for the app to take its mutex before this run
+/// stops waiting. The app takes it first thing; Task Scheduler usually starts
+/// it within a second or two. Bounded well inside the watchdog task's
+/// 5-minute execution limit, and short enough that the next per-minute run
+/// doesn't start while this one is still waiting. An app slower than this
+/// isn't written off: see `PendingRelaunch`.
 const RELAUNCH_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const RELAUNCH_CONFIRM_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// What a relaunch did. `confirmed` is the only thing reported as "restarted"
-/// (in the log and in alerts): the app was seen holding its mutex in this
-/// session afterwards.
+/// How long (awake time) after asking Task Scheduler to start the app later
+/// runs wait for it to come up before trying again or reporting it: neither
+/// a second copy nor an alert for an app that is merely slow to start.
+const RELAUNCH_PENDING_MAX_SECS: u64 = 3 * 60;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelaunchOutcome {
+    /// The app was seen holding its mutex in this session afterwards - the
+    /// only thing reported as "restarted".
+    Running,
+    /// Task Scheduler accepted the start, but the app wasn't running yet when
+    /// this run stopped waiting; later runs give it `RELAUNCH_PENDING_MAX_SECS`.
+    Requested,
+    /// The task couldn't be started at all.
+    Failed,
+}
+
+impl RelaunchOutcome {
+    /// For the log: `relaunched=true|pending|false`.
+    fn word(self) -> &'static str {
+        match self {
+            RelaunchOutcome::Running => "true",
+            RelaunchOutcome::Requested => "pending",
+            RelaunchOutcome::Failed => "false",
+        }
+    }
+}
+
+/// What a relaunch did, and the log's account of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Relaunch {
-    confirmed: bool,
+    outcome: RelaunchOutcome,
     detail: String,
 }
 
@@ -317,10 +455,28 @@ struct Relaunch {
 /// its own job and no execution limit. If the task can't be started (not
 /// registered, e.g. a dev build run without the installer, or not runnable by
 /// this account), the relaunch fails and says so.
+///
+/// Once Task Scheduler has accepted the start, a `PendingRelaunch` is
+/// recorded until the app is seen, so a run overlapping this one (the
+/// after-logon run and the per-minute one) or the next minute's run doesn't
+/// start a second copy or raise a second alert while it is still starting.
 fn relaunch_app() -> Relaunch {
-    relaunch_with(start_main_task, || {
-        wait_until(RELAUNCH_CONFIRM_TIMEOUT, RELAUNCH_CONFIRM_POLL, || unsafe { app_is_running() })
-    })
+    let token = crate::session::logon_token();
+    let relaunch = relaunch_with(
+        || {
+            let started = start_main_task()?;
+            if let (Some(logon_token), Some(unbiased)) = (token, unbiased_now()) {
+                let pending = PendingRelaunch { logon_token, unbiased, wall: wall_now() };
+                let _ = std::fs::write(pending_relaunch_path(), pending.serialize());
+            }
+            Ok(started)
+        },
+        || wait_until(RELAUNCH_CONFIRM_TIMEOUT, RELAUNCH_CONFIRM_POLL, || unsafe { app_is_running() }),
+    );
+    if relaunch.outcome == RelaunchOutcome::Running {
+        clear_pending_relaunch();
+    }
+    relaunch
 }
 
 /// `relaunch_app`'s decision, given how to start the task (`Ok` says how it
@@ -332,18 +488,18 @@ fn relaunch_with(
 ) -> Relaunch {
     match start() {
         Err(why) => Relaunch {
-            confirmed: false,
+            outcome: RelaunchOutcome::Failed,
             detail: format!("could not start the {MAIN_TASK_NAME} task: {why}"),
         },
         Ok(how) => match wait_for_app() {
             Some(after) => Relaunch {
-                confirmed: true,
+                outcome: RelaunchOutcome::Running,
                 detail: format!("{how}; the app was running {:.1}s later", after.as_secs_f32()),
             },
             None => Relaunch {
-                confirmed: false,
+                outcome: RelaunchOutcome::Requested,
                 detail: format!(
-                    "{how}, but the app was not running in this session {}s later",
+                    "{how}, but the app was not running in this session yet {}s later; the next runs give it until {RELAUNCH_PENDING_MAX_SECS}s before trying again",
                     RELAUNCH_CONFIRM_TIMEOUT.as_secs()
                 ),
             },
@@ -371,30 +527,216 @@ fn wait_until(
     }
 }
 
-/// Ask Task Scheduler to start the main task in this process's own session.
-///
-/// The task's principal is the BUILTIN\Users group, and nothing documents
-/// which session a plain on-demand run of a group task starts in. `RunEx`
-/// with TASK_RUN_USE_SESSION_ID is documented to start it "interactively as
-/// the user who is logged on to the specified session" - this one. Only if
-/// that call fails does this fall back to `schtasks /Run` (a plain `Run`),
-/// whose session is up to Task Scheduler; the caller confirms either way.
-/// Running the task at all needs the execute right setup grants standard
-/// accounts on it (installer/task-main.xml).
-fn start_main_task() -> Result<String, String> {
-    let session = crate::session::own_session_id();
-    let run_ex = match session {
-        Some(id) if id > 0 => match task_scheduler::run_task_in_session(MAIN_TASK_NAME, id) {
-            Ok(()) => return Ok(format!("started the {MAIN_TASK_NAME} task in session {id}")),
-            Err(e) => format!("RunEx in session {id}: {e}"),
-        },
-        Some(id) => format!("not trying RunEx from session {id}"),
-        None => "not trying RunEx: this session's id is unknown".to_string(),
-    };
-    match schtasks_run(MAIN_TASK_NAME) {
-        Ok(()) => Ok(format!("started the {MAIN_TASK_NAME} task with schtasks /Run ({run_ex})")),
-        Err(e) => Err(format!("{run_ex}; {e}")),
+/// A start of the app that Task Scheduler accepted and that hasn't been
+/// seen running yet (`relaunch_pending`, per account).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingRelaunch {
+    /// `session::logon_token` of the session it was started for.
+    logon_token: i64,
+    /// `QueryUnbiasedInterruptTime` when it was asked for.
+    unbiased: u64,
+    /// Wall-clock time (Unix seconds) when it was asked for.
+    wall: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingState {
+    /// Still within `RELAUNCH_PENDING_MAX_SECS`: leave it be.
+    Waiting { age_secs: u64 },
+    /// It never came up: carry on as if there had been none.
+    Expired { age_secs: u64 },
+    /// The app has started since (and stopped again).
+    CameUp,
+    /// Asked for in another session or boot.
+    NotThisSession,
+}
+
+impl PendingRelaunch {
+    fn parse(s: &str) -> Option<Self> {
+        let mut parts = s.split_whitespace();
+        if parts.next()? != "1" {
+            return None;
+        }
+        let p = PendingRelaunch {
+            logon_token: parts.next()?.parse().ok()?,
+            unbiased: parts.next()?.parse().ok()?,
+            wall: parts.next()?.parse().ok()?,
+        };
+        parts.next().is_none().then_some(p)
     }
+
+    fn serialize(&self) -> String {
+        format!("1 {} {} {}", self.logon_token, self.unbiased, self.wall)
+    }
+
+    /// Awake seconds since it was asked for, if `now_unbiased` is from the same boot.
+    fn age_secs(&self, now_unbiased: u64) -> Option<u64> {
+        now_unbiased.checked_sub(self.unbiased).map(|d| d / TICKS_PER_SEC)
+    }
+
+    /// Where it stands, given this session, the awake time now, the app's
+    /// heartbeat and when the app last started (Unix seconds).
+    fn state(&self, logon_token: Option<i64>, now_unbiased: Option<u64>, hb: Option<&Heartbeat>, app_started_wall: Option<i64>) -> PendingState {
+        let Some(age_secs) = now_unbiased.and_then(|now| self.age_secs(now)) else { return PendingState::NotThisSession };
+        if logon_token != Some(self.logon_token) {
+            return PendingState::NotThisSession;
+        }
+        let heartbeat_since = hb.is_some_and(|hb| hb.logon_token == self.logon_token && hb.unbiased >= self.unbiased);
+        if heartbeat_since || app_started_wall.is_some_and(|t| t >= self.wall) {
+            return PendingState::CameUp;
+        }
+        if age_secs < RELAUNCH_PENDING_MAX_SECS {
+            PendingState::Waiting { age_secs }
+        } else {
+            PendingState::Expired { age_secs }
+        }
+    }
+}
+
+fn pending_relaunch_path() -> std::path::PathBuf {
+    data_dir().join("relaunch_pending")
+}
+
+fn read_pending_relaunch() -> Option<PendingRelaunch> {
+    std::fs::read_to_string(pending_relaunch_path()).ok().and_then(|s| PendingRelaunch::parse(&s))
+}
+
+fn clear_pending_relaunch() {
+    let _ = std::fs::remove_file(pending_relaunch_path());
+}
+
+/// One way of asking Task Scheduler to start the main task.
+struct RunRequest {
+    /// How the log names it.
+    label: String,
+    flags: i32,
+    session: i32,
+    /// `RunEx`'s user argument; `None` passes none.
+    user: Option<String>,
+}
+
+/// The requests to try, in order, for session `session` (> 0) and this
+/// process's user SID, if known.
+///
+/// Task Scheduler's rules (MS-TSCH, SchRpcRun) for a caller without
+/// administrative privileges - the watchdog always runs non-elevated: a
+/// child's standard account, or an administrator's filtered token - are that
+/// it must be the task's registered user unless it asks to run the task as
+/// itself (TASK_RUN_AS_SELF), and that with TASK_RUN_USE_SESSION_ID it must
+/// be the user signed in to that session (with AS_SELF: the caller itself;
+/// otherwise: the user it names). The main task's principal is the Users
+/// group, not this user, so:
+/// 1. AS_SELF | USE_SESSION_ID in our own session: run as ourselves, where
+///    we are signed in - the request a non-elevated member of the group is
+///    entitled to make;
+/// 2. USER_SID | USE_SESSION_ID naming our own SID: the same, said the other
+///    way the rules allow;
+/// 3. USE_SESSION_ID alone (1.0.2's request): run as whoever is signed in to
+///    that session, which only an administrator may ask - kept for an
+///    elevated watchdog (e.g. with UAC turned off).
+///
+/// `start_main_task` falls back to `schtasks /Run` after these.
+fn run_requests(session: u32, sid: Option<&str>) -> Vec<RunRequest> {
+    use windows::Win32::System::TaskScheduler::{TASK_RUN_AS_SELF, TASK_RUN_USER_SID, TASK_RUN_USE_SESSION_ID};
+    let Ok(id) = i32::try_from(session) else { return Vec::new() };
+    let mut requests = vec![RunRequest {
+        label: format!("RunEx(AS_SELF|USE_SESSION_ID, session {session})"),
+        flags: TASK_RUN_AS_SELF.0 | TASK_RUN_USE_SESSION_ID.0,
+        session: id,
+        user: None,
+    }];
+    if let Some(sid) = sid {
+        requests.push(RunRequest {
+            label: format!("RunEx(USER_SID|USE_SESSION_ID, {sid}, session {session})"),
+            flags: TASK_RUN_USER_SID.0 | TASK_RUN_USE_SESSION_ID.0,
+            session: id,
+            user: Some(sid.to_string()),
+        });
+    }
+    requests.push(RunRequest {
+        label: format!("RunEx(USE_SESSION_ID, session {session})"),
+        flags: TASK_RUN_USE_SESSION_ID.0,
+        session: id,
+        user: None,
+    });
+    requests
+}
+
+/// Ask Task Scheduler to start the main task in this process's own session,
+/// trying `run_requests` in order and then `schtasks /Run` (a plain `Run`,
+/// whose session is up to Task Scheduler - the caller confirms by the mutex
+/// in this session either way, and a copy that lands in a session that has
+/// one already leaves quietly, see `QUIET_IF_RUNNING_ARG`). Says which
+/// request was accepted and how each one before it failed, and whether this
+/// process is elevated (the rules differ). Running the task at all needs the
+/// execute right setup grants standard accounts on it (installer/task-main.xml).
+fn start_main_task() -> Result<String, String> {
+    let who = if crate::update::is_elevated() { "an elevated" } else { "a non-elevated" };
+    let mut failed = Vec::new();
+    match crate::session::own_session_id() {
+        Some(id) if id > 0 => {
+            let requests = run_requests(id, own_user_sid().as_deref());
+            match task_scheduler::run_first_accepted(MAIN_TASK_NAME, &requests) {
+                Ok((Some(accepted), before)) => {
+                    failed.extend(before);
+                    let tried = if failed.is_empty() { String::new() } else { format!(" after {}", failed.join("; ")) };
+                    return Ok(format!(
+                        "started the {MAIN_TASK_NAME} task as {who} caller with {}{tried}",
+                        requests[accepted].label
+                    ));
+                }
+                Ok((None, all)) => failed.extend(all),
+                Err(e) => failed.push(format!("could not open the task: {e}")),
+            }
+        }
+        Some(id) => failed.push(format!("not trying RunEx from session {id}")),
+        None => failed.push("not trying RunEx: this session's id is unknown".to_string()),
+    }
+    match schtasks_run(MAIN_TASK_NAME) {
+        Ok(()) => Ok(format!(
+            "started the {MAIN_TASK_NAME} task as {who} caller with schtasks /Run, after {}",
+            failed.join("; ")
+        )),
+        Err(e) => {
+            failed.push(e);
+            Err(format!("as {who} caller: {}", failed.join("; ")))
+        }
+    }
+}
+
+/// This process's user, as a SID string (S-1-5-21-...), for `run_requests`.
+fn own_user_sid() -> Option<String> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn ConvertSidToStringSidW(sid: *const core::ffi::c_void, string_sid: *mut *mut u16) -> BOOL;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LocalFree(mem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    }
+
+    let mut token = HANDLE::default();
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.ok()?;
+    let mut len = 0u32;
+    let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut len) };
+    // u64s, so the buffer is aligned for TOKEN_USER.
+    let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+    let read = unsafe { GetTokenInformation(token, TokenUser, Some(buf.as_mut_ptr().cast()), len, &mut len) };
+    let _ = unsafe { CloseHandle(token) };
+    read.ok()?;
+    let user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
+    let mut text: *mut u16 = std::ptr::null_mut();
+    if !unsafe { ConvertSidToStringSidW(user.User.Sid.0, &mut text) }.as_bool() || text.is_null() {
+        return None;
+    }
+    let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
+    let sid = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
+    unsafe { LocalFree(text.cast()) };
+    Some(sid)
 }
 
 fn schtasks_run(task: &str) -> Result<(), String> {
@@ -418,7 +760,7 @@ fn schtasks_run(task: &str) -> Result<(), String> {
 }
 
 /// The Task Scheduler's COM interface, for what `schtasks` can't do: start a
-/// task in a given session.
+/// task in a given session, as a given user.
 mod task_scheduler {
     use windows::core::{BSTR, VARIANT};
     use windows::Win32::Security::PSECURITY_DESCRIPTOR;
@@ -426,7 +768,9 @@ mod task_scheduler {
         CoCreateInstance, CoInitializeEx, CoInitializeSecurity, CoUninitialize, CLSCTX_INPROC_SERVER,
         COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_PKT_PRIVACY, RPC_C_IMP_LEVEL_IMPERSONATE,
     };
-    use windows::Win32::System::TaskScheduler::{IRegisteredTask, ITaskService, TaskScheduler, TASK_RUN_USE_SESSION_ID};
+    use windows::Win32::System::TaskScheduler::{IRegisteredTask, ITaskService, TaskScheduler};
+
+    use super::RunRequest;
 
     /// COM for this thread, for as long as it lives.
     struct Com {
@@ -465,6 +809,10 @@ mod task_scheduler {
         }
     }
 
+    fn describe(e: &windows::core::Error) -> String {
+        format!("{} (0x{:08X})", e.message(), e.code().0)
+    }
+
     /// Look up the task called `name` in the root folder and hand it to `f`.
     /// The COM objects are all released before COM is uninitialized.
     pub(super) fn with_task<R>(name: &str, f: impl FnOnce(&IRegisteredTask) -> windows::core::Result<R>) -> Result<R, String> {
@@ -477,27 +825,34 @@ mod task_scheduler {
             let task = unsafe { folder.GetTask(&BSTR::from(name)) }?;
             f(&task)
         };
-        run().map_err(|e| format!("{} (0x{:08X})", e.message(), e.code().0))
+        run().map_err(|e| describe(&e))
     }
 
-    /// Start the task `name` as whoever is signed in to session `session`
-    /// (which must be > 0). Returns once Task Scheduler has accepted the
-    /// request; that doesn't mean it ran (a disabled task, say, isn't run
-    /// and still succeeds here).
-    pub(super) fn run_task_in_session(name: &str, session: u32) -> Result<(), String> {
-        let session = i32::try_from(session).map_err(|_| format!("session {session} out of range"))?;
+    /// Try `requests` in order on the task `name` until Task Scheduler
+    /// accepts one: its index (or `None` if none was), and how each one
+    /// before it failed. Accepted doesn't mean it ran (a disabled task, say,
+    /// isn't run and may still be accepted) - the caller looks for the app.
+    pub(super) fn run_first_accepted(name: &str, requests: &[RunRequest]) -> Result<(Option<usize>, Vec<String>), String> {
         with_task(name, |task| {
-            unsafe { task.RunEx(&VARIANT::default(), TASK_RUN_USE_SESSION_ID.0, session, &BSTR::new()) }.map(|_| ())
+            let mut failed = Vec::new();
+            for (i, request) in requests.iter().enumerate() {
+                let user = request.user.as_deref().map(BSTR::from).unwrap_or_default();
+                match unsafe { task.RunEx(&VARIANT::default(), request.flags, request.session, &user) } {
+                    Ok(_) => return Ok((Some(i), failed)),
+                    Err(e) => failed.push(format!("{} refused: {}", request.label, describe(&e))),
+                }
+            }
+            Ok((None, failed))
         })
     }
 }
 
-fn send_tamper_alert(relaunched: bool) {
+fn send_tamper_alert(outcome: RelaunchOutcome) {
     let username = current_windows_username();
-    let status = if relaunched {
-        i18n::t("watchdog.alert.restarted")
-    } else {
-        i18n::t("watchdog.alert.restart_failed")
+    let status = match outcome {
+        RelaunchOutcome::Running => i18n::t("watchdog.alert.restarted"),
+        RelaunchOutcome::Requested => i18n::t("watchdog.restart_pending"),
+        RelaunchOutcome::Failed => i18n::t("watchdog.alert.restart_failed"),
     };
     let text = format!(
         "⚠️ {} {} {}\n{}",
@@ -945,15 +1300,15 @@ fn handle_unresponsive_app(hb: &Heartbeat, age_secs: u64) {
         history.record_restart(now);
         let _ = std::fs::write(&history_path, history.serialize());
         let relaunch = relaunch_app();
-        let relaunched = relaunch.confirmed;
         log_state("hb_restarted", &format!(
-            "heartbeat {age_secs}s old and the app didn't respond - ended pid {target_pid}, relaunched={relaunched} ({}), alerting",
+            "heartbeat {age_secs}s old and the app didn't respond - ended pid {target_pid}, relaunched={} ({}), alerting",
+            relaunch.outcome.word(),
             relaunch.detail
         ));
-        let status = if relaunched {
-            i18n::t("watchdog.hung.restarted")
-        } else {
-            i18n::t("watchdog.hung.restart_failed")
+        let status = match relaunch.outcome {
+            RelaunchOutcome::Running => i18n::t("watchdog.hung.restarted"),
+            RelaunchOutcome::Requested => i18n::t("watchdog.restart_pending"),
+            RelaunchOutcome::Failed => i18n::t("watchdog.hung.restart_failed"),
         };
         queue_alert(&format!(
             "⚠️ {} {} {}\n{}",
@@ -1862,19 +2217,105 @@ mod tests {
     fn relaunch_counts_only_when_the_app_was_seen_running() {
         let started = || Ok("started the task in session 3".to_string());
         let r = relaunch_with(started, || Some(std::time::Duration::from_millis(1500)));
-        assert!(r.confirmed);
+        assert_eq!(r.outcome, RelaunchOutcome::Running);
+        assert_eq!(r.outcome.word(), "true", "what smoke-test.ps1 looks for");
         assert_eq!(r.detail, "started the task in session 3; the app was running 1.5s later");
 
-        // Task Scheduler took the request, but the app never came up (the
-        // 1.0.1 field case, and a disabled task, look like this).
+        // Task Scheduler took the request, but the app wasn't up yet (slow,
+        // or never: the 1.0.1 field case and a disabled task look like this).
+        // Not "failed": later runs wait for it (PendingRelaunch).
         let r = relaunch_with(started, || None);
-        assert!(!r.confirmed);
-        assert!(r.detail.contains("was not running in this session 30s later"), "{}", r.detail);
+        assert_eq!(r.outcome, RelaunchOutcome::Requested);
+        assert_eq!(r.outcome.word(), "pending");
+        assert!(r.detail.contains("was not running in this session yet 30s later"), "{}", r.detail);
 
         // The task couldn't be started: no point waiting.
         let r = relaunch_with(|| Err("Access is denied.".to_string()), || panic!("waited for an app nobody started"));
-        assert!(!r.confirmed);
+        assert_eq!(r.outcome, RelaunchOutcome::Failed);
         assert_eq!(r.detail, "could not start the ScreenTimeManager task: Access is denied.");
+    }
+
+    #[test]
+    fn a_slow_relaunch_is_waited_for_not_repeated_or_reported() {
+        let token = 77;
+        let asked = PendingRelaunch { logon_token: token, unbiased: 1_000 * S, wall: 1_700_000_000 };
+        assert_eq!(PendingRelaunch::parse(&asked.serialize()), Some(asked));
+        assert_eq!(PendingRelaunch::parse("1 2 3"), None);
+
+        // The next minute's run: still starting.
+        assert_eq!(asked.state(Some(token), Some(1_060 * S), None, None), PendingState::Waiting { age_secs: 60 });
+        // An old heartbeat (from before the kill) doesn't count as coming up.
+        let old_hb = Heartbeat { logon_token: token, unbiased: 900 * S, pid: 1 };
+        assert_eq!(asked.state(Some(token), Some(1_060 * S), Some(&old_hb), Some(1_699_999_000)), PendingState::Waiting { age_secs: 60 });
+        // It came up (heartbeat or recorded start since) and has stopped again.
+        let new_hb = Heartbeat { unbiased: 1_045 * S, ..old_hb };
+        assert_eq!(asked.state(Some(token), Some(1_060 * S), Some(&new_hb), None), PendingState::CameUp);
+        assert_eq!(asked.state(Some(token), Some(1_060 * S), None, Some(1_700_000_040)), PendingState::CameUp);
+        // Never came up: tried again (and reported) after the window.
+        assert_eq!(
+            asked.state(Some(token), Some(1_000 * S + RELAUNCH_PENDING_MAX_SECS * S), None, None),
+            PendingState::Expired { age_secs: RELAUNCH_PENDING_MAX_SECS }
+        );
+        // Another session, or a reboot since (awake time went backwards).
+        assert_eq!(asked.state(Some(78), Some(1_060 * S), None, None), PendingState::NotThisSession);
+        assert_eq!(asked.state(Some(token), Some(10 * S), None, None), PendingState::NotThisSession);
+        assert_eq!(asked.state(None, Some(1_060 * S), None, None), PendingState::NotThisSession);
+    }
+
+    #[test]
+    fn run_requests_start_with_the_ones_a_standard_user_may_make() {
+        let requests = run_requests(3, Some("S-1-5-21-1-2-3-1001"));
+        let labels: Vec<&str> = requests.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, [
+            "RunEx(AS_SELF|USE_SESSION_ID, session 3)",
+            "RunEx(USER_SID|USE_SESSION_ID, S-1-5-21-1-2-3-1001, session 3)",
+            "RunEx(USE_SESSION_ID, session 3)",
+        ]);
+        // TASK_RUN_AS_SELF = 1, TASK_RUN_USE_SESSION_ID = 4, TASK_RUN_USER_SID = 8 (taskschd.h).
+        assert_eq!(requests.iter().map(|r| r.flags).collect::<Vec<_>>(), [5, 12, 4]);
+        assert!(requests.iter().all(|r| r.session == 3));
+        assert_eq!(requests[0].user, None, "AS_SELF: the user argument is ignored, pass none");
+        assert_eq!(requests[1].user.as_deref(), Some("S-1-5-21-1-2-3-1001"));
+        // Own SID unknown: the SID request is left out.
+        assert_eq!(run_requests(3, None).len(), 2);
+    }
+
+    #[test]
+    fn install_marker_age_does_not_trust_the_wall_clock() {
+        let stamp = InstallStamp::parse("2026/11/16 10:00:00 boot=104 unbiased=5000000000\r\n");
+        assert_eq!(stamp, Some(InstallStamp { boot_id: 104, unbiased: 500 * S }));
+        assert_eq!(InstallStamp::parse("2026/11/16 10:00:00\r\n"), None, "an older setup's marker");
+
+        // Same boot, 60 s of awake time later: 60 s old, whatever the wall
+        // clock says (here it was set forward an hour right after the install).
+        assert_eq!(install_marker_age(stamp, Some(104), Some(560 * S), Some(3660)), Some(60));
+        // ...or back an hour (the marker's file time is in the future).
+        assert_eq!(install_marker_age(stamp, Some(104), Some(560 * S), None), Some(60));
+        // Written in an earlier boot: not a pending install, whatever its file time.
+        assert_eq!(install_marker_age(stamp, Some(105), Some(560 * S), Some(30)), None);
+        // No stamp, or the boot can't be read: the file time, as before.
+        assert_eq!(install_marker_age(None, Some(104), Some(560 * S), Some(42)), Some(42));
+        assert_eq!(install_marker_age(stamp, None, Some(560 * S), Some(42)), Some(42));
+        assert_eq!(install_marker_age(None, Some(104), Some(560 * S), None), None, "future file time, no stamp: stale");
+
+        // Started since the install: a heartbeat later in the same boot.
+        let hb = |unbiased| Heartbeat { logon_token: 1, unbiased, pid: 2 };
+        assert!(started_since_install(stamp, Some(104), Some(600 * S), Some(&hb(520 * S))));
+        assert!(!started_since_install(stamp, Some(104), Some(600 * S), Some(&hb(400 * S))), "from before the install");
+        assert!(!started_since_install(stamp, Some(105), Some(600 * S), Some(&hb(520 * S))), "another boot");
+        assert!(!started_since_install(None, Some(104), Some(600 * S), Some(&hb(520 * S))));
+    }
+
+    #[test]
+    fn own_sid_is_read() {
+        let sid = own_user_sid().expect("own SID");
+        assert!(sid.starts_with("S-1-5-"), "{sid}");
+    }
+
+    #[test]
+    fn boot_id_is_readable() {
+        // What setup writes into the marker; readable without elevation.
+        assert!(current_boot_id().is_some());
     }
 
     #[test]

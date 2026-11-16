@@ -294,13 +294,19 @@ pub fn setup_log_path() -> Option<PathBuf> {
     updates_dir().map(|d| d.join(SETUP_LOG_FILE))
 }
 
-/// When setup last (re)wrote `updating.marker` next to the exe: once the old
-/// instances are gone (before it re-enables the watchdog task), and also
-/// when it fails or is cancelled after disabling the tasks. Read by the
-/// watchdog.
-pub fn update_marker_modified() -> Option<SystemTime> {
+/// `updating.marker` next to the exe, read by the watchdog: its modification
+/// time and text. Setup (re)writes it once the old instances are gone
+/// (before it re-enables the watchdog task), and also when it fails or is
+/// cancelled after disabling the tasks; its crash recovery task does too.
+/// Setup writes the boot it
+/// was written in and the awake time then (`boot=<n> unbiased=<n>`), so the
+/// watchdog can tell its age without trusting the wall clock (see watchdog.rs).
+pub fn read_update_marker() -> Option<(SystemTime, String)> {
     let path = exe_dir()?.join(MARKER_FILE);
-    std::fs::metadata(path).ok()?.modified().ok()
+    let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+    // Small; an unreadable text just means "no boot stamp".
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    Some((modified, text))
 }
 
 // ============================================================================
@@ -335,7 +341,7 @@ fn log(msg: &str) {
 /// Also accepts an enabled Administrators membership (IsUserAnAdmin), which
 /// SYSTEM's token has too, in case TokenElevation ever reports SYSTEM's
 /// token as "not elevated".
-fn is_elevated() -> bool {
+pub(crate) fn is_elevated() -> bool {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};

@@ -92,6 +92,14 @@ fn main() {
 
         // Check for single instance
         if !ensure_single_instance() {
+            // Started through the ScreenTimeManager task (its logon trigger,
+            // a watchdog relaunch) while a copy already runs in this
+            // session: that's the state wanted, so leave without a word.
+            // Two starts can meet - e.g. the per-minute and the after-logon
+            // watchdog runs - and a box there would be shown to the child.
+            if std::env::args().any(|a| a == watchdog::QUIET_IF_RUNNING_ARG) {
+                return;
+            }
             MessageBoxW(
                 None,
                 w!("Screen Time Manager is already running."),
