@@ -423,13 +423,53 @@ fn get_idle_seconds() -> u32 {
     }
 }
 
-/// The calendar date (per `database::effective_today_date`) this running
-/// process last saw - compared every tick to catch the day rolling over
-/// while the app stays open across midnight. Without this, the countdown and
-/// active-time counters only ever reset at process startup: an app left
-/// running overnight would just keep counting down (or sitting at 0) using
-/// the old day's numbers instead of getting a fresh daily allowance.
-static CURRENT_TRACKED_DATE: Mutex<Option<String>> = Mutex::new(None);
+/// Start the day counters at startup: `remaining` and `active` were loaded
+/// for `date`, which from now on is the date they're saved under, and the
+/// one the rollover compares with (see `database::with_counters_date`). An
+/// app started in the last seconds before midnight used to record whatever
+/// date its first tick saw as "not a rollover", carrying the old day's
+/// leftover into the new day.
+pub fn start_day(date: &str, remaining: i32, active: i32) {
+    database::with_counters_date(|tracked| {
+        REMAINING_SECONDS.store(remaining, Ordering::SeqCst);
+        SESSION_ACTIVE_SECONDS.store(active, Ordering::SeqCst);
+        *tracked = Some(date.to_string());
+    });
+}
+
+/// Save the remaining time now, under the date it belongs to. Any thread.
+/// Read inside the lock, so a rollover can't swap in the next day's value
+/// between the read and the write.
+pub fn persist_remaining() {
+    database::with_counters_date(|tracked| {
+        let date = database::counters_save_date(tracked.as_deref(), database::effective_today_date);
+        database::save_remaining_time_for(&date, REMAINING_SECONDS.load(Ordering::SeqCst));
+    });
+}
+
+/// Save the remaining and the active time now, as `persist_remaining`.
+pub fn persist_day_counters() {
+    database::with_counters_date(|tracked| {
+        let date = database::counters_save_date(tracked.as_deref(), database::effective_today_date);
+        database::save_remaining_time_for(&date, REMAINING_SECONDS.load(Ordering::SeqCst));
+        database::save_session_active_time_for(&date, SESSION_ACTIVE_SECONDS.load(Ordering::SeqCst));
+    });
+}
+
+/// Whether "today" has moved on from the date the counters belong to.
+/// Without a date yet (startup hasn't loaded the counters) there's nothing
+/// to roll over from.
+fn is_new_day(tracked: Option<&str>, today: &str) -> bool {
+    tracked.is_some_and(|t| t != today)
+}
+
+/// Roll the counters over now if the day has changed, from any thread -
+/// before a parent's change to the remaining time, so a change made between
+/// midnight and the tick's own rollover counts for the new day rather than
+/// being replaced by it a moment later.
+pub fn roll_over_if_due() {
+    unsafe { check_day_rollover(true) }
+}
 
 /// The raw local date (`database::local_today_date`) at the previous check -
 /// polled every tick without touching the database, so the authoritative
@@ -458,26 +498,32 @@ unsafe fn check_day_rollover(force: bool) {
         }
     }
 
-    let today = database::effective_today_date();
-    let mut tracked = CURRENT_TRACKED_DATE.lock().unwrap();
-
-    if tracked.as_deref() == Some(today.as_str()) {
-        return;
-    }
-    let is_rollover = tracked.is_some();
-    *tracked = Some(today);
-    drop(tracked);
-
-    if !is_rollover {
-        return; // First tick since startup - nothing to roll over from yet.
-    }
-
-    let remaining = database::load_remaining_time().unwrap_or_else(|| {
-        let weekday = database::get_current_weekday();
-        (database::get_daily_limit(weekday) * 60) as i32
+    // The switch happens under the counters' date lock, so no save can
+    // interleave and file one day's numbers under the other.
+    let new_day = database::with_counters_date(|tracked| {
+        let today = database::effective_today_date();
+        if !is_new_day(tracked.as_deref(), &today) {
+            if tracked.is_none() {
+                *tracked = Some(today);
+            }
+            return None;
+        }
+        // The old day's last counted seconds go under the old day.
+        if let Some(old) = tracked.as_deref() {
+            database::save_remaining_time_for(old, REMAINING_SECONDS.load(Ordering::SeqCst));
+            database::save_session_active_time_for(old, SESSION_ACTIVE_SECONDS.load(Ordering::SeqCst));
+        }
+        let remaining = database::load_remaining_time_for(&today).unwrap_or_else(|| {
+            let weekday = database::get_current_weekday();
+            (database::get_daily_limit(weekday) * 60) as i32
+        });
+        REMAINING_SECONDS.store(remaining, Ordering::SeqCst);
+        SESSION_ACTIVE_SECONDS.store(database::get_session_active_time_for(&today), Ordering::SeqCst);
+        *tracked = Some(today);
+        Some(remaining)
     });
-    REMAINING_SECONDS.store(remaining, Ordering::SeqCst);
-    SESSION_ACTIVE_SECONDS.store(database::get_session_active_time(), Ordering::SeqCst);
+    let Some(remaining) = new_day else { return };
+    persist_day_counters();
 
     update_mini_overlay();
     if remaining > 0 {
@@ -585,10 +631,13 @@ pub unsafe fn start_accounting(main_hwnd: HWND) {
 
 /// End a pause in progress so it's counted now. For WM_DESTROY (sign-out,
 /// shutdown, Quit), since a restarted app never resumes a pause.
+/// Also saves the day's counters: the periodic save runs only every 30
+/// seconds, and the active time used to be saved nowhere else.
 pub fn flush_on_exit() {
     if IS_PAUSED.load(Ordering::SeqCst) {
         resume_timer();
     }
+    persist_day_counters();
 }
 
 /// What a tick does with the time that passed.
@@ -795,12 +844,12 @@ unsafe fn enforce_zero_time() {
         return;
     }
     resume_timer(); // no-op unless paused
-    database::save_remaining_time(remaining);
+    persist_remaining();
     let msg = database::get_blocking_message();
     if !crate::blocking::show_out_of_time_overlay(&msg) {
         // A bot extended the time in the meantime: no lock. Save the new
         // time, in case the 0 above landed after the bot's own save.
-        database::save_remaining_time(REMAINING_SECONDS.load(Ordering::SeqCst));
+        persist_remaining();
         return;
     }
     crate::time_request::notify_out_of_time();
@@ -811,8 +860,7 @@ unsafe fn enforce_zero_time() {
 /// pending - whether or not time is currently being counted.
 fn periodic_save() {
     if ACCOUNTING_DIRTY.swap(false, Ordering::SeqCst) {
-        database::save_remaining_time(REMAINING_SECONDS.load(Ordering::SeqCst));
-        database::save_session_active_time(SESSION_ACTIVE_SECONDS.load(Ordering::SeqCst));
+        persist_day_counters();
     }
     if let Some(drift) = database::take_pending_clock_tamper_alert() {
         crate::time_request::notify_clock_tamper(drift);
@@ -941,6 +989,15 @@ pub unsafe fn register_mini_overlay_class(hinstance: windows::Win32::Foundation:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_start_just_before_midnight_still_rolls_over() {
+        // Loaded for the 16th at 23:59:59; the first tick is on the 17th.
+        assert!(is_new_day(Some("2026-11-16"), "2026-11-17"));
+        assert!(!is_new_day(Some("2026-11-17"), "2026-11-17"));
+        // Nothing loaded yet: nothing to roll over from
+        assert!(!is_new_day(None, "2026-11-17"));
+    }
 
     #[test]
     fn lock_overlay_freezes_everything() {

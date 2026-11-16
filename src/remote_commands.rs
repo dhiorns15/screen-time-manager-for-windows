@@ -575,15 +575,10 @@ pub fn cmd_setlimit(args: &str) -> String {
 }
 
 pub fn cmd_reset() -> String {
-    let weekday = database::get_current_weekday();
-    let daily_limit_minutes = database::get_daily_limit(weekday);
-    let daily_limit_seconds = (daily_limit_minutes * 60) as i32;
-
-    blocking::REMAINING_SECONDS.store(daily_limit_seconds, Ordering::SeqCst);
-    database::save_remaining_time(daily_limit_seconds);
+    let daily_limit_seconds = blocking::reset_to_daily_limit();
+    let daily_limit_minutes = (daily_limit_seconds / 60) as u32;
 
     unsafe {
-        mini_overlay::update_mini_overlay();
         // Hide the blocking overlay if it's showing
         blocking::hide_blocking_overlay();
     }

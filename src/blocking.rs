@@ -405,20 +405,41 @@ fn reduced(current: i32, reduction_seconds: i32) -> i32 {
 
 /// Extend the remaining time by the specified minutes. One atomic update, so
 /// the countdown tick on the UI thread can't overwrite an extension made from
-/// a bot thread at the same moment.
+/// a bot thread at the same moment. Saved at once: while nothing is counting
+/// (paused, idle, locked) nothing else would save it, and a kill, crash or
+/// update then brought the old value back.
 pub fn extend_time(minutes: i32) {
+    crate::mini_overlay::roll_over_if_due();
     let additional_seconds = minutes * 60;
     let _ = REMAINING_SECONDS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
         Some(extended(current, additional_seconds))
     });
+    crate::mini_overlay::persist_remaining();
+    unsafe { crate::mini_overlay::update_mini_overlay() };
 }
 
-/// Reduce the remaining time by the specified minutes (atomically, as above)
+/// Reduce the remaining time by the specified minutes (atomically, and
+/// saved at once, as above)
 pub fn reduce_time(minutes: i32) {
+    crate::mini_overlay::roll_over_if_due();
     let reduction_seconds = minutes * 60;
     let _ = REMAINING_SECONDS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
         Some(reduced(current, reduction_seconds))
     });
+    crate::mini_overlay::persist_remaining();
+    unsafe { crate::mini_overlay::update_mini_overlay() };
+}
+
+/// Set the remaining time back to today's full limit (bot `reset`, Stats
+/// "Reset Timer"), saved at once. Returns the limit in seconds.
+pub fn reset_to_daily_limit() -> i32 {
+    crate::mini_overlay::roll_over_if_due();
+    let limit_minutes = crate::database::get_daily_limit(crate::database::get_current_weekday());
+    let limit_seconds = (limit_minutes * 60) as i32;
+    REMAINING_SECONDS.store(limit_seconds, Ordering::SeqCst);
+    crate::mini_overlay::persist_remaining();
+    unsafe { crate::mini_overlay::update_mini_overlay() };
+    limit_seconds
 }
 
 /// Remaining time capped to a new daily limit, or `None` if it's already
@@ -436,7 +457,7 @@ pub fn cap_remaining_time(limit_seconds: i32) -> bool {
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| capped(current, limit_seconds))
         .is_ok();
     if changed {
-        crate::database::save_remaining_time(REMAINING_SECONDS.load(Ordering::SeqCst));
+        crate::mini_overlay::persist_remaining();
         unsafe {
             crate::mini_overlay::update_mini_overlay();
         }
@@ -512,7 +533,7 @@ pub unsafe fn hide_blocking_overlay() {
     SHUTDOWN_COUNTDOWN_SECONDS.store(-1, Ordering::SeqCst);
 
     // Save remaining time to database
-    crate::database::save_remaining_time(REMAINING_SECONDS.load(Ordering::SeqCst));
+    crate::mini_overlay::persist_remaining();
 
     if !on_ui_thread(hwnd) {
         let _ = PostMessageW(hwnd, WM_APP_HIDE_OVERLAY, WPARAM(0), LPARAM(0));

@@ -38,13 +38,12 @@ use windows::{
     },
 };
 
-use blocking::{create_blocking_overlay, create_secondary_overlays, register_blocking_class, REMAINING_SECONDS};
+use blocking::{create_blocking_overlay, create_secondary_overlays, register_blocking_class};
 use constants::MUTEX_NAME;
-use database::{load_remaining_time, get_current_weekday, get_daily_limit};
+use database::{load_remaining_time_for, get_current_weekday, get_daily_limit};
 use mini_overlay::{create_mini_overlay, register_mini_overlay_class, show_mini_overlay};
 use overlay::{create_overlay_window, register_overlay_class};
 use tray::{add_tray_icon, remove_tray_icon, window_proc};
-use std::sync::atomic::Ordering;
 
 /// Log a panic's message and source location before the process aborts
 /// (`panic = "abort"` in Cargo.toml still runs this hook first - it just
@@ -138,14 +137,16 @@ fn main() {
         database::init_shared_database();
 
         report_database_recovery(&db_startup);
-        if matches!(
-            db_startup,
-            database::DatabaseStartup::Recreated { .. } | database::DatabaseStartup::Temporary { .. }
-        ) {
-            // Don't start today over on a fresh database (see there).
-            if let Some(remaining) = database::restore_today_from_shared_mirror() {
-                eprintln!("[Main] Carried today's usage over from the shared database: {remaining}s left");
-            }
+
+        // The one date today's counters are loaded for, saved under, and
+        // rolled over from (see database::with_counters_date).
+        let today = database::effective_today_date();
+
+        // Don't start today over on a fresh database - recreated, temporary,
+        // or simply deleted - if the shared mirror shows today's use (see
+        // there; a no-op when today already has its remaining time).
+        if let Some(remaining) = database::restore_today_from_shared_mirror(&today) {
+            eprintln!("[Main] Carried today's usage over from the shared database: {remaining}s left");
         }
 
         // Housekeeping: drop per-day usage/enforcement rows older than the
@@ -217,17 +218,15 @@ fn main() {
         create_secondary_overlays(hinstance);  // Create overlays for secondary monitors
         create_mini_overlay(hinstance);
 
-        // Initialize remaining time from database or daily limit
-        let remaining = load_remaining_time().unwrap_or_else(|| {
+        // Initialize remaining time from database or daily limit, and the
+        // session active time, both for `today`
+        let remaining = load_remaining_time_for(&today).unwrap_or_else(|| {
             // No saved time for today, use daily limit
             let weekday = get_current_weekday();
             (get_daily_limit(weekday) * 60) as i32  // Convert minutes to seconds
         });
-        REMAINING_SECONDS.store(remaining, Ordering::SeqCst);
-
-        // Initialize session active time from database
-        let session_active = database::get_session_active_time();
-        mini_overlay::SESSION_ACTIVE_SECONDS.store(session_active, Ordering::SeqCst);
+        let session_active = database::get_session_active_time_for(&today);
+        mini_overlay::start_day(&today, remaining, session_active);
 
         // The always-on per-second tick (countdown, rollover, idle, bots)
         mini_overlay::start_accounting(hwnd);

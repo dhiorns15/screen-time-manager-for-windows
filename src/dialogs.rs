@@ -1927,8 +1927,7 @@ pub unsafe fn show_stats_dialog(parent_hwnd: HWND) {
         lparam: LPARAM,
     ) -> LRESULT {
         use crate::blocking::REMAINING_SECONDS;
-        use crate::database::{get_current_weekday, get_daily_limit, save_remaining_time};
-        use crate::mini_overlay::update_mini_overlay;
+        use crate::database::{get_current_weekday, get_daily_limit};
         use std::sync::atomic::Ordering;
 
         const ID_RESET_TIMER: i32 = 3001;
@@ -2191,14 +2190,8 @@ pub unsafe fn show_stats_dialog(parent_hwnd: HWND) {
                 let id = (wparam.0 & 0xFFFF) as i32;
 
                 if id == ID_RESET_TIMER {
-                    // Reset to daily limit
-                    let weekday = get_current_weekday();
-                    let daily_limit_minutes = get_daily_limit(weekday);
-                    let daily_limit_seconds = (daily_limit_minutes * 60) as i32;
-
-                    REMAINING_SECONDS.store(daily_limit_seconds, Ordering::SeqCst);
-                    save_remaining_time(daily_limit_seconds);
-                    update_mini_overlay();
+                    // Reset to daily limit (saved at once)
+                    crate::blocking::reset_to_daily_limit();
 
                     let msg = i18n::wide("stats.timer_reset");
                     let title = i18n::wide("stats.timer_reset_title");

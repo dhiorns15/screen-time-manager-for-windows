@@ -1052,19 +1052,42 @@ pub fn take_pending_clock_tamper_alert() -> Option<i64> {
     Some(drift)
 }
 
-/// Save remaining time to database (associated with current date)
-pub fn save_remaining_time(seconds: i32) {
-    let date = effective_today_date();
-    let key = format!("remaining_time_{}", date);
-    set_setting(&key, &seconds.to_string());
+/// The date the running app's day counters (remaining time, active time -
+/// `blocking::REMAINING_SECONDS`, `mini_overlay::SESSION_ACTIVE_SECONDS`)
+/// belong to: the date they were loaded for at startup, then each new day's
+/// at the rollover (`mini_overlay::check_day_rollover`). `None` until
+/// startup loads them.
+///
+/// Saves of those counters go under this date, not under "today" as worked
+/// out at the moment of the save: between midnight and the rollover that
+/// follows it (about a second, up to 30 while the time zone differs from the
+/// remembered one) that used to file the old day's numbers under the new
+/// day, and the rollover then loaded them as the new day's allowance - a 0
+/// saved that way locked the new day.
+static COUNTERS_DATE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Run `f` with the day counters' date held, so a save can't interleave
+/// with the rollover switching the counters to the next day. Never call
+/// back into anything that takes this lock (`f` runs with it held).
+pub fn with_counters_date<R>(f: impl FnOnce(&mut Option<String>) -> R) -> R {
+    let mut guard = COUNTERS_DATE.lock().unwrap();
+    f(&mut guard)
 }
 
-/// Load remaining time from database for today
-#[allow(dead_code)]
-pub fn load_remaining_time() -> Option<i32> {
-    let date = effective_today_date();
-    let key = format!("remaining_time_{}", date);
-    get_setting(&key).and_then(|s| s.parse().ok())
+/// The date to save the day counters under: the date they belong to, or
+/// (before startup has loaded them) today's.
+pub fn counters_save_date(tracked: Option<&str>, today: impl FnOnce() -> String) -> String {
+    tracked.map(str::to_string).unwrap_or_else(today)
+}
+
+/// Save the remaining time for `date`.
+pub fn save_remaining_time_for(date: &str, seconds: i32) {
+    set_setting(&format!("remaining_time_{}", date), &seconds.to_string());
+}
+
+/// The remaining time saved for `date`, if any.
+pub fn load_remaining_time_for(date: &str) -> Option<i32> {
+    get_setting(&format!("remaining_time_{}", date)).and_then(|s| s.parse().ok())
 }
 
 /// Get the current weekday (0 = Monday, 6 = Sunday) - of the day in the time
@@ -1203,21 +1226,19 @@ pub fn get_current_timestamp() -> i64 {
     wall_clock_now_secs()
 }
 
-/// Get the session start time used today (in seconds) - tracks when timer started today
-pub fn get_session_active_time() -> i32 {
-    let date = effective_today_date();
+/// The time actively used on `date` (in seconds)
+pub fn get_session_active_time_for(date: &str) -> i32 {
     let key = format!("session_active_{}", date);
     get_setting(&key)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0)
 }
 
-/// Save session active time (in seconds)
-pub fn save_session_active_time(seconds: i32) {
-    let date = effective_today_date();
+/// Save the time actively used on `date` (in seconds)
+pub fn save_session_active_time_for(date: &str, seconds: i32) {
     let key = format!("session_active_{}", date);
     set_setting(&key, &seconds.to_string());
-    mirror_shared_daily_stat("active", &date, seconds);
+    mirror_shared_daily_stat("active", date, seconds);
 }
 
 /// Log a pause event under `date` - the date its time was counted under
@@ -1530,40 +1551,62 @@ fn remaining_after_use(limit_secs: i32, active_secs: i32) -> i32 {
     limit_secs.saturating_sub(active_secs.max(0)).max(0)
 }
 
-/// After `init_database_with_recovery` had to recreate the per-account
-/// database or replace it with a temporary one, start today from this
-/// account's usage as mirrored in the shared database (see
-/// `mirror_shared_daily_stat`, refreshed every 30 seconds) instead of from
-/// nothing: today's used time and pause time are carried over, and the
-/// remaining time is today's limit minus the time used. So damaging the
-/// settings file can't be used to get a fresh day's allowance (or pause
-/// budget), and the mirror isn't overwritten with smaller numbers. Returns
-/// the remaining time it set, or `None` if there was nothing to carry over
-/// (or today already has a remaining time).
-pub fn restore_today_from_shared_mirror() -> Option<i32> {
-    if load_remaining_time().is_some() {
+/// What `restore_today_from_shared_mirror` sets for the day.
+#[derive(Debug, PartialEq, Eq)]
+struct MirrorRestore {
+    active: i32,
+    paused: i32,
+    remaining: i32,
+}
+
+/// Whether and how to start a day from the shared mirror: only when the day
+/// has no remaining time stored but the mirror shows use. The used and
+/// paused times are the larger of what's stored here and in the mirror (the
+/// two are written together, so normally equal) - never added, and never
+/// lowered - and the remaining time is the limit minus the time used.
+fn mirror_restore(
+    stored_remaining: Option<i32>,
+    local: (i32, i32),
+    mirrored: (i32, i32),
+    limit_secs: i32,
+) -> Option<MirrorRestore> {
+    if stored_remaining.is_some() || (mirrored.0 <= 0 && mirrored.1 <= 0) {
         return None;
     }
-    let date = effective_today_date();
+    let active = local.0.max(mirrored.0).max(0);
+    let paused = local.1.max(mirrored.1).max(0);
+    Some(MirrorRestore { active, paused, remaining: remaining_after_use(limit_secs, active) })
+}
+
+/// At startup, if `date` has no remaining time stored but this account's
+/// usage as mirrored in the shared database (see `mirror_shared_daily_stat`,
+/// refreshed every 30 seconds) shows time used that day, start the day from
+/// that usage instead of from nothing: the used time and pause time are
+/// carried over, and the remaining time is the day's limit minus the time
+/// used. So deleting or damaging the settings file can't be used to get a
+/// fresh day's allowance (or pause budget), and the mirror isn't
+/// overwritten with smaller numbers. Returns the remaining time it set, or
+/// `None` if there was nothing to carry over (a fresh day, or one that
+/// already has a remaining time).
+pub fn restore_today_from_shared_mirror(date: &str) -> Option<i32> {
     let username = crate::remote_commands::current_windows_username();
     let mirrored = |kind: &str| {
-        get_shared_setting(&shared_user_stat_key(kind, &username, &date))
+        get_shared_setting(&shared_user_stat_key(kind, &username, date))
             .and_then(|s| s.parse::<i32>().ok())
             .unwrap_or(0)
-            .max(0)
     };
-    let active = mirrored("active");
-    let paused = mirrored("pause");
-    if active == 0 && paused == 0 {
-        return None;
-    }
+    let limit_minutes = get_daily_limit(get_current_weekday());
+    let restore = mirror_restore(
+        load_remaining_time_for(date),
+        (get_session_active_time_for(date), get_pause_used_for(date)),
+        (mirrored("active"), mirrored("pause")),
+        (limit_minutes * 60) as i32,
+    )?;
 
-    save_session_active_time(active);
-    save_pause_used_for(&date, paused);
-    let limit_secs = (get_daily_limit(get_current_weekday()) * 60) as i32;
-    let remaining = remaining_after_use(limit_secs, active);
-    save_remaining_time(remaining);
-    Some(remaining)
+    save_session_active_time_for(date, restore.active);
+    save_pause_used_for(date, restore.paused);
+    save_remaining_time_for(date, restore.remaining);
+    Some(restore.remaining)
 }
 
 fn start_temporary_database(error: String) -> DatabaseStartup {
@@ -2772,6 +2815,38 @@ mod tests {
         assert_eq!(remaining_after_use(7200, 0), 7200);
         assert_eq!(remaining_after_use(0, 100), 0);
         assert_eq!(remaining_after_use(7200, -5), 7200);
+    }
+
+    #[test]
+    fn a_deleted_database_does_not_start_the_day_over() {
+        // The file was deleted: nothing stored, the mirror shows 50 minutes
+        // used and 10 paused, limit 2 h.
+        assert_eq!(
+            mirror_restore(None, (0, 0), (3000, 600), 7200),
+            Some(MirrorRestore { active: 3000, paused: 600, remaining: 4200 })
+        );
+        // A fresh day (nothing in the mirror either) isn't touched...
+        assert_eq!(mirror_restore(None, (0, 0), (0, 0), 7200), None);
+        // ...nor a day that already has its remaining time (a normal start)
+        assert_eq!(mirror_restore(Some(5000), (2200, 0), (2200, 0), 7200), None);
+        // Restoring twice changes nothing the second time: by then the
+        // remaining time is stored.
+        assert_eq!(mirror_restore(Some(4200), (3000, 600), (3000, 600), 7200), None);
+        // Stored and mirrored usage are never added up, and never lowered
+        assert_eq!(
+            mirror_restore(None, (3100, 600), (3000, 700), 7200),
+            Some(MirrorRestore { active: 3100, paused: 700, remaining: 4100 })
+        );
+        // Used more than the limit (extensions): no time left, not negative
+        assert_eq!(mirror_restore(None, (0, 0), (9000, 0), 7200).map(|r| r.remaining), Some(0));
+    }
+
+    #[test]
+    fn counters_are_saved_under_the_day_they_belong_to() {
+        // Loaded for the 16th; a save after midnight but before the
+        // rollover still goes under the 16th.
+        assert_eq!(counters_save_date(Some("2026-11-16"), || "2026-11-17".into()), "2026-11-16");
+        assert_eq!(counters_save_date(None, || "2026-11-17".into()), "2026-11-17", "before startup loaded them");
     }
 
     #[test]
