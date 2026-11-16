@@ -593,6 +593,9 @@ fn en(key: &str) -> &'static str {
         "time_zone.notify.dst_off" => "daylight saving time off",
         "time_zone.notify.suffix" => "Screen time still follows the old time zone: the day starts at midnight there, so changing the time zone gains or loses no time. If the new time zone is right (for example, you are travelling), open Settings on this PC with the passcode and press Save - that switches to the new time zone.",
 
+        // ----- Daily update reminder -----
+        "update.notify.reminder" => "Reminder: Screen Time Manager has an update waiting:",
+
         // Fallback - return empty string for unknown keys (should not happen in practice)
         _ => "",
     }
@@ -1088,6 +1091,9 @@ fn de(key: &str) -> &'static str {
         "time_zone.notify.dst_off" => "Sommerzeit aus",
         "time_zone.notify.suffix" => "Die Bildschirmzeit folgt weiter der alten Zeitzone: Der Tag beginnt um Mitternacht dort, ein Zeitzonenwechsel bringt also keine Zeit und kostet keine. Wenn die neue Zeitzone stimmt (zum Beispiel auf Reisen), öffnen Sie auf diesem PC mit dem Passcode die Einstellungen und klicken Sie auf Speichern - damit gilt die neue Zeitzone.",
 
+        // ----- Tägliche Update-Erinnerung -----
+        "update.notify.reminder" => "Erinnerung: Für den Bildschirmzeit Manager wartet ein Update:",
+
         // Fallback to English
         _ => en(key),
     }
@@ -1169,5 +1175,15 @@ mod tests {
             assert!(!de(key).is_empty(), "missing German text for {key}");
             assert_ne!(en(key), de(key), "German text for {key} is just the English fallback");
         }
+    }
+
+    #[test]
+    fn update_reminder_keys_are_translated() {
+        let key = "update.notify.reminder";
+        assert!(!en(key).is_empty(), "missing English text for {key}");
+        assert!(!de(key).is_empty(), "missing German text for {key}");
+        assert_ne!(en(key), de(key), "German text for {key} is just the English fallback");
+        // Goes to Discord too: nothing in it may read as a mention.
+        assert!(!en(key).contains('@') && !de(key).contains('@'), "{key}");
     }
 }

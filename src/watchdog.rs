@@ -1297,12 +1297,19 @@ fn local_time_string() -> String {
 /// is sent by the next `flush_pending_alerts` (and retried until delivered).
 /// Needs the shared database open (`database::init_shared_database`).
 fn queue_alert(text: &str) {
+    queue_alert_to(text, true, true);
+}
+
+/// `queue_alert` for only the bots asked for. Same queue line as any other
+/// alert (one still pending for just one bot looks exactly like this), so
+/// every watchdog version reads it.
+fn queue_alert_to(text: &str, for_telegram: bool, for_discord: bool) {
     use std::io::Write;
 
     let tg = database::get_telegram_config();
     let dc = database::get_discord_config();
-    let telegram = tg.enabled && tg.bot_token.is_some() && tg.admin_chat_id.is_some();
-    let discord = dc.enabled && dc.bot_token.is_some() && dc.channel_id.is_some();
+    let telegram = for_telegram && tg.enabled && tg.bot_token.is_some() && tg.admin_chat_id.is_some();
+    let discord = for_discord && dc.enabled && dc.bot_token.is_some() && dc.channel_id.is_some();
     if !telegram && !discord {
         return;
     }
@@ -1328,6 +1335,20 @@ fn queue_alert(text: &str) {
 /// watchdog's next runs. Needs the shared database open.
 pub fn raise_alert(text: &str) {
     queue_alert(text);
+    std::thread::spawn(flush_pending_alerts);
+}
+
+/// `raise_alert` with its own text for each bot (a Discord mention, or the
+/// command syntax). The two texts must differ - the queue tells alerts
+/// raised in the same second apart by their text - so equal texts go out as
+/// one alert to both.
+pub fn raise_alert_per_bot(telegram_text: &str, discord_text: &str) {
+    if telegram_text == discord_text {
+        queue_alert(telegram_text);
+    } else {
+        queue_alert_to(telegram_text, true, false);
+        queue_alert_to(discord_text, false, true);
+    }
     std::thread::spawn(flush_pending_alerts);
 }
 
@@ -1458,6 +1479,7 @@ pub fn flush_pending_alerts() {
     let tg = database::get_telegram_config();
     let dc = database::get_discord_config();
     let tg_target = tg.bot_token.zip(tg.admin_chat_id).filter(|_| tg.enabled);
+    let dc_admin = dc.admin_user_id;
     let dc_target = dc.bot_token.zip(dc.channel_id).filter(|_| dc.enabled);
     let mut tg_up = true;
     let mut dc_up = true;
@@ -1479,7 +1501,7 @@ pub fn flush_pending_alerts() {
             match &dc_target {
                 None => alert.discord = false,
                 Some(_) if !dc_up => {}
-                Some((token, channel_id)) => match send_discord_alert(token, *channel_id, &text) {
+                Some((token, channel_id)) => match send_discord_alert(token, *channel_id, dc_admin, &text) {
                     SendOutcome::Sent | SendOutcome::Rejected => alert.discord = false,
                     SendOutcome::Retry => dc_up = false,
                 },
@@ -1540,7 +1562,7 @@ fn send_telegram_alert(token: &str, chat_id: i64, text: &str) -> SendOutcome {
 
 /// One-off Discord message via the REST API - doesn't need the Gateway
 /// connection the main app's bot uses, same approach as the setup wizard.
-fn send_discord_alert(token: &str, channel_id: u64, text: &str) -> SendOutcome {
+fn send_discord_alert(token: &str, channel_id: u64, admin_user_id: Option<u64>, text: &str) -> SendOutcome {
     // `ChannelId::new` panics on 0 (and this build aborts on a panic).
     let Some(channel_id) = std::num::NonZeroU64::new(channel_id) else {
         return SendOutcome::Rejected;
@@ -1550,12 +1572,25 @@ fn send_discord_alert(token: &str, channel_id: u64, text: &str) -> SendOutcome {
     };
     rt.block_on(async {
         let http = serenity::http::Http::new(token);
-        let send = serenity::model::id::ChannelId::from(channel_id).say(&http, text);
+        let message = serenity::builder::CreateMessage::new()
+            .content(text)
+            .allowed_mentions(discord_allowed_mentions(admin_user_id));
+        let send = serenity::model::id::ChannelId::from(channel_id).send_message(&http, message);
         match tokio::time::timeout(std::time::Duration::from_secs(15), send).await {
             Ok(Ok(_)) => SendOutcome::Sent,
             _ => SendOutcome::Retry,
         }
     })
+}
+
+/// Who an alert may ping on Discord: only the configured admin user, when
+/// the text tags them (`<@id>`, the update reminder). Without this Discord
+/// would turn any user, role, @everyone or @here mention in the text into a
+/// ping; with it, nothing else in an alert can ping anyone.
+fn discord_allowed_mentions(admin_user_id: Option<u64>) -> serenity::builder::CreateAllowedMentions {
+    // `UserId::new` panics on 0, and parse_discord_id never yields 0 anyway.
+    let admin = admin_user_id.and_then(std::num::NonZeroU64::new).map(serenity::model::id::UserId::from);
+    serenity::builder::CreateAllowedMentions::new().users(admin)
 }
 
 #[cfg(test)]
@@ -1752,6 +1787,34 @@ mod tests {
         // Something another flush already removed stays removed.
         let merged = merge_after_send(vec![alert(now - 1, "new")], &snapshot, &updated, now);
         assert_eq!(merged, vec![alert(now - 1, "new")]);
+    }
+
+    /// `raise_alert_per_bot`'s two queue lines: same second, one bot each,
+    /// in the format every watchdog version reads - and delivering one
+    /// leaves the other pending.
+    #[test]
+    fn per_bot_alerts_are_ordinary_queue_lines_kept_apart() {
+        let now = 1_700_000_000;
+        let tg = alert(now, "/update");
+        let dc = PendingAlert { telegram: false, discord: true, ..alert(now, "<@42> !update") };
+        let line = dc.serialize();
+        assert_eq!(line, format!("{now}\t2026-11-15 10:00\t0\t1\t<@42> !update"));
+        assert_eq!(parse_queue(&serialize_queue(&[tg.clone(), dc.clone()])), vec![tg.clone(), dc.clone()]);
+
+        let snapshot = vec![tg.clone(), dc.clone()];
+        let updated = vec![PendingAlert { telegram: false, ..tg.clone() }, dc.clone()];
+        let merged = merge_after_send(snapshot.clone(), &snapshot, &updated, now);
+        assert_eq!(merged, vec![dc], "Telegram's copy delivered, Discord's still pending");
+    }
+
+    #[test]
+    fn discord_alerts_may_ping_only_the_admin() {
+        let json = |admin| serde_json::to_value(discord_allowed_mentions(admin)).unwrap();
+        // An empty `parse` list: no @everyone/@here, roles or other users,
+        // whatever the text says. Only the listed user can be pinged.
+        assert_eq!(json(Some(42)), serde_json::json!({"parse": [], "users": ["42"], "roles": []}));
+        assert_eq!(json(None), serde_json::json!({"parse": [], "users": [], "roles": []}));
+        assert_eq!(json(Some(0)), json(None), "0 isn't a user (and would panic)");
     }
 
     #[test]

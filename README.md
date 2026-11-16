@@ -246,7 +246,7 @@ A few more things worth knowing:
 
 ## Updating
 
-**With Telegram or Discord set up:** when a new version comes out, the bot sends you a message. Reply `/update` (Telegram) or `!update` (Discord) to install it. The app downloads the new setup from this project's [Releases page](https://github.com/dhiorns15/screen-time-manager-for-windows/releases), checks that it's exactly the file published there, and installs it. The timer disappears briefly and comes back on its own a minute or so later, on every signed-in account. Your settings, limits and today's remaining time are kept.
+**With Telegram or Discord set up:** when a new version comes out, the bot sends you a message. Reply `/update` (Telegram) or `!update` (Discord) to install it. Until you do, the bot reminds you once a day (from 7am, on any day the PC is on); on Discord the message mentions the admin user you set up, so it pings you. The app downloads the new setup from this project's [Releases page](https://github.com/dhiorns15/screen-time-manager-for-windows/releases), checks that it's exactly the file published there, and installs it. The timer disappears briefly and comes back on its own a minute or so later, on every signed-in account. Your settings, limits and today's remaining time are kept.
 
 **Without a bot:** download the new `...-windows-x64-setup.exe` from the [latest release](https://github.com/dhiorns15/screen-time-manager-for-windows/releases/latest) and run it, just like the first time. It installs over the old version and keeps your settings.
 

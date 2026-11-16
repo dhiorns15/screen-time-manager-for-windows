@@ -3,7 +3,8 @@
 //! Two very different processes use this module:
 //!
 //! - The normal per-session tray app (a standard user) checks GitHub once a
-//!   day and tells the admin via the bots when a newer release exists, runs
+//!   day and tells the admin via the bots when a newer release exists (and
+//!   reminds them once a day until it is installed), runs
 //!   the `update` bot command (see `remote_commands::cmd_update`), and
 //!   announces once after an update that the new version is running.
 //! - `screen-time-manager.exe --update`, run as SYSTEM by the
@@ -76,6 +77,10 @@ const MAX_INSTALLER_BYTES: u64 = 256 * 1024 * 1024;
 /// announces a given version.
 const UPDATE_NOTIFIED_VERSION_KEY: &str = "update_notified_version";
 const LAST_RUNNING_VERSION_KEY: &str = "last_running_version";
+/// The local date (YYYY-MM-DD) the last "update available" message - the
+/// first announcement of a version or a daily reminder - was sent on: at
+/// most one a day per PC.
+const UPDATE_MESSAGE_DAY_KEY: &str = "update_message_day";
 
 /// A release version: major.minor.patch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -532,12 +537,17 @@ fn spawn_setup(setup: &Path, args: &[std::ffi::OsString]) -> Result<&'static str
 // Tray app side: daily check, version-change notice, `update` command
 // ============================================================================
 
-/// First check this long after startup, then once a day.
+/// First look this long after startup, then every `TICK`: GitHub is asked
+/// once per calendar day (see `check_due`), so a PC that's only on for an
+/// hour or two a day still checks - and reminds - every day it's on.
 const FIRST_CHECK_DELAY: Duration = Duration::from_secs(2 * 60);
-const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-/// Retry interval when a check couldn't happen (no network, no bot
-/// connected in this session yet).
+const TICK: Duration = Duration::from_secs(10 * 60);
+/// After a failed check (no network, GitHub error), wait at least this long
+/// before asking GitHub again.
 const RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// No check, and so no update message, before this local hour: a PC left on
+/// overnight would otherwise ping the admin just after midnight.
+const EARLIEST_HOUR: u16 = 7;
 
 /// How long to wait for this session's bots to connect before giving up on
 /// announcing a version change (another session may announce it instead).
@@ -620,53 +630,110 @@ fn announce_version_change() {
 
 fn daily_update_check() {
     std::thread::sleep(FIRST_CHECK_DELAY);
-    let mut last_checked: Option<Instant> = None;
+    // The local date this process last heard back from GitHub on.
+    let mut checked_day: Option<String> = None;
+    let mut last_failure: Option<Instant> = None;
     loop {
-        if last_checked.is_none_or(|t| t.elapsed() >= CHECK_INTERVAL) {
+        let (today, hour) = local_day_and_hour();
+        let failed_recently = last_failure.is_some_and(|t| t.elapsed() < RETRY_INTERVAL);
+        if !failed_recently
+            && check_due(&today, hour, checked_day.as_deref(), database::get_shared_setting(UPDATE_MESSAGE_DAY_KEY).as_deref())
+        {
             match bot_state() {
-                BotState::NoneEnabled => last_checked = Some(Instant::now()),
-                BotState::NotReady => {}
+                BotState::NoneEnabled | BotState::NotReady => {}
                 BotState::Ready => match check_for_newer() {
                     Ok(newer) => {
-                        last_checked = Some(Instant::now());
+                        checked_day = Some(today.clone());
+                        last_failure = None;
                         if let Some(release) = newer {
-                            notify_update_available(&release);
+                            notify_update_available(&release, &today);
                         }
                     }
-                    Err(e) => eprintln!("[Update] Daily check failed: {e}"),
+                    Err(e) => {
+                        last_failure = Some(Instant::now());
+                        eprintln!("[Update] Daily check failed: {e}");
+                    }
                 },
             }
         }
-        std::thread::sleep(RETRY_INTERVAL);
+        std::thread::sleep(TICK);
     }
 }
 
-/// Tells the admin about `release`, unless some session already told them
-/// about this exact version.
-fn notify_update_available(release: &Release) {
+/// Today's local date (YYYY-MM-DD) and hour, from one reading of the clock.
+fn local_day_and_hour() -> (String, u16) {
+    let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    (format!("{:04}-{:02}-{:02}", st.wYear, st.wMonth, st.wDay), st.wHour)
+}
+
+/// Whether to ask GitHub now: not before `EARLIEST_HOUR`, at most once a day
+/// per process (`checked_day`: the day this process last got an answer),
+/// and not at all once today's update message has gone out from any
+/// session (`message_day`, shared) - nothing more could be sent today.
+fn check_due(today: &str, hour: u16, checked_day: Option<&str>, message_day: Option<&str>) -> bool {
+    hour >= EARLIEST_HOUR && checked_day != Some(today) && message_day != Some(today)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpdateMessage {
+    /// First news of this version.
+    Announcement,
+    /// The admin was told about this version on an earlier day.
+    Reminder,
+}
+
+/// Claims today's update message about `latest`, with `swap` behaving like
+/// `database::swap_shared_setting` (atomic; `Some(previous)` only when it
+/// changed the value). `None` if one was already sent today - by any
+/// session, account or earlier run on this PC. Otherwise an announcement if
+/// no session has announced `latest` yet, else a reminder. A version first
+/// seen on a day that already had its message is announced the next day.
+fn claim_update_message(
+    mut swap: impl FnMut(&str, &str) -> Option<Option<String>>,
+    today: &str,
+    latest: Version,
+) -> Option<UpdateMessage> {
+    swap(UPDATE_MESSAGE_DAY_KEY, today)?;
+    Some(match swap(UPDATE_NOTIFIED_VERSION_KEY, &latest.to_string()) {
+        Some(_) => UpdateMessage::Announcement,
+        None => UpdateMessage::Reminder,
+    })
+}
+
+/// The Telegram and Discord texts for an update message. Each names only
+/// its own bot's command; Discord's tags the admin user, when one is set,
+/// so it pings them (see watchdog.rs's `discord_allowed_mentions`).
+/// Telegram's has no tag: the admin chat is normally the private chat with
+/// the bot, where every message notifies.
+fn update_message_texts(kind: UpdateMessage, latest: Version, installed: Version, discord_admin: Option<u64>) -> (String, String) {
+    let headline = match kind {
+        UpdateMessage::Announcement => format!("⬆️ {}", i18n::t("update.notify.available")),
+        UpdateMessage::Reminder => format!("⏰ {}", i18n::t("update.notify.reminder")),
+    };
+    let body = format!("{headline} v{latest}\n{}: v{installed}\n", i18n::t("update.notify.current"));
+    let tag = discord_admin.filter(|&id| id != 0).map(|id| format!("<@{id}> ")).unwrap_or_default();
+    (
+        format!("{body}{}", i18n::t("update.notify.how_tg")),
+        format!("{tag}{body}{}", i18n::t("update.notify.how_dc")),
+    )
+}
+
+/// Tells the admin about `release` - once a day per PC, until it's
+/// installed (`check_for_newer` stops finding it then).
+fn notify_update_available(release: &Release, today: &str) {
     if let Err(e) = installer_asset(release) {
         // The update command would only fail on it - don't advertise it.
         eprintln!("[Update] Not announcing v{}: {e}", release.version);
         return;
     }
-    if database::swap_shared_setting(UPDATE_NOTIFIED_VERSION_KEY, &release.version.to_string()).is_none() {
+    let Some(kind) = claim_update_message(database::swap_shared_setting, today, release.version) else {
         return;
-    }
-    let body = format!(
-        "⬆️ {} v{}\n{}: v{}\n",
-        i18n::t("update.notify.available"),
-        release.version,
-        i18n::t("update.notify.current"),
-        Version::current(),
-    );
-    // One text for both bots (see `send_claimed_announcement`), so it names
-    // the command for each one that's enabled.
-    let how = match (database::get_telegram_config().enabled, database::get_discord_config().enabled) {
-        (true, false) => i18n::t("update.notify.how_tg").to_string(),
-        (false, true) => i18n::t("update.notify.how_dc").to_string(),
-        _ => format!("{}\n{}", i18n::t("update.notify.how_tg"), i18n::t("update.notify.how_dc")),
     };
-    send_claimed_announcement(&format!("{body}{how}"));
+    let (tg_text, dc_text) =
+        update_message_texts(kind, release.version, Version::current(), database::get_discord_config().admin_user_id);
+    // Claimed, so through the alert queue like `send_claimed_announcement`,
+    // but with each bot's own text.
+    crate::watchdog::raise_alert_per_bot(&tg_text, &dc_text);
 }
 
 /// Send an announcement this session has just claimed in the shared
@@ -926,6 +993,87 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).trim(),
             r#"/VERYSILENT /SUPPRESSMSGBOXES /NORESTART "/LOG=C:\Program Files\ScreenTimeManager\updates\setup.log""#
         );
+    }
+
+    #[test]
+    fn checks_github_once_a_day_from_seven() {
+        let day = "2026-11-16";
+        assert!(check_due(day, 7, None, None), "just started");
+        assert!(check_due(day, 19, None, Some("2026-11-15")), "evening-only PC: yesterday's message doesn't count");
+        assert!(check_due(day, 8, Some("2026-11-15"), None), "running since yesterday: asks again today");
+        assert!(!check_due(day, 12, Some(day), None), "this process already asked today");
+        assert!(!check_due(day, 12, None, Some(day)), "today's message already sent from somewhere on this PC");
+        assert!(!check_due(day, 0, Some("2026-11-15"), None), "left on overnight: not just after midnight");
+        assert!(!check_due(day, EARLIEST_HOUR - 1, None, None));
+    }
+
+    /// `database::swap_shared_setting` over a map, for `claim_update_message`.
+    fn shared_settings() -> std::cell::RefCell<std::collections::HashMap<String, String>> {
+        Default::default()
+    }
+
+    fn claim(db: &std::cell::RefCell<std::collections::HashMap<String, String>>, today: &str, latest: &str) -> Option<UpdateMessage> {
+        let swap = |key: &str, value: &str| {
+            let previous = db.borrow_mut().insert(key.to_string(), value.to_string());
+            (previous.as_deref() != Some(value)).then_some(previous)
+        };
+        claim_update_message(swap, today, v(latest))
+    }
+
+    #[test]
+    fn one_update_message_a_day_until_installed() {
+        use UpdateMessage::*;
+        let db = shared_settings();
+        // v1.1.0 appears: announced, and that's the day's message - other
+        // accounts, sessions and restarts that day stay quiet.
+        assert_eq!(claim(&db, "2026-11-16", "1.1.0"), Some(Announcement));
+        assert_eq!(claim(&db, "2026-11-16", "1.1.0"), None);
+        assert_eq!(claim(&db, "2026-11-16", "1.1.0"), None);
+        // Every later day the PC is on: one reminder, whatever the gap.
+        assert_eq!(claim(&db, "2026-11-17", "1.1.0"), Some(Reminder));
+        assert_eq!(claim(&db, "2026-11-17", "1.1.0"), None);
+        assert_eq!(claim(&db, "2026-11-20", "1.1.0"), Some(Reminder));
+        // A newer release is announced on its first day...
+        assert_eq!(claim(&db, "2026-11-21", "1.2.0"), Some(Announcement));
+        assert_eq!(claim(&db, "2026-11-22", "1.2.0"), Some(Reminder));
+        // ...or, if that day's message has gone out already, the next day.
+        assert_eq!(claim(&db, "2026-11-22", "1.3.0"), None);
+        assert_eq!(claim(&db, "2026-11-23", "1.3.0"), Some(Announcement));
+
+        // Released versions recorded the announcement before this existed:
+        // the next day's message is a reminder, not a second announcement.
+        let db = shared_settings();
+        db.borrow_mut().insert(UPDATE_NOTIFIED_VERSION_KEY.into(), "1.1.0".into());
+        assert_eq!(claim(&db, "2026-11-16", "1.1.0"), Some(Reminder));
+
+        // The shared database can't be written: nothing is sent.
+        assert_eq!(claim_update_message(|_: &str, _: &str| None, "2026-11-16", v("1.1.0")), None);
+    }
+
+    #[test]
+    fn update_messages_name_each_bots_own_command_and_tag_only_on_discord() {
+        let (latest, installed) = (v("1.1.0"), v("1.0.1"));
+        for kind in [UpdateMessage::Announcement, UpdateMessage::Reminder] {
+            let (tg, dc) = update_message_texts(kind, latest, installed, Some(123_456_789_012_345_678));
+            for text in [&tg, &dc] {
+                assert!(text.contains("v1.1.0") && text.contains("Installed: v1.0.1"), "{text}");
+            }
+            assert!(tg.ends_with("Send /update to install it.") && !tg.contains("!update"), "{tg}");
+            assert!(dc.ends_with("Send !update to install it.") && !dc.contains("/update"), "{dc}");
+            assert!(!tg.contains('<') && !tg.contains('@'), "no Discord mention on Telegram: {tg}");
+            assert!(dc.starts_with("<@123456789012345678> "), "{dc}");
+            assert_eq!(dc.matches('@').count(), 1, "nothing else that could ping: {dc}");
+            assert_ne!(tg, dc, "the queue tells same-second alerts apart by text");
+
+            // No admin user configured: no tag at all.
+            let (_, untagged) = update_message_texts(kind, latest, installed, None);
+            assert!(!untagged.contains('@') && !untagged.contains('<'), "{untagged}");
+            assert_eq!(update_message_texts(kind, latest, installed, Some(0)).1, untagged);
+        }
+        let (announcement, _) = update_message_texts(UpdateMessage::Announcement, latest, installed, None);
+        let (reminder, _) = update_message_texts(UpdateMessage::Reminder, latest, installed, None);
+        assert!(announcement.starts_with("⬆️ A new version"), "{announcement}");
+        assert_eq!(reminder, "⏰ Reminder: Screen Time Manager has an update waiting: v1.1.0\nInstalled: v1.0.1\nSend /update to install it.");
     }
 
     #[test]
