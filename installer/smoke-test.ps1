@@ -358,7 +358,13 @@ function StandardAccountProbe {
         New-Item -ItemType Directory $probeDir | Out-Null
         icacls $probeDir /grant "${user}:(OI)(CI)M" | Out-Null
         $out = "$probeDir\result.json"
-        Add-Type -Namespace Probe -Name Native -OutputAssembly "$probeDir\probe-native.dll" -MemberDefinition '[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);'
+        # Compiled by Windows PowerShell, which is what the probe runs in: an assembly compiled by
+        # PowerShell 7 (this script, in CI) doesn't load there.
+        Set-Content "$probeDir\compile.ps1" -Encoding ASCII -Value @'
+Add-Type -Namespace Probe -Name Native -OutputAssembly (Join-Path $PSScriptRoot 'probe-native.dll') -MemberDefinition '[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);'
+'@
+        powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$probeDir\compile.ps1" | Out-Host
+        Check (Test-Path "$probeDir\probe-native.dll") "Could not compile the standard account probe's helper"
         Set-Content "$probeDir\probe.ps1" -Encoding ASCII -Value @'
 param([string]$Out, [string]$Shared)
 $r = [ordered]@{}
