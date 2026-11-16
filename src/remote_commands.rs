@@ -112,12 +112,13 @@ pub fn timer_state(
     }
 }
 
-/// The timer's state right now. The manual-lock flag (`None` here) is for
-/// the caller to fill in once the app tracks it - see `timer_state`.
+/// The timer's state right now. A parent's lock (`blocking::is_manual_lock`)
+/// reads as `Locked` whether or not time is left; a lock screen without one
+/// as `OutOfTime`.
 pub fn current_timer_state() -> TimerState {
     timer_state(
         blocking::is_blocking_overlay_visible(),
-        None,
+        Some(blocking::is_manual_lock()),
         blocking::get_remaining_seconds(),
         mini_overlay::is_paused(),
         mini_overlay::is_idle_paused(),

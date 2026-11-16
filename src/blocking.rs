@@ -38,6 +38,7 @@ use crate::database::{get_discord_config, get_telegram_config};
 use crate::dpi::scale;
 use crate::i18n;
 use crate::passcode_guard::{self, Attempt};
+use crate::time_request::RequestOutcome;
 
 /// Initiates a Windows shutdown with proper privilege handling
 unsafe fn initiate_shutdown() -> bool {
@@ -186,26 +187,31 @@ fn request_offered(telegram_enabled: bool, discord_enabled: bool) -> bool {
     telegram_enabled || discord_enabled
 }
 
-/// Whether a request would reach the admin now: an enabled bot is connected
-/// with an admin chat/channel set (its `can_notify`). That's as far as the
-/// app can tell - `time_request::request_more_time` hands the message over
-/// without reporting whether it was delivered.
-fn request_reaches_admin(
-    telegram_enabled: bool,
-    telegram_connected: bool,
-    discord_enabled: bool,
-    discord_connected: bool,
-) -> bool {
-    (telegram_enabled && telegram_connected) || (discord_enabled && discord_connected)
+/// Whether the button's text during the cooldown says "already sent" (the
+/// last press found an unanswered request - `RequestOutcome::AlreadySent`)
+/// rather than "sent".
+static REQUEST_WAS_ALREADY_SENT: AtomicBool = AtomicBool::new(false);
+
+/// What the button says after a press, and whether the cooldown starts.
+/// `Sent` (queued for every bot that is set up: delivered now, or once the
+/// PC is online) and `AlreadySent` (an unanswered request went out minutes
+/// ago) both honestly mean the parent has it. `NotSent` (no bot set up)
+/// keeps the note and allows another try.
+fn request_button_after(outcome: RequestOutcome) -> (&'static str, bool) {
+    match outcome {
+        RequestOutcome::Sent => ("blocking.request_sent", true),
+        RequestOutcome::AlreadySent => ("blocking.request_already_sent", true),
+        RequestOutcome::NotSent => ("blocking.request_not_sent", false),
+    }
 }
 
-fn request_can_go_out() -> bool {
-    request_reaches_admin(
-        get_telegram_config().enabled,
-        crate::telegram::can_notify(),
-        get_discord_config().enabled,
-        crate::discord::can_notify(),
-    )
+/// The button text's key during the cooldown.
+fn request_cooldown_key() -> &'static str {
+    if REQUEST_WAS_ALREADY_SENT.load(Ordering::SeqCst) {
+        "blocking.request_already_sent"
+    } else {
+        "blocking.request_sent"
+    }
 }
 
 /// Show or hide the request section from the bot configuration now. Called
@@ -347,6 +353,16 @@ pub fn end_manual_lock() -> bool {
         crate::database::set_setting(MANUAL_LOCK_KEY, "0");
     }
     was_on
+}
+
+/// The lock screen's title: a parent's lock while time is left isn't
+/// "Time's up!".
+fn lock_title_key(manual_lock: bool, remaining: i32) -> &'static str {
+    if manual_lock && remaining > 0 {
+        "blocking.parent_lock_title"
+    } else {
+        "blocking.times_up"
+    }
 }
 
 /// Whether the lock screen comes up at startup: a manual lock, or no time
@@ -1024,7 +1040,9 @@ pub unsafe extern "system" fn blocking_overlay_proc(
             };
             DrawTextW(
                 hdc,
-                &mut i18n::t("blocking.times_up").encode_utf16().collect::<Vec<_>>(),
+                &mut i18n::t(lock_title_key(is_manual_lock(), REMAINING_SECONDS.load(Ordering::SeqCst)))
+                    .encode_utf16()
+                    .collect::<Vec<_>>(),
                 &mut title_rect,
                 DT_CENTER | DT_SINGLELINE,
             );
@@ -1274,28 +1292,29 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                             let remaining = REMAINING_SECONDS.load(Ordering::SeqCst).max(0);
                             let btn_ptr = REQUEST_TIME_HWND.load(Ordering::SeqCst);
 
-                            // "Sent!" only if a connected bot took it (see
-                            // request_can_go_out); otherwise say so, keep
-                            // the note, and let it be tried again.
-                            if !request_can_go_out() {
+                            let outcome = crate::time_request::request_more_time(
+                                if note.is_empty() { None } else { Some(note.to_string()) },
+                                remaining,
+                            );
+                            let (text_key, cooldown) = request_button_after(outcome);
+
+                            // Not sent: say so, keep the note, and let it be
+                            // tried again.
+                            if !cooldown {
                                 if !btn_ptr.is_null() {
-                                    let text = i18n::wide("blocking.request_not_sent");
+                                    let text = i18n::wide(text_key);
                                     SetWindowTextW(HWND(btn_ptr), PCWSTR(text.as_ptr())).ok();
                                 }
                                 let _ = PlaySoundW(w!("SystemExclamation"), None, SND_ALIAS | SND_ASYNC);
                                 return LRESULT(0);
                             }
 
-                            crate::time_request::request_more_time(
-                                if note.is_empty() { None } else { Some(note.to_string()) },
-                                remaining,
-                            );
-
+                            REQUEST_WAS_ALREADY_SENT.store(outcome == RequestOutcome::AlreadySent, Ordering::SeqCst);
                             REQUEST_COOLDOWN_REMAINING.store(REQUEST_COOLDOWN_SECONDS, Ordering::SeqCst);
                             if !btn_ptr.is_null() {
                                 let btn = HWND(btn_ptr);
                                 let _ = EnableWindow(btn, false);
-                                let text = i18n::wide("blocking.request_sent");
+                                let text = i18n::wide(text_key);
                                 SetWindowTextW(btn, PCWSTR(text.as_ptr())).ok();
                             }
                             if !note_ptr.is_null() {
@@ -1399,7 +1418,7 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                     } else if !btn_ptr.is_null() {
                         let text = format!(
                             "{} ({}:{:02})",
-                            i18n::t("blocking.request_sent"),
+                            i18n::t(request_cooldown_key()),
                             remaining / 60, remaining % 60
                         );
                         let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
@@ -2059,13 +2078,20 @@ mod tests {
     }
 
     #[test]
-    fn a_request_is_reported_sent_only_when_a_bot_can_take_it() {
-        assert!(request_reaches_admin(true, true, false, false));
-        assert!(request_reaches_admin(false, false, true, true));
-        assert!(request_reaches_admin(true, false, true, true), "Discord takes it");
-        assert!(!request_reaches_admin(true, false, false, false), "Telegram offline");
-        assert!(!request_reaches_admin(false, true, false, true), "connected but switched off");
-        assert!(!request_reaches_admin(false, false, false, false));
+    fn the_title_fits_why_the_screen_is_locked() {
+        assert_eq!(lock_title_key(true, 40 * 60), "blocking.parent_lock_title");
+        assert_eq!(lock_title_key(true, 0), "blocking.times_up", "a parent's lock with no time left");
+        assert_eq!(lock_title_key(false, 0), "blocking.times_up");
+    }
+
+    #[test]
+    fn the_request_button_says_what_became_of_the_request() {
+        // Queued (even with the bot offline for now): sent, cooldown
+        assert_eq!(request_button_after(RequestOutcome::Sent), ("blocking.request_sent", true));
+        // An unanswered one went out minutes ago: the parent has it
+        assert_eq!(request_button_after(RequestOutcome::AlreadySent), ("blocking.request_already_sent", true));
+        // No bot set up: say so, no cooldown, try again
+        assert_eq!(request_button_after(RequestOutcome::NotSent), ("blocking.request_not_sent", false));
     }
 
     #[test]

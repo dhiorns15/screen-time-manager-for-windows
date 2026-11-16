@@ -624,7 +624,9 @@ fn en(key: &str) -> &'static str {
         // ----- Stats reset alert, lock-screen time request -----
         "reset.notify.header" => "used the passcode to reset today's timer to the daily limit",
         "reset.source.stats" => "Stats window",
-        "blocking.request_not_sent" => "⚠️ Not sent - no connection. Try again",
+        "blocking.request_not_sent" => "⚠️ Not sent - the bot isn't fully set up",
+        "blocking.request_already_sent" => "✅ Already sent! Wait",
+        "blocking.parent_lock_title" => "Locked by a parent",
 
         // Fallback - return empty string for unknown keys (should not happen in practice)
         _ => "",
@@ -1152,7 +1154,9 @@ fn de(key: &str) -> &'static str {
         // ----- Statistik-Zurücksetzen, Zeitanfrage am Sperrbildschirm -----
         "reset.notify.header" => "hat mit dem Code den Timer für heute auf das Tageslimit zurückgesetzt",
         "reset.source.stats" => "Statistik-Fenster",
-        "blocking.request_not_sent" => "⚠️ Nicht gesendet - keine Verbindung. Erneut versuchen",
+        "blocking.request_not_sent" => "⚠️ Nicht gesendet - der Bot ist nicht fertig eingerichtet",
+        "blocking.request_already_sent" => "✅ Bereits gesendet! Warten",
+        "blocking.parent_lock_title" => "Von den Eltern gesperrt",
 
         // Fallback to English
         _ => en(key),
@@ -1239,7 +1243,10 @@ mod tests {
 
     #[test]
     fn stats_reset_and_request_keys_are_translated() {
-        for key in ["reset.notify.header", "reset.source.stats", "blocking.request_not_sent"] {
+        for key in [
+            "reset.notify.header", "reset.source.stats", "blocking.request_not_sent",
+            "blocking.request_already_sent", "blocking.parent_lock_title",
+        ] {
             assert!(!en(key).is_empty(), "missing English text for {key}");
             assert!(!de(key).is_empty(), "missing German text for {key}");
             assert_ne!(en(key), de(key), "German text for {key} is just the English fallback");
