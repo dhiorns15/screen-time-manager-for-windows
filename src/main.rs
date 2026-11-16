@@ -238,8 +238,11 @@ fn main() {
         // Show the mini overlay with remaining time
         show_mini_overlay();
 
-        // If time is already exhausted, show blocking overlay immediately
-        if remaining <= 0 {
+        // If time is already exhausted, or a parent's lock is still on (it
+        // outlasts restarts, reboots and updates - see blocking::MANUAL_LOCK),
+        // show blocking overlay immediately
+        blocking::load_manual_lock();
+        if blocking::lock_screen_due_at_start(blocking::is_manual_lock(), remaining) {
             let msg = database::get_blocking_message();
             blocking::show_blocking_overlay(&msg);
         }

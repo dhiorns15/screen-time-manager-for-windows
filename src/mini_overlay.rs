@@ -532,7 +532,9 @@ unsafe fn check_day_rollover(force: bool) {
     let remaining = REMAINING_SECONDS.load(Ordering::SeqCst);
 
     update_mini_overlay();
-    if remaining > 0 {
+    // A manual lock stays up (the tick keeps it up; see
+    // blocking::MANUAL_LOCK); an out-of-time lock goes if the new day has time.
+    if crate::blocking::rollover_hides_lock_screen(crate::blocking::is_manual_lock(), remaining) {
         crate::blocking::hide_blocking_overlay();
     }
 }
@@ -728,6 +730,8 @@ pub unsafe fn on_accounting_tick() {
     if tick.is_multiple_of(LOCK_RECHECK_TICKS) {
         recheck_session_lock();
     }
+
+    crate::blocking::enforce_manual_lock();
 
     let mode = tick_mode(
         crate::blocking::is_blocking_overlay_visible(),

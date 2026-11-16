@@ -244,6 +244,84 @@ pub unsafe fn show_blocking_overlay(text: &str) {
     show_blocking_overlay_with_time(text, -1);
 }
 
+/// A lock a parent started (bot `lock`/`stop`), whatever the remaining time.
+/// Kept in the per-account database (`MANUAL_LOCK_KEY`), so it survives the
+/// app stopping for any reason - the lock screen's own Shut Down button or
+/// countdown, a sign-out, a reboot, a kill, an update - and midnight: until
+/// a parent ends it, the lock screen comes back up at every start and stays
+/// up at the rollover (it used to be only on screen, and any of those
+/// undid a bedtime lock with time left). What ends it, and what that does
+/// to the remaining time:
+/// - `unlock` (bot): the time is left as it is; with time left the lock
+///   screen goes, with none the out-of-time lock stays (as before).
+/// - an extension (bot, tray, lock screen with the passcode): adds the time
+///   and the lock screen goes.
+/// - a reset (bot, Stats): back to today's full limit, the lock screen goes.
+/// - the passcode on the lock screen: the time is left as it is if there is
+///   some; with none, 15 minutes are added (as before).
+///
+/// Time isn't counted while the lock screen is up (see
+/// `mini_overlay::tick_mode`).
+static MANUAL_LOCK: AtomicBool = AtomicBool::new(false);
+const MANUAL_LOCK_KEY: &str = "manual_lock";
+
+/// Read the stored manual lock. Call once at startup, before deciding
+/// whether the lock screen starts up.
+pub fn load_manual_lock() {
+    let stored = crate::database::get_setting(MANUAL_LOCK_KEY);
+    MANUAL_LOCK.store(stored.as_deref() == Some("1"), Ordering::SeqCst);
+}
+
+/// Whether a parent's manual lock is on (as opposed to the lock screen
+/// being up because time ran out) - for `status`, among others.
+pub fn is_manual_lock() -> bool {
+    MANUAL_LOCK.load(Ordering::SeqCst)
+}
+
+/// Start a manual lock: remembered first, then the lock screen shown. Any
+/// thread.
+pub unsafe fn start_manual_lock(text: &str) {
+    MANUAL_LOCK.store(true, Ordering::SeqCst);
+    crate::database::set_setting(MANUAL_LOCK_KEY, "1");
+    show_blocking_overlay(text);
+}
+
+/// End the manual lock, if there is one (see `MANUAL_LOCK` for who calls
+/// this). Doesn't hide the lock screen - the caller decides that. Returns
+/// whether one was on.
+pub fn end_manual_lock() -> bool {
+    let was_on = MANUAL_LOCK.swap(false, Ordering::SeqCst);
+    if was_on {
+        crate::database::set_setting(MANUAL_LOCK_KEY, "0");
+    }
+    was_on
+}
+
+/// Whether the lock screen comes up at startup: a manual lock, or no time
+/// left.
+pub fn lock_screen_due_at_start(manual_lock: bool, remaining: i32) -> bool {
+    manual_lock || remaining <= 0
+}
+
+/// Whether the rollover to a new day takes the lock screen down: the new
+/// day has time and no manual lock is on.
+pub fn rollover_hides_lock_screen(manual_lock: bool, remaining: i32) -> bool {
+    !manual_lock && remaining > 0
+}
+
+/// Whether the accounting tick has to (re)show the lock screen for a manual
+/// lock - in case anything took it down without ending the lock.
+fn manual_lock_needs_showing(manual_lock: bool, overlay_up: bool) -> bool {
+    manual_lock && !overlay_up
+}
+
+/// Every tick: keep the lock screen up while a manual lock is on.
+pub unsafe fn enforce_manual_lock() {
+    if manual_lock_needs_showing(is_manual_lock(), is_blocking_overlay_visible()) {
+        show_blocking_overlay(&crate::database::get_blocking_message());
+    }
+}
+
 /// Shows the full-screen blocking overlay with optional remaining time in seconds.
 /// Safe to call from any thread: the state changes happen here, the window
 /// work on the UI thread (see `WM_APP_SHOW_OVERLAY`).
@@ -408,8 +486,11 @@ fn reduced(current: i32, reduction_seconds: i32) -> i32 {
 /// a bot thread at the same moment. Saved at once: while nothing is counting
 /// (paused, idle, locked) nothing else would save it, and a kill, crash or
 /// update then brought the old value back.
+/// An extension also ends a manual lock (see `MANUAL_LOCK`); the caller
+/// takes the lock screen down.
 pub fn extend_time(minutes: i32) {
     crate::mini_overlay::roll_over_if_due();
+    end_manual_lock();
     let additional_seconds = minutes * 60;
     let _ = REMAINING_SECONDS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
         Some(extended(current, additional_seconds))
@@ -431,10 +512,12 @@ pub fn reduce_time(minutes: i32) {
 }
 
 /// Set the remaining time back to today's full limit (bot `reset`, Stats
-/// "Reset Timer"), saved at once. Returns the limit in seconds.
+/// "Reset Timer"), saved at once. Also ends a manual lock; the caller takes
+/// the lock screen down. Returns the limit in seconds.
 pub fn reset_to_daily_limit() -> i32 {
     use crate::database;
     crate::mini_overlay::roll_over_if_due();
+    end_manual_lock();
     let _serial = LIMIT_CHANGE.lock().unwrap();
     let limit_minutes = database::get_daily_limit(database::get_current_weekday());
     let limit_seconds = minutes_to_secs(limit_minutes);
@@ -472,9 +555,10 @@ fn after_limit_change(current: i32, old_seconds: i32, new_seconds: i32) -> Optio
 }
 
 /// Whether a change to the remaining time takes the lock screen down: time
-/// is left now and it's up because time had run out.
-fn lifts_out_of_time_lock(remaining: i32, overlay_up: bool) -> bool {
-    remaining > 0 && overlay_up
+/// is left now and it's up because time had run out - not for a manual
+/// lock, which only a parent's unlock, extension, reset or passcode ends.
+fn lifts_out_of_time_lock(remaining: i32, overlay_up: bool, manual_lock: bool) -> bool {
+    remaining > 0 && overlay_up && !manual_lock
 }
 
 /// Serializes limit changes (Settings on the UI thread, `setlimit` on a bot
@@ -520,7 +604,11 @@ pub fn reconcile_todays_limit() -> bool {
         unsafe {
             crate::mini_overlay::update_mini_overlay();
             // No time left: the accounting tick locks within a second.
-            if lifts_out_of_time_lock(REMAINING_SECONDS.load(Ordering::SeqCst), is_blocking_overlay_visible()) {
+            if lifts_out_of_time_lock(
+                REMAINING_SECONDS.load(Ordering::SeqCst),
+                is_blocking_overlay_visible(),
+                is_manual_lock(),
+            ) {
                 hide_blocking_overlay();
             }
         }
@@ -645,6 +733,27 @@ unsafe fn check_blocking_passcode() -> bool {
     let attempt = passcode_guard::attempt(&entered);
     PasscodeNotice::after(attempt).set();
     attempt.is_correct()
+}
+
+/// The lock screen's Unlock button (or Enter in the passcode field): with
+/// the right code, end a manual lock and take the lock screen down. Time is
+/// only added if there wasn't any left - a manual lock with time remaining
+/// is just dismissed (as the bot's `unlock` does).
+unsafe fn unlock_with_passcode(hwnd: HWND) {
+    if !check_blocking_passcode() {
+        reject_passcode(hwnd);
+        return;
+    }
+    end_manual_lock();
+    if REMAINING_SECONDS.load(Ordering::SeqCst) <= 0 {
+        extend_time(15);
+        crate::time_request::notify_passcode_extend(
+            "passcode_extend.source.lock_screen",
+            15,
+            REMAINING_SECONDS.load(Ordering::SeqCst),
+        );
+    }
+    hide_blocking_overlay();
 }
 
 /// After a code that didn't unlock: show the notice, clear the field for
@@ -1033,24 +1142,7 @@ pub unsafe extern "system" fn blocking_overlay_proc(
 
             if notification == BN_CLICKED {
                 match id {
-                    ID_UNLOCK_BUTTON => {
-                        if check_blocking_passcode() {
-                            // Only add time if there wasn't any left - if this was a
-                            // manual lock with time still remaining, just dismiss it
-                            // (matches what the !unlock/unlock bot command does).
-                            if REMAINING_SECONDS.load(Ordering::SeqCst) <= 0 {
-                                extend_time(15);
-                                crate::time_request::notify_passcode_extend(
-                                    "passcode_extend.source.lock_screen",
-                                    15,
-                                    REMAINING_SECONDS.load(Ordering::SeqCst),
-                                );
-                            }
-                            hide_blocking_overlay();
-                        } else {
-                            reject_passcode(hwnd);
-                        }
-                    }
+                    ID_UNLOCK_BUTTON => unlock_with_passcode(hwnd),
                     ID_EXTEND_15 | ID_EXTEND_30 | ID_EXTEND_60 => {
                         // Require passcode for extension
                         if check_blocking_passcode() {
@@ -1240,22 +1332,7 @@ pub unsafe extern "system" fn blocking_overlay_proc(
         }
         WM_KEYDOWN => {
             if wparam.0 == VK_RETURN.0 as usize {
-                if check_blocking_passcode() {
-                    // Only add time if there wasn't any left - if this was a
-                    // manual lock with time still remaining, just dismiss it
-                    // (matches what the !unlock/unlock bot command does).
-                    if REMAINING_SECONDS.load(Ordering::SeqCst) <= 0 {
-                        extend_time(15);
-                        crate::time_request::notify_passcode_extend(
-                            "passcode_extend.source.lock_screen",
-                            15,
-                            REMAINING_SECONDS.load(Ordering::SeqCst),
-                        );
-                    }
-                    hide_blocking_overlay();
-                } else {
-                    reject_passcode(hwnd);
-                }
+                unlock_with_passcode(hwnd);
             }
             LRESULT(0)
         }
@@ -1872,7 +1949,7 @@ mod tests {
         day.remaining = 0; // out of time, locked
         day.set_limit(90);
         assert_eq!(day.mins(), 30);
-        assert!(lifts_out_of_time_lock(day.remaining, true));
+        assert!(lifts_out_of_time_lock(day.remaining, true, false));
     }
 
     #[test]
@@ -1881,10 +1958,35 @@ mod tests {
         day.remaining -= 10 * 60;
         day.set_limit(0);
         assert_eq!(day.remaining, 0, "the tick locks");
-        assert!(!lifts_out_of_time_lock(day.remaining, true));
+        assert!(!lifts_out_of_time_lock(day.remaining, true, false));
         // Raising it again starts from that 0
         day.set_limit(30);
         assert_eq!(day.mins(), 30);
+    }
+
+    #[test]
+    fn a_bedtime_lock_with_time_left_comes_back_at_every_start() {
+        // `lock` at 21:00 with 40 minutes left; then the lock screen's Shut
+        // Down button, its countdown, a kill or an update, and a new start.
+        assert!(lock_screen_due_at_start(true, 40 * 60));
+        // ...and after midnight, with a fresh day's time
+        assert!(lock_screen_due_at_start(true, 120 * 60));
+        assert!(!rollover_hides_lock_screen(true, 120 * 60), "kept up at the rollover");
+        // Without a manual lock, as before: up only with no time left
+        assert!(!lock_screen_due_at_start(false, 40 * 60));
+        assert!(lock_screen_due_at_start(false, 0));
+        assert!(rollover_hides_lock_screen(false, 120 * 60));
+        assert!(!rollover_hides_lock_screen(false, 0), "a 0-minute day stays locked");
+    }
+
+    #[test]
+    fn a_manual_lock_is_kept_up_until_a_parent_ends_it() {
+        assert!(manual_lock_needs_showing(true, false), "taken down by anything else: back up");
+        assert!(!manual_lock_needs_showing(true, true));
+        assert!(!manual_lock_needs_showing(false, false));
+        // Raising the limit lifts an out-of-time lock, not a manual one
+        assert!(lifts_out_of_time_lock(1800, true, false));
+        assert!(!lifts_out_of_time_lock(1800, true, true));
     }
 
     #[test]

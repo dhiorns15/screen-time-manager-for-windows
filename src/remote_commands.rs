@@ -594,8 +594,9 @@ pub fn cmd_reset() -> String {
 pub fn cmd_lock() -> String {
     let message = database::get_blocking_message();
 
+    // Remembered until a parent ends it (see blocking::MANUAL_LOCK)
     unsafe {
-        blocking::show_blocking_overlay(&message);
+        blocking::start_manual_lock(&message);
     }
 
     format!("🔒 {}", i18n::t("tg.lock.success"))
@@ -606,6 +607,9 @@ pub fn cmd_lock() -> String {
 /// actually run out, since dismissing with 0 remaining would leave the
 /// countdown timer stopped with nothing left to re-trigger the lock screen.
 pub fn cmd_unlock() -> String {
+    // Ends a manual lock in every case; with no time left the out-of-time
+    // lock stays, as before.
+    blocking::end_manual_lock();
     if !blocking::is_blocking_overlay_visible() {
         return i18n::t("tg.unlock.not_locked").to_string();
     }

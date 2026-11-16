@@ -20,7 +20,10 @@ use windows::{
     },
 };
 
-use crate::blocking::{extend_time, get_remaining_seconds, hide_blocking_overlay, show_blocking_overlay, BLOCKING_HWND};
+use crate::blocking::{
+    extend_time, get_remaining_seconds, hide_blocking_overlay, is_blocking_overlay_visible, show_blocking_overlay,
+    BLOCKING_HWND,
+};
 use crate::constants::*;
 use crate::database::{get_blocking_message, get_warning_config, is_pause_enabled};
 use crate::dialogs::{show_settings_dialog, show_stats_dialog, verify_passcode_for_action, PasscodeAction};
@@ -320,7 +323,12 @@ pub unsafe extern "system" fn window_proc(
                 }
                 IDM_EXTEND_15 => {
                     if verify_passcode_for_action(hwnd, PasscodeAction::Extend15) {
+                        // Saved at once; ends a manual lock, so the lock
+                        // screen goes too (see blocking::extend_time)
                         extend_time(15);
+                        if is_blocking_overlay_visible() {
+                            hide_blocking_overlay();
+                        }
                         crate::time_request::notify_passcode_extend(
                             "passcode_extend.source.tray_menu",
                             15,
@@ -331,6 +339,9 @@ pub unsafe extern "system" fn window_proc(
                 IDM_EXTEND_45 => {
                     if verify_passcode_for_action(hwnd, PasscodeAction::Extend45) {
                         extend_time(45);
+                        if is_blocking_overlay_visible() {
+                            hide_blocking_overlay();
+                        }
                         crate::time_request::notify_passcode_extend(
                             "passcode_extend.source.tray_menu",
                             45,
