@@ -118,19 +118,28 @@ Right-click the tray icon and select "Today's Stats..." to see:
 You can monitor and control screen time from your phone using Telegram. This is useful when you're not near the computer.
 
 **What you can do from Telegram:**
-- `/status` - Check remaining time and pause status
+- `/status` - Check remaining time and whether the timer is running, paused or stopped
 - `/time` - Quick time check
-- `/extend 30` - Add extra time (e.g., 30 minutes)
+- `/extend 30` - Add extra time (e.g., 30 minutes; up to 120 at a time). `/e30`, `/e60` and `/e120` are shortcuts
+- `/reduce 30` - Take time away (up to 120 minutes at a time)
+- `/reset` - Set the remaining time back to today's full limit
+- `/lock` (or `/stop`) - Show the lock screen now
 - `/unlock` - Dismiss the lock screen without changing remaining time (only works if there's still time left)
 - `/pause` - Pause the timer
 - `/resume` - Resume the timer
 - `/history` - See today's pause activity
+- `/weekly` - A table of the last two weeks' use, for every account on the PC
+- `/msg Dinner is ready!` - Show a message on the screen for a few seconds. Any text you send that isn't a command does the same
 - `/setmessage Time for a break!` - Change the blocking screen message remotely
 - `/setpin 1234` - Change the passcode remotely
 - `/setlimit 90` or `/setlimit saturday 180` - Change the daily time limit remotely (today, or a specific day)
 - `/rotatingpin on` and `/getpin` - Optional auto-rotating daily code (see below)
 - `/update` - Install a new version of the app, after the bot tells you one is out (see [Updating](#updating))
 - `/clearlockout` - Let the next passcode be checked straight away after too many wrong codes locked passcode entry
+- `/chatid` - Show this chat's ID (works before the bot is set up)
+- `/help` - See all commands
+
+Command names don't care about upper or lower case (`/Extend 30` works too). Replies to commands that change or read the timer, limits or lock screen say which Windows account they acted on.
 
 **Setup (one-time):**
 
@@ -146,7 +155,7 @@ The bot starts as soon as you save. Once configured, only you can control the bo
 
 The Setup Wizard takes the chat from the first message the bot receives while the wizard is waiting for it, so send that message after you reach that step - anything sent to the bot earlier is ignored.
 
-Commands are acted on only if they reach the PC within a few minutes. Anything you sent while the PC was off, asleep or offline is dropped when it comes back, rather than suddenly running then - for whichever account happens to be signed in by that time. Send the command again once the PC is on.
+Commands are acted on only if they reach the PC within a few minutes. Anything you sent while the PC was off, asleep or offline is dropped when it comes back, rather than suddenly running then - for whichever account happens to be signed in by that time. Send the command again once the PC is on. The same goes for a command sent in the few seconds while the app restarts or the PC switches to another account (on Telegram and Discord alike): it gets no reply, so if you don't get one, send it again.
 
 **Note:** the bot token/chat ID - like the passcode and rotating PIN - are stored machine-wide (shared across every Windows account on the PC, unlike time limits, which are per-account) - set it up once and it works no matter which child's account is running the app. Setup gives every account access to the shared settings folder; a copy of the app that wasn't installed with setup silently falls back to per-account storage instead.
 
@@ -157,20 +166,28 @@ Commands are acted on only if they reach the PC within a few minutes. Anything y
 You can also monitor and control screen time from a Discord channel, using a Discord bot instead of Telegram.
 
 **What you can do from Discord:**
-- `!status` - Check remaining time and pause status
+- `!status` - Check remaining time and whether the timer is running, paused or stopped
 - `!time` - Quick time check
-- `!extend 30` - Add extra time (e.g., 30 minutes)
+- `!extend 30` - Add extra time (e.g., 30 minutes; up to 120 at a time). `!e30`, `!e60` and `!e120` are shortcuts
+- `!reduce 30` - Take time away (up to 120 minutes at a time)
+- `!reset` - Set the remaining time back to today's full limit
+- `!lock` (or `!stop`) - Show the lock screen now
 - `!unlock` - Dismiss the lock screen without changing remaining time (only works if there's still time left)
 - `!pause` - Pause the timer
 - `!resume` - Resume the timer
 - `!history` - See today's pause activity
+- `!weekly` - A table of the last two weeks' use, for every account on the PC
+- `!msg Dinner is ready!` - Show a message on the screen for a few seconds
 - `!setmessage Time for a break!` - Change the blocking screen message remotely
 - `!setpin 1234` - Change the passcode remotely
 - `!setlimit 90` or `!setlimit saturday 180` - Change the daily time limit remotely (today, or a specific day)
 - `!rotatingpin on` and `!getpin` - Optional auto-rotating daily code (see below)
 - `!update` - Install a new version of the app, after the bot tells you one is out (see [Updating](#updating))
 - `!clearlockout` - Let the next passcode be checked straight away after too many wrong codes locked passcode entry
+- `!whoami` - Show your Discord user ID (works before the bot is set up)
 - `!help` - See all commands
+
+As on Telegram, command names don't care about case, and replies to commands that change or read the timer, limits or lock screen say which Windows account they acted on.
 
 **Setup (one-time):**
 
@@ -190,9 +207,9 @@ The bot starts as soon as you save. Once configured, only you can control the bo
 
 ## Requesting More Time From the Lock Screen
 
-If Telegram and/or Discord is enabled, the lock screen shows a **"Request More Time"** button that doesn't need the passcode. Your child can optionally type a short reason (e.g. "saving my game"), then click it to ping you directly - the message includes their Windows account, remaining time, and the reason if given. Reply `!extend 30` (Discord) or `/extend 30` (Telegram) to grant time, or `!unlock`/`/unlock` to dismiss the screen without changing the timer if there's still time left - either one closes the lock screen automatically. The button has a 5-minute cooldown to prevent spamming.
+If Telegram and/or Discord is enabled, the lock screen shows a **"Request More Time"** button that doesn't need the passcode. Your child can optionally type a short reason (e.g. "saving my game"), then click it to ping you directly - the message includes their Windows account, remaining time, and the reason if given. Reply `!extend 30` (Discord) or `/extend 30` (Telegram) to grant time, or `!unlock`/`/unlock` to dismiss the screen without changing the timer if there's still time left - either one closes the lock screen automatically. The button has a 5-minute cooldown to prevent spamming, and while a request is still unanswered, pressing it again sends you a reminder at most every 15 minutes. If the PC is offline at that moment, the request is sent once it's back online, like the alerts below. The reason is shown exactly as typed: it can't ping anyone or show links or formatting on Discord.
 
-If both Telegram and Discord are enabled, the request goes to both, but only one reply is needed - whichever one you respond from first, the other gets a short "already handled" notice so you don't have to reply twice.
+If both Telegram and Discord are enabled, the request goes to both, but only one reply is needed - whichever one you respond from first, the other gets a short "already handled" notice so you don't have to reply twice. A request counts as unanswered for an hour (and not past midnight); time you grant after that doesn't send the notice.
 
 **Passcode alerts:** if Telegram and/or Discord is enabled, using the passcode to add time - either on the lock screen or via the tray icon's right-click menu - sends you a notification too. This is separate from the request flow above, so you find out any time the passcode grants time, whether or not anyone asked first.
 
@@ -216,7 +233,7 @@ Other alerts you may get:
 - **Clock or time zone changed** - changing the PC's clock or time zone doesn't start a new day with a fresh allowance: the app stays on the day it was on, and tells you. If you changed the time zone on purpose (say, you're travelling with the laptop), open Settings and click Save to accept it.
 - **Damaged settings** - if an account's settings file can't be opened, the app doesn't stop: a damaged file is set aside and replaced with default settings (re-check the limits for that account), and if the file can't be opened at all the app runs on default settings until it can. Either way you're told. The time already used today is carried over, so this doesn't start the day's allowance over.
 
-If the PC is offline when an alert is raised, it's kept and sent once the connection is back (anything more than a day old is dropped).
+If the PC is offline when an alert is raised, it's kept and sent once the connection is back (anything more than a day old is dropped). The same goes for the passcode alerts above, the "out of screen time" notice, a time request and a stalled update. Notices that only matter at the moment they happen - low time, idle, the screen being locked or unlocked - are only sent if the bot is connected right then.
 
 ---
 
