@@ -32,6 +32,10 @@ pub static MINI_OVERLAY_VISIBLE: AtomicBool = AtomicBool::new(false);
 pub static IS_PAUSED: AtomicBool = AtomicBool::new(false);
 pub static PAUSE_START_TIMESTAMP: AtomicI64 = AtomicI64::new(0);
 pub static CURRENT_PAUSE_DURATION: AtomicI32 = AtomicI32::new(0);
+/// The current pause's maximum (`get_max_pause_duration`) as last worked
+/// out by the tick, for the mini overlay's WM_PAINT - which used to work it
+/// out itself, looking up today's date in the database on every repaint.
+static PAUSE_MAX_SECONDS: AtomicI32 = AtomicI32::new(0);
 pub static SESSION_ACTIVE_SECONDS: AtomicI32 = AtomicI32::new(0);
 
 // Idle detection state (independent from manual pause)
@@ -346,6 +350,7 @@ fn pause_timer() {
     let timestamp = database::get_current_timestamp();
     PAUSE_START_TIMESTAMP.store(timestamp, Ordering::SeqCst);
     CURRENT_PAUSE_DURATION.store(0, Ordering::SeqCst);
+    PAUSE_MAX_SECONDS.store(get_max_pause_duration(), Ordering::SeqCst);
     IS_PAUSED.store(true, Ordering::SeqCst);
 
     // Update display immediately
@@ -366,12 +371,13 @@ fn resume_timer() {
     }
     let pause_duration = CURRENT_PAUSE_DURATION.swap(0, Ordering::SeqCst);
 
-    // Update total pause used today
-    let total_used = database::get_pause_used_today() + pause_duration;
-    database::save_pause_used_today(total_used);
-
-    // Log the pause event
-    database::log_pause_event(pause_duration);
+    // Count it, and log it, under one date: today's when it ends. (A pause
+    // that spans midnight is counted against the new day as a whole, as
+    // before; the log used to put it under the raw local date instead.)
+    let date = database::effective_today_date();
+    let total_used = database::get_pause_used_for(&date) + pause_duration;
+    database::save_pause_used_for(&date, total_used);
+    database::log_pause_event_for(&date, pause_duration);
 
     // Save last pause end timestamp
     let timestamp = database::get_current_timestamp();
@@ -712,7 +718,9 @@ fn accrue_pause(secs: i32) {
         return;
     }
     let prev = CURRENT_PAUSE_DURATION.load(Ordering::SeqCst);
-    let (duration, ends) = pause_step(prev, secs, get_max_pause_duration());
+    let max = get_max_pause_duration();
+    PAUSE_MAX_SECONDS.store(max, Ordering::SeqCst);
+    let (duration, ends) = pause_step(prev, secs, max);
     CURRENT_PAUSE_DURATION.store(duration, Ordering::SeqCst);
 
     if ends {
@@ -853,7 +861,7 @@ pub unsafe extern "system" fn mini_overlay_proc(
             let (display_text, color) = if paused {
                 // Show pause indicator and remaining pause time
                 let pause_duration = CURRENT_PAUSE_DURATION.load(Ordering::SeqCst);
-                let max_duration = get_max_pause_duration();
+                let max_duration = PAUSE_MAX_SECONDS.load(Ordering::SeqCst);
                 let pause_remaining = max_duration - pause_duration;
 
                 // Format: "II 0:45" (pause symbol + remaining pause time)

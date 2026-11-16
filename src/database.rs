@@ -928,11 +928,33 @@ fn load_clock_anchor() -> Option<ClockAnchor> {
     })
 }
 
-fn store_clock_anchor(anchor: &ClockAnchor) {
-    set_setting(CLOCK_ANCHOR_WALL_KEY, &anchor.wall_secs.to_string());
-    set_setting(CLOCK_ANCHOR_TICK_KEY, &anchor.tick_ms.to_string());
-    set_setting(CLOCK_ANCHOR_DATE_KEY, &anchor.date);
-    set_setting(CLOCK_ANCHOR_LOGON_KEY, &anchor.logon_token.map(|t| t.to_string()).unwrap_or_default());
+/// The settings rows that store `anchor`.
+fn clock_anchor_rows(anchor: &ClockAnchor) -> Vec<(&'static str, String)> {
+    vec![
+        (CLOCK_ANCHOR_WALL_KEY, anchor.wall_secs.to_string()),
+        (CLOCK_ANCHOR_TICK_KEY, anchor.tick_ms.to_string()),
+        (CLOCK_ANCHOR_DATE_KEY, anchor.date.clone()),
+        (CLOCK_ANCHOR_LOGON_KEY, anchor.logon_token.map(|t| t.to_string()).unwrap_or_default()),
+    ]
+}
+
+/// How long an accepted anchor may go without being rewritten. Below the
+/// accounting tick's 30-second periodic check, so that check still
+/// refreshes it; far below `CLOCK_DRIFT_TOLERANCE_SECS`, so comparing with
+/// an anchor this old reaches the same verdict as with a fresh one.
+const ANCHOR_REWRITE_MS: i64 = 25_000;
+
+/// Whether the accepted anchor `new` must be written over `stored`: always
+/// when the date or the logon session changed (or there's none stored, or
+/// the tick went backwards), otherwise only once the stored one is
+/// `ANCHOR_REWRITE_MS` old. While paused the date is looked up about twice a
+/// second, and every lookup used to rewrite the anchor.
+fn anchor_needs_write(stored: Option<&ClockAnchor>, new: &ClockAnchor) -> bool {
+    let Some(stored) = stored else { return true };
+    stored.date != new.date
+        || stored.logon_token != new.logon_token
+        || new.tick_ms < stored.tick_ms
+        || new.tick_ms - stored.tick_ms >= ANCHOR_REWRITE_MS
 }
 
 fn load_clock_tamper() -> ClockTamper {
@@ -943,18 +965,38 @@ fn load_clock_tamper() -> ClockTamper {
     }
 }
 
-/// Write the parts of `new` that differ from `old` (what's stored now).
-fn store_clock_tamper(old: &ClockTamper, new: &ClockTamper) {
-    let flag = |on: bool| if on { "1" } else { "0" };
+/// The rows for the parts of `new` that differ from `old` (what's stored now).
+fn clock_tamper_rows(old: &ClockTamper, new: &ClockTamper) -> Vec<(&'static str, String)> {
+    let flag = |on: bool| if on { "1" } else { "0" }.to_string();
+    let mut rows = Vec::new();
     if new.active != old.active {
-        set_setting(CLOCK_TAMPER_ACTIVE_KEY, flag(new.active));
+        rows.push((CLOCK_TAMPER_ACTIVE_KEY, flag(new.active)));
     }
     if new.alerted != old.alerted {
-        set_setting(CLOCK_TAMPER_ALERTED_KEY, flag(new.alerted));
+        rows.push((CLOCK_TAMPER_ALERTED_KEY, flag(new.alerted)));
     }
     if let Some(drift) = new.drift_secs.filter(|_| new.drift_secs != old.drift_secs) {
-        set_setting(CLOCK_TAMPER_DRIFT_KEY, &drift.to_string());
+        rows.push((CLOCK_TAMPER_DRIFT_KEY, drift.to_string()));
     }
+    rows
+}
+
+/// Write several settings rows in one transaction: all of them or none.
+fn set_settings(rows: &[(&str, String)]) -> bool {
+    if rows.is_empty() {
+        return true;
+    }
+    let Ok(mut guard) = DB_CONNECTION.lock() else { return false };
+    let Some(conn) = guard.as_mut() else { return false };
+    set_settings_in(conn, rows).is_ok()
+}
+
+fn set_settings_in(conn: &mut Connection, rows: &[(&str, String)]) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+    for (key, value) in rows {
+        tx.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)", params![key, value])?;
+    }
+    tx.commit()
 }
 
 /// The date to use for all "today"-scoped enforcement state (remaining time,
@@ -987,11 +1029,16 @@ pub fn effective_today_date() -> String {
         logon_token: crate::session::logon_token().filter(|&t| t != 0),
     };
     let tamper = load_clock_tamper();
-    let check = check_clock(load_clock_anchor().as_ref(), tamper, now, &today);
-    if let Some(anchor) = &check.anchor {
-        store_clock_anchor(anchor);
-    }
-    store_clock_tamper(&tamper, &check.tamper);
+    let stored = load_clock_anchor();
+    let check = check_clock(stored.as_ref(), tamper, now, &today);
+    // One transaction, so a kill can't leave half an anchor behind (say the
+    // new wall time with the old tick, which reads as the clock moved).
+    let mut rows = match &check.anchor {
+        Some(anchor) if anchor_needs_write(stored.as_ref(), anchor) => clock_anchor_rows(anchor),
+        _ => Vec::new(),
+    };
+    rows.extend(clock_tamper_rows(&tamper, &check.tamper));
+    set_settings(&rows);
     check.date
 }
 
@@ -1117,19 +1164,22 @@ pub fn get_pause_config() -> PauseConfig {
 
 /// Get pause time used today (in seconds)
 pub fn get_pause_used_today() -> i32 {
-    let date = effective_today_date();
+    get_pause_used_for(&effective_today_date())
+}
+
+/// Pause time used on `date` (in seconds)
+pub fn get_pause_used_for(date: &str) -> i32 {
     let key = format!("pause_used_{}", date);
     get_setting(&key)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0)
 }
 
-/// Save pause time used today (in seconds)
-pub fn save_pause_used_today(seconds: i32) {
-    let date = effective_today_date();
+/// Save the pause time used on `date` (in seconds)
+pub fn save_pause_used_for(date: &str, seconds: i32) {
     let key = format!("pause_used_{}", date);
     set_setting(&key, &seconds.to_string());
-    mirror_shared_daily_stat("pause", &date, seconds);
+    mirror_shared_daily_stat("pause", date, seconds);
 }
 
 /// Get timestamp of last pause end (Unix timestamp)
@@ -1170,14 +1220,15 @@ pub fn save_session_active_time(seconds: i32) {
     mirror_shared_daily_stat("active", &date, seconds);
 }
 
-/// Log a pause event for today
-pub fn log_pause_event(duration_seconds: i32) {
+/// Log a pause event under `date` - the date its time was counted under
+/// (`save_pause_used_for`), so the log and the usage always agree. (The log
+/// used the raw local date, while usage follows `effective_today_date`.)
+pub fn log_pause_event_for(date: &str, duration_seconds: i32) {
     use windows::Win32::System::SystemInformation::GetLocalTime;
 
     let st = unsafe { GetLocalTime() };
     let time_str = format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond);
 
-    let date = get_today_date();
     let key = format!("pause_log_{}", date);
 
     let existing = get_setting(&key).unwrap_or_default();
@@ -1192,9 +1243,9 @@ pub fn log_pause_event(duration_seconds: i32) {
     set_setting(&key, &updated);
 }
 
-/// Get pause log for today
+/// Get pause log for today (the same date as `get_pause_used_today`)
 pub fn get_pause_log_today() -> Vec<String> {
-    let date = get_today_date();
+    let date = effective_today_date();
     let key = format!("pause_log_{}", date);
 
     get_setting(&key)
@@ -1508,7 +1559,7 @@ pub fn restore_today_from_shared_mirror() -> Option<i32> {
     }
 
     save_session_active_time(active);
-    save_pause_used_today(paused);
+    save_pause_used_for(&date, paused);
     let limit_secs = (get_daily_limit(get_current_weekday()) * 60) as i32;
     let remaining = remaining_after_use(limit_secs, active);
     save_remaining_time(remaining);
@@ -2298,6 +2349,64 @@ mod clock_anchor_tests {
             self.tamper.alerted = true;
             Some(drift)
         }
+
+        /// `today`, but storing an accepted anchor only when
+        /// `anchor_needs_write` says so, as `effective_today_date` does.
+        fn today_lazily(&mut self, now: ClockReading, today: &str) -> String {
+            let check = check_clock(self.anchor.as_ref(), self.tamper, now, today);
+            if let Some(anchor) = check.anchor {
+                if anchor_needs_write(self.anchor.as_ref(), &anchor) {
+                    self.anchor = Some(anchor);
+                }
+            }
+            self.tamper = check.tamper;
+            check.date
+        }
+    }
+
+    #[test]
+    fn the_anchor_is_rewritten_only_when_it_matters() {
+        let token = logon_at(secs(2026, 11, 16, 7, 0, 0));
+        let stored = anchor(1_000, 60_000, "2026-11-16", token);
+        let same = |tick_ms: i64| anchor(1_000 + (tick_ms - 60_000) / 1000, tick_ms, "2026-11-16", token);
+        assert!(anchor_needs_write(None, &same(60_500)));
+        assert!(!anchor_needs_write(Some(&stored), &same(60_500)), "half a second later");
+        assert!(!anchor_needs_write(Some(&stored), &same(60_000 + ANCHOR_REWRITE_MS - 1)));
+        assert!(anchor_needs_write(Some(&stored), &same(60_000 + ANCHOR_REWRITE_MS)));
+        assert!(anchor_needs_write(Some(&stored), &anchor(1_001, 61_000, "2026-11-17", token)), "new date");
+        assert!(anchor_needs_write(Some(&stored), &anchor(1_001, 61_000, "2026-11-16", logon_at(5))), "new session");
+        assert!(anchor_needs_write(Some(&stored), &anchor(1_001, 59_000, "2026-11-16", token)), "tick went back");
+    }
+
+    #[test]
+    fn rewriting_the_anchor_less_often_reaches_the_same_dates() {
+        // A paused afternoon (a check every half second), then the clock is
+        // moved forward a day mid-session, then moved back.
+        let token = logon_at(secs(2026, 11, 16, 7, 0, 0));
+        let start = secs(2026, 11, 16, 23, 50, 0);
+        let mut eager = Stored::default();
+        let mut lazy = Stored::default();
+        let mut moved = 0;
+        for step in 0..4_000i64 {
+            let tick_ms = 3_600_000 + step * 500;
+            if step == 1_000 {
+                moved = DAY;
+            }
+            if step == 3_000 {
+                moved = 0;
+            }
+            let wall = start + step / 2 + moved;
+            let (y, m, d) = civil_from_days(wall.div_euclid(DAY));
+            let today = format!("{y:04}-{m:02}-{d:02}");
+            let now = reading(wall, tick_ms, token);
+            assert_eq!(lazy.today_lazily(now, &today), eager.today(now, &today), "step {step}");
+            // The same alerts; the drift they report may differ by the
+            // second lost to rounding over an older anchor.
+            match (lazy.take_alert(), eager.take_alert()) {
+                (Some(a), Some(b)) => assert!((a - b).abs() <= 1, "step {step}: {a} vs {b}"),
+                (a, b) => assert_eq!(a, b, "step {step}"),
+            }
+        }
     }
 
     const DAY: i64 = 86_400;
@@ -2592,6 +2701,29 @@ mod tests {
         assert_eq!(clamp_lock_screen_timeout(-600), 60);
         assert_eq!(clamp_lock_screen_timeout(i32::MIN), 60, "negative never means \"never\"");
         assert_eq!(clamp_lock_screen_timeout(i32::MAX), i32::MAX);
+    }
+
+    #[test]
+    fn settings_rows_are_written_all_or_nothing() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)", []).unwrap();
+        let read = |conn: &Connection, key: &str| -> Option<String> {
+            conn.query_row("SELECT value FROM settings WHERE key = ?1", params![key], |r| r.get(0)).ok()
+        };
+
+        set_settings_in(&mut conn, &[("a", "1".into()), ("b", "2".into())]).unwrap();
+        assert_eq!(read(&conn, "a").as_deref(), Some("1"));
+        assert_eq!(read(&conn, "b").as_deref(), Some("2"));
+
+        // A failure part-way (here, a trigger refusing the second row)
+        // leaves nothing written.
+        conn.execute(
+            "CREATE TRIGGER fail_on_c BEFORE INSERT ON settings WHEN NEW.key = 'c' BEGIN SELECT RAISE(ABORT, 'no'); END",
+            [],
+        )
+        .unwrap();
+        assert!(set_settings_in(&mut conn, &[("a", "9".into()), ("c", "3".into())]).is_err());
+        assert_eq!(read(&conn, "a").as_deref(), Some("1"), "the first row was rolled back");
     }
 
     #[test]
