@@ -17,11 +17,20 @@
 
   ExecutionTimeLimit PT0S means no limit: the app runs for the whole session. RestartOnFailure
   brings it back after a crash; the watchdog task covers it being killed.
+
+  SecurityDescriptor: Administrators and SYSTEM get full access; BUILTIN\Users get read and execute
+  (FRFX) only, as for task-update.xml. The watchdog runs with the signed-in account's non-elevated
+  token and relaunches the app by running this task, which needs execute access; without it (the
+  default descriptor gives Users read only) the relaunch fails with "Access is denied", which is
+  what happened in 1.0.1. Users still can't change, disable or delete it. Setup passes the same
+  string to RegisterTask and sets it on the task afterwards as well, so an existing task gets it
+  too.
 -->
 <Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Description>Screen Time Manager - Manages daily computer time limits</Description>
     <URI>\ScreenTimeManager</URI>
+    <SecurityDescriptor>D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FRFX;;;BU)</SecurityDescriptor>
   </RegistrationInfo>
   <Principals>
     <Principal id="Users">

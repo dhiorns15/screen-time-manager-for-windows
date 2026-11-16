@@ -9,7 +9,9 @@
 ; only the tests use, to have an update to install.
 ;
 ; The scheduled tasks, from the task-*.xml templates next to this script:
-;   ScreenTimeManager          starts the app at every sign-in, for every account
+;   ScreenTimeManager          starts the app at every sign-in, for every account; standard users may
+;                              start it (the watchdog relaunches the app through it), but not change
+;                              or delete it
 ;   ScreenTimeManagerWatchdog  every minute, relaunches the app if it was killed and sends a tamper alert
 ;   ScreenTimeManagerUpdate    on demand, runs `screen-time-manager.exe --update` as SYSTEM; standard
 ;                              users may start it, but not change or delete it
@@ -45,7 +47,8 @@
 #define MainTask "ScreenTimeManager"
 #define WatchdogTask "ScreenTimeManagerWatchdog"
 #define UpdateTask "ScreenTimeManagerUpdate"
-; Must match the SecurityDescriptor in task-update.xml; see there.
+; Must match the SecurityDescriptor in task-main.xml and task-update.xml; see there.
+#define MainTaskSddl "D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FRFX;;;BU)"
 #define UpdateTaskSddl "D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FRFX;;;BU)"
 
 [Setup]
@@ -247,15 +250,30 @@ end;
 
 // Registers (or replaces in place) a task. Replacing also takes over the tasks of the same names
 // that install.ps1 registered, whatever folder they ran the exe from. No user or password is
-// passed, so the template's principal is used; the logon type passed matches it.
-procedure RegisterTaskXml(Folder: Variant; const Name, Xml: String; LogonType: Integer; Sddl: Variant);
+// passed, so the template's principal is used; the logon type passed matches it. Sddl, if not '',
+// is the task's security descriptor.
+procedure RegisterTaskXml(Folder: Variant; const Name, Xml: String; LogonType: Integer; const Sddl: String);
 var
-  Task: Variant;
+  Task, SddlArg: Variant;
 begin
-  Task := Folder.RegisterTask(Name, Xml, TASK_CREATE_OR_UPDATE, Unassigned, Unassigned, LogonType, Sddl);
+  if Sddl = '' then
+    SddlArg := Unassigned
+  else
+    SddlArg := Sddl;
+  Task := Folder.RegisterTask(Name, Xml, TASK_CREATE_OR_UPDATE, Unassigned, Unassigned, LogonType, SddlArg);
+  // Set again on the registered task: replacing a task that already exists isn't documented to
+  // replace its descriptor, and an upgrade from 1.0.1 must give the main task its new one (standard
+  // users couldn't run it, so the watchdog couldn't relaunch the app).
+  if Sddl <> '' then
+    Task.SetSecurityDescriptor(Sddl, 0);
   // A task replaced in place keeps being disabled otherwise (PauseTask).
   Task.Enabled := True;
   Log('Registered task ' + Name + ' for ' + InstalledExe);
+  try
+    Log('Task ' + Name + ' security: ' + Task.GetSecurityDescriptor(4));
+  except
+    Log('Could not read the security of task ' + Name + ': ' + GetExceptionMessage);
+  end;
 end;
 
 // Whether the update task is running and already as task-update.xml would register it: the same
@@ -289,8 +307,8 @@ var
   UpdateXml: String;
 begin
   Folder := TaskFolder;
-  RegisterTaskXml(Folder, '{#MainTask}', TaskXml('task-main.xml'), TASK_LOGON_GROUP, Unassigned);
-  RegisterTaskXml(Folder, '{#WatchdogTask}', TaskXml('task-watchdog.xml'), TASK_LOGON_GROUP, Unassigned);
+  RegisterTaskXml(Folder, '{#MainTask}', TaskXml('task-main.xml'), TASK_LOGON_GROUP, '{#MainTaskSddl}');
+  RegisterTaskXml(Folder, '{#WatchdogTask}', TaskXml('task-watchdog.xml'), TASK_LOGON_GROUP, '');
   // Never ended or deleted during install: when the app's updater started this setup, setup may be
   // running inside this task's job, and ending the task would end setup with it. It's replaced in
   // place, and while it's running only if its definition changed.

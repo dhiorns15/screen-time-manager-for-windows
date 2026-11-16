@@ -9,7 +9,8 @@
   (FRFX) only. Task Scheduler needs read access to open a task and execute access to run it, and
   write/delete access to change, disable or delete it, so a standard user can start an update but
   can't point the task elsewhere, disable it or remove it. Setup passes the same string to
-  RegisterTask as well, since a descriptor given there supersedes this one.
+  RegisterTask as well, since a descriptor given there supersedes this one, and sets it on the task
+  afterwards so a task that already existed gets it too.
 
   IgnoreNew: one update at a time. The time limit is generous for a slow download plus setup.
 

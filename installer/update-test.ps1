@@ -56,7 +56,21 @@ for ($i = 0; $i -lt 300; $i++) {
                 Get-ScheduledTask -TaskName $_ -ErrorAction SilentlyContinue | Where-Object { $_.State -ne 'Disabled' }
             })
         if ($tasks.Count -ne 3) { throw "Updated to $current, but only $($tasks.Count) of the 3 scheduled tasks are registered and enabled" }
-        "Updated $previous to $current through the update task"
+        # Up to 1.0.1 the main task let standard accounts read it but not run it, so the watchdog
+        # (which runs non-elevated) couldn't relaunch the app; the update must replace that.
+        $service = New-Object -ComObject Schedule.Service
+        $service.Connect()
+        $sddl = $service.GetFolder('\').GetTask('ScreenTimeManager').GetSecurityDescriptor(4)
+        $granted = 0
+        foreach ($ace in (New-Object Security.AccessControl.RawSecurityDescriptor $sddl).DiscretionaryAcl) {
+            # Everyone, Authenticated Users, Interactive, Users.
+            if ([string]$ace.AceQualifier -eq 'AccessAllowed' -and @('S-1-1-0', 'S-1-5-11', 'S-1-5-4', 'S-1-5-32-545') -contains $ace.SecurityIdentifier.Value) {
+                $granted = $granted -bor $ace.AccessMask
+            }
+        }
+        # FILE_READ_DATA and FILE_EXECUTE.
+        if (($granted -band 0x21) -ne 0x21) { throw "Updated to $current, but standard accounts still can't run the ScreenTimeManager task: $sddl" }
+        "Updated $previous to $current through the update task; ScreenTimeManager task security: $sddl"
         exit 0
     }
 }

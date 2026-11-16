@@ -1,8 +1,12 @@
 # Installs Screen Time Manager with the built setup and checks the install: the exe, the three
-# scheduled tasks, the shared config folder's permissions and the update marker. Then it reinstalls
-# as SYSTEM over a running copy, checks the update task can be started by an administrator and by a
-# standard account (which must not be able to disable or delete any task), updates through the
-# app's own updater from a fake release served on localhost, and uninstalls.
+# scheduled tasks (and that standard accounts may run the main and update tasks but not change
+# them), the shared config folder's permissions and the update marker. Then it reinstalls as SYSTEM
+# over a running copy (which must replace a 1.0.1-style descriptor on the main task), checks the
+# update task can be started by an administrator, and the update and main tasks by a standard
+# account (which must not be able to disable or delete any task), updates through the app's own
+# updater from a fake release served on localhost, checks the installed watchdog brings the app
+# back after that update and after a kill (when the runner has a signed-in session for it to run
+# in), and uninstalls.
 #
 #   installer\build.ps1 -Bin ..\target\debug
 #   installer\smoke-test.ps1 [-Bin ..\target\debug]
@@ -57,6 +61,69 @@ function InstalledVersion {
 
 function AppProcesses {
     @(Get-Process screen-time-manager -ErrorAction SilentlyContinue)
+}
+
+# The app itself (not a --watchdog-check or --update run) in session $Session.
+function AppInSession([int]$Session) {
+    @(Get-CimInstance Win32_Process -Filter "Name = 'screen-time-manager.exe'" | Where-Object {
+            $_.SessionId -eq $Session -and $_.CommandLine -notmatch '--watchdog-check|--update'
+        })
+}
+
+# One line per running screen-time-manager.exe: pid, session, account, arguments.
+function AppProcessSummary {
+    $procs = @(Get-CimInstance Win32_Process -Filter "Name = 'screen-time-manager.exe'")
+    if (!$procs.Count) { return 'no screen-time-manager.exe running' }
+    ($procs | ForEach-Object {
+            $owner = Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction SilentlyContinue
+            "pid $($_.ProcessId) session $($_.SessionId) $($owner.Domain)\$($owner.User) [$($_.CommandLine)]"
+        }) -join '; '
+}
+
+# This account's watchdog.log lines written at or after $Since (each starts with [unix seconds]).
+function WatchdogLogSince([datetime]$Since) {
+    $log = "$userDataDir\watchdog.log"
+    if (!(Test-Path $log)) { return @() }
+    $from = ([DateTimeOffset]$Since).ToUnixTimeSeconds() - 1
+    @(Get-Content $log | Where-Object { $_ -match '^\[(\d+)\]' -and [int64]$Matches[1] -ge $from })
+}
+
+# Waits for the installed watchdog task, by itself, to bring the app back in this runner's session
+# after $Since, and checks that it survives the watchdog run that started it (1.0.1's fallback
+# started it as a child of that run, which ended it). $LogPattern must match the watchdog.log line
+# for the relaunch. Returns $false if the watchdog task never ran here, so this can't be checked.
+function CheckWatchdogRelaunch([int]$Session, [datetime]$Since, [string]$LogPattern, [string]$What) {
+    $deadline = (Get-Date).AddSeconds(180)
+    $app = $null
+    while (!$app -and (Get-Date) -lt $deadline) {
+        $app = @(AppInSession $Session) | Select-Object -First 1
+        if (!$app) { Start-Sleep 2 }
+    }
+    if (!$app) {
+        if ((Get-ScheduledTaskInfo -TaskName $watchdogTask).LastRunTime -lt $Since) { return $false }
+        ShowFile "$userDataDir\watchdog.log"
+        throw "$What`: the watchdog ran but the app was not running in session $Session 3 minutes later ($(AppProcessSummary))"
+    }
+    # The watchdog checks that started before the app; the one that relaunched it is among them.
+    $started = $app.CreationDate
+    for ($i = 0; $i -lt 90; $i++) {
+        $checks = @(Get-CimInstance Win32_Process -Filter "Name = 'screen-time-manager.exe'" | Where-Object {
+                $_.CommandLine -match '--watchdog-check' -and $_.CreationDate -le $started
+            })
+        if (!$checks.Count) { break }
+        Start-Sleep 1
+    }
+    Start-Sleep 5
+    $still = Get-Process -Id $app.ProcessId -ErrorAction SilentlyContinue
+    if (!$still) { ShowFile "$userDataDir\watchdog.log" }
+    Check ($null -ne $still) "$What`: the app the watchdog started (pid $($app.ProcessId)) was gone once the watchdog run had finished"
+    $parent = Get-CimInstance Win32_Process -Filter "ProcessId = $($app.ParentProcessId)"
+    Check (!$parent -or $parent.Name -ne 'screen-time-manager.exe') "$What`: the app was started as a child of $($parent.CommandLine), not by Task Scheduler"
+    $lines = @(WatchdogLogSince $Since | Where-Object { $_ -match $LogPattern })
+    if (!$lines.Count) { ShowFile "$userDataDir\watchdog.log" }
+    Check ($lines.Count -gt 0) "$What`: watchdog.log has no line matching '$LogPattern' since $Since"
+    "$What`: the watchdog relaunched the app (pid $($app.ProcessId), session $Session, parent $($parent.Name)); it logged: $($lines[-1])" | Out-Host
+    $true
 }
 
 function ShowFile([string]$Path) {
@@ -140,26 +207,39 @@ function TriggersOf($Task, [string]$Class = '') {
     @($Task.Triggers | Where-Object { $null -ne $_ -and (!$Class -or $_.CimClass.CimClassName -eq $Class) })
 }
 
-# The update task's DACL: standard accounts may read and run it, and nothing more.
-function CheckUpdateTaskSecurity {
+function TaskFolder {
     $service = New-Object -ComObject Schedule.Service
     $service.Connect()
-    $sddl = $service.GetFolder('\').GetTask($updateTask).GetSecurityDescriptor(4)
+    $service.GetFolder('\')
+}
+
+# FILE_WRITE_DATA, FILE_APPEND_DATA, FILE_WRITE_EA, FILE_WRITE_ATTRIBUTES, DELETE, WRITE_DAC,
+# WRITE_OWNER, GENERIC_ALL, GENERIC_WRITE: what it takes to change, disable or delete a task.
+$taskWrites = 0x2 -bor 0x4 -bor 0x10 -bor 0x100 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
+# FILE_READ_DATA and FILE_EXECUTE: to open a task and to run it.
+$taskRun = 0x21
+
+# What a task's DACL allows standard accounts (Everyone, Authenticated Users, Interactive, Users).
+function StandardAccountAccess([string]$Name) {
+    $sddl = (TaskFolder).GetTask($Name).GetSecurityDescriptor(4)
     $sd = New-Object Security.AccessControl.RawSecurityDescriptor $sddl
-    # Everyone, Authenticated Users, Interactive, Users.
     $standard = 'S-1-1-0', 'S-1-5-11', 'S-1-5-4', $usersSid
-    # FILE_WRITE_DATA, FILE_APPEND_DATA, FILE_WRITE_EA, FILE_WRITE_ATTRIBUTES, DELETE, WRITE_DAC,
-    # WRITE_OWNER, GENERIC_ALL, GENERIC_WRITE.
-    $writes = 0x2 -bor 0x4 -bor 0x10 -bor 0x100 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
     $granted = 0
     foreach ($ace in $sd.DiscretionaryAcl) {
         if ([string]$ace.AceQualifier -eq 'AccessAllowed' -and $standard -contains $ace.SecurityIdentifier.Value) {
-            Check (($ace.AccessMask -band $writes) -eq 0) "The update task lets $($ace.SecurityIdentifier) change or delete it: $sddl"
             $granted = $granted -bor $ace.AccessMask
         }
     }
-    # FILE_READ_DATA and FILE_EXECUTE: to open the task and to run it.
-    Check (($granted -band 0x21) -eq 0x21) "The update task doesn't let standard accounts run it: $sddl"
+    [pscustomobject]@{ Sddl = $sddl; Granted = $granted }
+}
+
+# Standard accounts may read and run the task, and nothing more. The main task needs this for the
+# watchdog (which runs with the account's non-elevated token) to relaunch the app through it, the
+# update task for the app to start an update.
+function CheckStandardAccountsMayOnlyRun([string]$Name) {
+    $access = StandardAccountAccess $Name
+    Check (($access.Granted -band $taskWrites) -eq 0) "Task $Name lets standard accounts change or delete it: $($access.Sddl)"
+    Check (($access.Granted -band $taskRun) -eq $taskRun) "Task $Name doesn't let standard accounts run it: $($access.Sddl)"
 }
 
 function CheckInstall([string]$Version, [datetime]$Since) {
@@ -174,6 +254,8 @@ function CheckInstall([string]$Version, [datetime]$Since) {
     Check ($logon.Count -eq 1 -and !$logon[0].UserId) "Task $mainTask should start at the sign-in of any user"
     Check ($t.Settings.RestartCount -eq 3 -and $t.Settings.RestartInterval -eq 'PT1M') "Task $mainTask should restart 3 times, every minute"
     Check ($t.Settings.StartWhenAvailable) "Task $mainTask should start when available"
+    Check ($t.Settings.AllowDemandStart) "Task $mainTask should allow starting on demand, as the watchdog does"
+    CheckStandardAccountsMayOnlyRun $mainTask
 
     $t = CheckTask $watchdogTask '--watchdog-check' $usersSid 'Limited' 'Parallel' 'PT5M'
     $time = @(TriggersOf $t 'MSFT_TaskTimeTrigger')
@@ -183,7 +265,7 @@ function CheckInstall([string]$Version, [datetime]$Since) {
 
     $t = CheckTask $updateTask '--update' $systemSid 'Highest' 'IgnoreNew' 'PT2H'
     Check (@(TriggersOf $t).Count -eq 0) "Task $updateTask should only run on demand"
-    CheckUpdateTaskSecurity
+    CheckStandardAccountsMayOnlyRun $updateTask
 
     Check (Test-Path $sharedDir) "$sharedDir was not created"
     $rules = (Get-Acl $sharedDir).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
@@ -195,8 +277,9 @@ function CheckInstall([string]$Version, [datetime]$Since) {
     Check ($users.Count -gt 0) "Standard accounts can't modify everything in $sharedDir"
 }
 
-# Runs a script as a new standard account: it starts the update task, then tries to delete and to
-# disable each task. Returns its results, or $null if a process couldn't be started as that account.
+# Runs a script as a new standard account: it starts the update task and the main task, then tries
+# to delete and to disable each task. Returns its results, or $null if a process couldn't be started
+# as that account.
 function StandardAccountProbe {
     $user = 'stmsmoketest'
     # 14 characters at most, or `net user` asks to confirm.
@@ -216,6 +299,9 @@ $r.user = $id.Name
 $r.admin = ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 cmd /c "schtasks /Run /TN ScreenTimeManagerUpdate <nul >nul 2>&1"
 $r.run = $LASTEXITCODE
+# As the watchdog does when the app isn't running (1.0.1: "Access is denied.").
+$r.runMainOutput = (cmd /c "schtasks /Run /TN ScreenTimeManager <nul 2>&1" | Out-String).Trim()
+$r.runMain = $LASTEXITCODE
 $service = New-Object -ComObject Schedule.Service
 $service.Connect()
 $folder = $service.GetFolder('\')
@@ -257,6 +343,17 @@ try {
     CheckInstall $version $since
     "Installed $version" | Out-Host
 
+    # ---- Setup must replace an existing main task's descriptor ----
+    # 1.0.1 registered it with the default one, which lets standard accounts read it but not run
+    # it, so its watchdog couldn't relaunch the app. Give it an equivalent here; the reinstall below
+    # (CheckInstall) must leave it runnable again.
+    (TaskFolder).GetTask($mainTask).SetSecurityDescriptor('D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FR;;;BU)', 0)
+    $oldAccess = StandardAccountAccess $mainTask
+    $upgradeChecked = ($oldAccess.Granted -band $taskRun) -ne $taskRun
+    if (!$upgradeChecked) {
+        "::warning::Could not give $mainTask a 1.0.1-style descriptor ($($oldAccess.Sddl)); not checking that setup replaces it" | Out-Host
+    }
+
     # ---- Reinstall as SYSTEM over a running copy: setup must close it, from session 0 ----
     # The watchdog may already have relaunched it (the marker is fresh).
     if (!(AppProcesses)) {
@@ -272,6 +369,7 @@ try {
     }
     CheckInstall $version $since
     "Reinstalled as SYSTEM over the running app, which setup closed" | Out-Host
+    if ($upgradeChecked) { "Setup replaced $mainTask's 1.0.1-style descriptor: $((StandardAccountAccess $mainTask).Sddl)" | Out-Host }
 
     # ---- The update task, started by an administrator ----
     # It checks the real latest release, which is expected to be no newer than this build.
@@ -289,13 +387,17 @@ try {
         "Standard account probe: $($probe | ConvertTo-Json -Compress)" | Out-Host
         Check (!$probe.admin) "The probe account $($probe.user) is an administrator"
         Check ($probe.run -eq 0) "A standard account could not start $updateTask (schtasks exited with $($probe.run))"
+        Check ($probe.runMain -eq 0) "A standard account could not start $mainTask, so the watchdog can't relaunch the app (schtasks exited with $($probe.runMain): $($probe.runMainOutput))"
         foreach ($t in $tasks) {
             Check ($probe."delete $t" -ne 0) "A standard account deleted task $t"
             Check ($probe."disable $t" -eq 'denied') "A standard account disabled task $t"
         }
+        # Where Task Scheduler started the main task for an account that has no session of its own
+        # (the probe runs in this runner's session) isn't asserted: it's not a case the app meets.
+        "After the probe started ${mainTask}: $(AppProcessSummary)" | Out-Host
         $null = WaitForTaskRun $updateTask $since 300
         CheckInstall $version ([datetime]'2000-01-01')
-        "A standard account started the update task, and could not delete or disable any task" | Out-Host
+        "A standard account started the update task and the main task, and could not delete or disable any task" | Out-Host
     }
 
     # ---- Update through the app's updater, from a fake release on localhost ----
@@ -360,6 +462,9 @@ try {
     }
     Check $ready "The fake release server didn't start: $(Receive-Job $server 2>&1 | Out-String)"
 
+    # The watchdog logs a conclusion only when it differs from the last one (watchdog.state); start
+    # afresh, so the relaunch after this update is logged even if an earlier one was the last thing.
+    Remove-Item "$userDataDir\watchdog.state" -ErrorAction SilentlyContinue
     $env:STM_UPDATE_FEED = "$base/releases/latest"
     try {
         $since = Get-Date
@@ -391,6 +496,28 @@ try {
     "Updated $version to $next through --update; the fake release server saw:" | Out-Host
     Receive-Job $server | Out-Host
 
+    # ---- The watchdog brings the app back after the update, and after a kill ----
+    # 1.0.1 in the field: setup closed the app, and the watchdog's relaunch failed ("Access is
+    # denied" starting the main task as a standard user, then a direct child that ended with the
+    # watchdog run) while logging relaunched=true. Here the installed watchdog task, running
+    # non-elevated in this runner's session, must bring the app back by itself, and the app must
+    # outlive the watchdog run. Nothing here starts the app.
+    $session = (Get-Process -Id $PID).SessionId
+    if ($session -eq 0) {
+        "::warning::This runner runs in session 0, where nobody is signed in and the watchdog task doesn't run; skipped checking the watchdog's relaunch" | Out-Host
+    } elseif (!(CheckWatchdogRelaunch $session $since 'install/update finished .*relaunched=true' 'After the update')) {
+        "::warning::The watchdog task did not run in this runner's session ($session) within 3 minutes; skipped checking the watchdog's relaunch. $(AppProcessSummary)" | Out-Host
+    } else {
+        # A stop only counts as a kill once a watchdog run has seen the app running in this session
+        # (until then it may still be starting); that run sets watchdog.state to 'running'.
+        $state = "$userDataDir\watchdog.state"
+        for ($i = 0; $i -lt 150 -and (Get-Content $state -ErrorAction SilentlyContinue) -ne 'running'; $i++) { Start-Sleep 1 }
+        Check ((Get-Content $state -ErrorAction SilentlyContinue) -eq 'running') "No watchdog run saw the relaunched app running: watchdog.state is '$(Get-Content $state -ErrorAction SilentlyContinue)'"
+        $since = Get-Date
+        AppInSession $session | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+        Check (CheckWatchdogRelaunch $session $since 'relaunched=true .*sending tamper alert' 'After a kill') "The watchdog task stopped running in session $session"
+    }
+
     # ---- Uninstall, while the app runs ----
     if (!(AppProcesses)) {
         Start-Process $exe | Out-Null
@@ -417,7 +544,7 @@ try {
     Check (Test-Path "$sharedDir\smoke-test.txt") "Uninstall removed $sharedDir"
     Check (Test-Path "$userDataDir\smoke-test.txt") "Uninstall removed $userDataDir"
     Remove-Item "$sharedDir\smoke-test.txt", "$userDataDir\smoke-test.txt"
-    'Install, reinstall as SYSTEM, update task permissions, update and uninstall OK'
+    'Install, reinstall as SYSTEM, task permissions, update, watchdog relaunch and uninstall OK'
 } finally {
     if ($server) { Stop-Job $server; Remove-Job $server -Force }
 }
