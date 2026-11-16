@@ -688,7 +688,8 @@ async fn authorize(bot: &Bot, msg: &Message, admin_chat_id: Option<i64>) -> Auth
         Ok(member) if member.kind.is_privileged() => AuthDecision::Allow,
         Ok(_) => AuthDecision::Deny,
         Err(e) => {
-            eprintln!("[Telegram] Couldn't check group admin status of {user_id}: {e}");
+            // The sender isn't named: who it was is no use here, and ids stay out of the log.
+            eprintln!("[Telegram] Couldn't check whether the sender is a group admin: {e}");
             AuthDecision::Deny
         }
     }
