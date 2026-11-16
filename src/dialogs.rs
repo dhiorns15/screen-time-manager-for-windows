@@ -239,6 +239,8 @@ pub enum PasscodeAction {
     Settings,
     Extend15,
     Extend45,
+    FreeTime,
+    EndFreeTime,
     Quit,
 }
 
@@ -249,6 +251,8 @@ impl PasscodeAction {
             PasscodeAction::Settings => "passcode.action.settings",
             PasscodeAction::Extend15 => "passcode.action.extend_15",
             PasscodeAction::Extend45 => "passcode.action.extend_45",
+            PasscodeAction::FreeTime => "passcode.action.free_time",
+            PasscodeAction::EndFreeTime => "passcode.action.end_free_time",
             PasscodeAction::Quit => "passcode.action.quit",
         }
     }

@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::blocking;
 use crate::database;
+use crate::free_time;
 use crate::i18n;
 use crate::mini_overlay;
 use crate::overlay;
@@ -60,17 +61,19 @@ pub fn reply_names_account(name: &str) -> bool {
     matches!(
         name,
         "time" | "extend" | "e30" | "e60" | "e120" | "reduce" | "reset" | "lock" | "stop" | "unlock"
-            | "pause" | "resume" | "setlimit" | "setmessage"
+            | "pause" | "resume" | "setlimit" | "setmessage" | "free"
     )
 }
 
 /// What the timer is doing right now, for `status`. Mirrors the order in
 /// mini_overlay.rs's `tick_mode`: the app's lock screen freezes everything,
-/// then a manual pause, then idle or the Windows lock screen.
+/// then free time, then a manual pause, then idle or the Windows lock screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimerState {
     /// Counting down.
     Running,
+    /// Free time a parent gave: nothing is counted.
+    FreeTime,
     /// Paused by hand (counts against the pause budget).
     Paused,
     /// Stopped because nobody is using the PC.
@@ -91,6 +94,7 @@ pub fn timer_state(
     blocked: bool,
     manual_lock: Option<bool>,
     remaining: i32,
+    free_time: bool,
     paused: bool,
     idle_paused: bool,
     windows_locked: bool,
@@ -101,6 +105,8 @@ pub fn timer_state(
         } else {
             TimerState::OutOfTime
         }
+    } else if free_time {
+        TimerState::FreeTime
     } else if paused {
         TimerState::Paused
     } else if idle_paused {
@@ -120,6 +126,7 @@ pub fn current_timer_state() -> TimerState {
         blocking::is_blocking_overlay_visible(),
         Some(blocking::is_manual_lock()),
         blocking::get_remaining_seconds(),
+        free_time::is_active(),
         mini_overlay::is_paused(),
         mini_overlay::is_idle_paused(),
         mini_overlay::IS_LOCK_PAUSED.load(Ordering::SeqCst),
@@ -130,6 +137,7 @@ pub fn current_timer_state() -> TimerState {
 fn timer_state_key(state: TimerState) -> &'static str {
     match state {
         TimerState::Running => "bot.status.running",
+        TimerState::FreeTime => "bot.status.free_time",
         TimerState::Paused => "bot.status.paused",
         TimerState::Idle => "bot.status.idle",
         TimerState::WindowsLocked => "bot.status.windows_locked",
@@ -162,7 +170,7 @@ pub fn status_text(state: TimerState) -> String {
          ━━━━━━━━━━━━━━━━━━\n\
          {}\n\
          {} {}: {}\n\
-         ⏱ {}: {}\n\
+         ⏱ {}: {}{}\n\
          🔋 {}: {}",
         i18n::t("tg.status.header"),
         user_line(),
@@ -171,18 +179,127 @@ pub fn status_text(state: TimerState) -> String {
         format_hm(remaining),
         i18n::t("bot.status.timer"),
         i18n::t(timer_state_key(state)),
+        free_time_line(free_time::seconds_left()),
         i18n::t("tg.status.pause_budget"),
         format_hm(pause_budget)
     )
 }
 
+/// `status`'s and `time`'s line about free time ("\n🎁 Free time: 1h 20m
+/// left"), or nothing while there's none - also behind a parent's lock,
+/// where it keeps running down.
+fn free_time_line(free_secs: i32) -> String {
+    if free_secs <= 0 {
+        return String::new();
+    }
+    format!("\n🎁 {}", i18n::t("free.status.left").replace("{time}", &format_hm_up(free_secs)))
+}
+
+/// `format_hm`, rounded up to the minute - for free time, so 30 seconds
+/// left doesn't read "0m".
+fn format_hm_up(seconds: i32) -> String {
+    format_hm(seconds.saturating_add(59) / 60 * 60)
+}
+
 pub fn cmd_time() -> String {
     let remaining = blocking::get_remaining_seconds();
     format!(
-        "{} {}",
+        "{} {}{}",
         remaining_emoji(remaining),
-        i18n::t("bot.time.remaining").replace("{time}", &format_hm(remaining))
+        i18n::t("bot.time.remaining").replace("{time}", &format_hm(remaining)),
+        free_time_line(free_time::seconds_left()),
     )
+}
+
+/// What `free` was asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreeRequest {
+    /// `free`: say whether free time is on.
+    Report,
+    /// `free off`: end it.
+    End,
+    /// `free <minutes>`: start (or replace) it.
+    Start(i32),
+    /// Anything else: explain the command.
+    Usage,
+}
+
+pub fn parse_free_args(args: &str) -> FreeRequest {
+    let args = args.trim();
+    if args.is_empty() {
+        FreeRequest::Report
+    } else if args.eq_ignore_ascii_case("off") {
+        FreeRequest::End
+    } else {
+        match minutes_arg(args) {
+            Some(minutes) if (1..=free_time::MAX_FREE_MINUTES).contains(&minutes) => FreeRequest::Start(minutes),
+            _ => FreeRequest::Usage,
+        }
+    }
+}
+
+/// The bot's `free` command: `free <minutes>` starts (or replaces) free
+/// time, `free off` ends it, `free` alone says whether it's on.
+/// `command` is how the command is typed on this platform ("/free" or
+/// "!free"), for the usage text.
+pub fn cmd_free(args: &str, command: &str) -> String {
+    match parse_free_args(args) {
+        FreeRequest::Report => {
+            let left = free_time::seconds_left();
+            if left > 0 {
+                format!("🎁 {}", i18n::t("free.status.left").replace("{time}", &format_hm_up(left)))
+            } else {
+                i18n::t("free.reply.none").to_string()
+            }
+        }
+        FreeRequest::End => {
+            if !free_time::end() {
+                return i18n::t("free.reply.none").to_string();
+            }
+            let remaining = blocking::get_remaining_seconds();
+            let after = if remaining == 0 {
+                i18n::t("free.after.no_time").to_string()
+            } else {
+                format!("{}: {}", i18n::t("tg.status.remaining"), format_hm(remaining))
+            };
+            format!("⏱ {}\n⏳ {}", i18n::t("free.reply.ended"), after)
+        }
+        FreeRequest::Start(minutes) => {
+            match free_time::start(minutes) {
+                Ok(()) => {
+                    let remaining = blocking::get_remaining_seconds();
+                    let after = if remaining == 0 {
+                        i18n::t("free.reply.no_time_after").to_string()
+                    } else {
+                        i18n::t("free.reply.countdown_waits").replace("{time}", &format_hm(remaining))
+                    };
+                    format!(
+                        "🎁 {}\n⏳ {}",
+                        i18n::t("free.reply.started").replace("{time}", &format_hm(minutes * 60)),
+                        after
+                    )
+                }
+                Err(free_time::StartRefused::ManualLock) => format!("🔒 {}", i18n::t("free.reply.locked")),
+                Err(free_time::StartRefused::OutOfRange) => free_usage(command),
+            }
+        }
+        FreeRequest::Usage => free_usage(command),
+    }
+}
+
+/// For resolving a pending "request more time": what a `free` command with
+/// `args` grants, if it will start free time (a parent's lock refuses it).
+pub fn free_grant_detail(args: &str) -> Option<String> {
+    match parse_free_args(args) {
+        FreeRequest::Start(minutes) if !blocking::is_manual_lock() => Some(format!("free time {minutes} min")),
+        _ => None,
+    }
+}
+
+fn free_usage(command: &str) -> String {
+    i18n::t("free.reply.usage")
+        .replace("{cmd}", command)
+        .replace("{max}", &free_time::MAX_FREE_MINUTES.to_string())
 }
 
 /// Split the text after a command prefix ("/" or "!") into the command name
@@ -266,6 +383,10 @@ pub fn cmd_reduce(minutes: i32) -> String {
 pub fn cmd_pause() -> String {
     if mini_overlay::is_paused() {
         return format!("⏸ {}", i18n::t("tg.pause.already_paused"));
+    }
+    if free_time::is_active() {
+        let reason = format_pause_reason(mini_overlay::PauseBlockedReason::FreeTime);
+        return format!("{} {}", i18n::t("tg.pause.cannot"), reason);
     }
     if mini_overlay::is_idle_paused() {
         return format!("⏸ {}", i18n::t("tg.pause.idle_paused"));
@@ -600,6 +721,15 @@ pub fn cmd_lock() -> String {
         blocking::start_manual_lock(&message);
     }
 
+    // A lock wins over free time, which keeps running down underneath.
+    let free_secs = free_time::seconds_left();
+    if free_secs > 0 {
+        return format!(
+            "🔒 {}\n🎁 {}",
+            i18n::t("tg.lock.success"),
+            i18n::t("free.reply.lock_over_free").replace("{time}", &format_hm_up(free_secs))
+        );
+    }
     format!("🔒 {}", i18n::t("tg.lock.success"))
 }
 
@@ -615,8 +745,10 @@ pub fn cmd_unlock() -> String {
         return i18n::t("tg.unlock.not_locked").to_string();
     }
 
+    // During free time the lock screen can only be a parent's lock: ending
+    // it is enough, time left or not.
     let remaining = blocking::get_remaining_seconds();
-    if remaining <= 0 {
+    if remaining <= 0 && !free_time::is_active() {
         return i18n::t("tg.unlock.no_time").to_string();
     }
 
@@ -675,6 +807,7 @@ pub fn format_pause_reason(reason: mini_overlay::PauseBlockedReason) -> String {
             format!("{} ({})", i18n::t("pause.min_active"), format_hm(seconds_remaining))
         }
         mini_overlay::PauseBlockedReason::TimeTooLow => i18n::t("pause.time_too_low").to_string(),
+        mini_overlay::PauseBlockedReason::FreeTime => i18n::t("pause.free_time").to_string(),
     }
 }
 
@@ -1425,7 +1558,7 @@ mod tests {
     fn replies_that_name_the_account() {
         for name in [
             "time", "extend", "e30", "e60", "e120", "reduce", "reset", "lock", "stop", "unlock", "pause",
-            "resume", "setlimit", "setmessage",
+            "resume", "setlimit", "setmessage", "free",
         ] {
             assert!(reply_names_account(name), "{name}");
         }
@@ -1436,10 +1569,44 @@ mod tests {
     }
 
     #[test]
+    fn free_arguments() {
+        assert_eq!(parse_free_args(""), FreeRequest::Report);
+        assert_eq!(parse_free_args("  "), FreeRequest::Report);
+        assert_eq!(parse_free_args("off"), FreeRequest::End);
+        assert_eq!(parse_free_args("OFF"), FreeRequest::End);
+        assert_eq!(parse_free_args("90"), FreeRequest::Start(90));
+        assert_eq!(parse_free_args(" 1 "), FreeRequest::Start(1));
+        assert_eq!(parse_free_args("1440"), FreeRequest::Start(1440));
+        for bad in ["0", "-30", "1441", "99999999999", "30min", "on", "half an hour"] {
+            assert_eq!(parse_free_args(bad), FreeRequest::Usage, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn free_time_reads_in_whole_minutes_rounded_up() {
+        assert_eq!(format_hm_up(30), "1m");
+        assert_eq!(format_hm_up(60), "1m");
+        assert_eq!(format_hm_up(61), "2m");
+        assert_eq!(format_hm_up(3600), "1h 0m");
+        assert_eq!(format_hm_up(i32::MAX), format_hm(i32::MAX / 60 * 60));
+    }
+
+    #[test]
+    fn timer_state_during_free_time() {
+        use TimerState::*;
+        // Nothing counts, whatever else is going on
+        assert_eq!(timer_state(false, Some(false), 0, true, false, false, false), FreeTime);
+        assert_eq!(timer_state(false, Some(false), 600, true, true, true, true), FreeTime);
+        // A parent's lock wins over free time
+        assert_eq!(timer_state(true, Some(true), 0, true, false, false, false), Locked);
+        assert_eq!(timer_state(true, Some(true), 600, true, false, false, false), Locked);
+    }
+
+    #[test]
     fn timer_state_reports_what_the_countdown_is_doing() {
         use TimerState::*;
         let state = |blocked, manual, remaining, paused, idle, locked| {
-            timer_state(blocked, manual, remaining, paused, idle, locked)
+            timer_state(blocked, manual, remaining, false, paused, idle, locked)
         };
         assert_eq!(state(false, None, 600, false, false, false), Running);
         assert_eq!(state(false, None, 600, true, false, false), Paused);
@@ -1456,8 +1623,8 @@ mod tests {
         assert_eq!(state(false, Some(true), 600, false, false, false), Running);
         // Each state has its own text.
         let keys: std::collections::HashSet<_> =
-            [Running, Paused, Idle, WindowsLocked, OutOfTime, Locked].map(timer_state_key).into_iter().collect();
-        assert_eq!(keys.len(), 6);
+            [Running, FreeTime, Paused, Idle, WindowsLocked, OutOfTime, Locked].map(timer_state_key).into_iter().collect();
+        assert_eq!(keys.len(), 7);
     }
 
     #[test]

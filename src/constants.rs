@@ -14,6 +14,11 @@ pub const IDM_TODAYS_STATS: u16 = 1006;
 pub const IDM_PAUSE_TOGGLE: u16 = 1007;
 pub const IDM_EXTEND_15: u16 = 1008;
 pub const IDM_EXTEND_45: u16 = 1009;
+pub const IDM_FREE_30: u16 = 1010;
+pub const IDM_FREE_60: u16 = 1011;
+pub const IDM_FREE_120: u16 = 1012;
+pub const IDM_FREE_180: u16 = 1013;
+pub const IDM_FREE_END: u16 = 1014;
 
 // Mutex name for single instance. Deliberately unprefixed (not "Global\\")
 // so it lives in the caller's session namespace - each Windows account (and

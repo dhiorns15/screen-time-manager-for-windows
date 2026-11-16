@@ -5,12 +5,14 @@
 
 #![windows_subsystem = "windows"]
 
+mod activity;
 mod blocking;
 mod constants;
 mod database;
 mod dialogs;
 mod discord;
 mod dpi;
+mod free_time;
 mod i18n;
 mod mini_overlay;
 mod overlay;
@@ -248,8 +250,16 @@ fn main() {
         blocking::reconcile_todays_limit();
         let remaining = blocking::get_remaining_seconds();
 
+        // Free time a parent gave, carried over (less the time since it was
+        // saved) - before the tick starts counting it down and before the
+        // lock screen decision below.
+        free_time::load_at_start();
+
         // The always-on per-second tick (countdown, rollover, idle, bots)
         mini_overlay::start_accounting(hwnd);
+
+        // Signs of use other than keyboard and mouse, for idle auto-pause
+        activity::start(session::is_active_console_session);
 
         // Show the mini overlay with remaining time
         show_mini_overlay();
@@ -258,7 +268,7 @@ fn main() {
         // outlasts restarts, reboots and updates - see blocking::MANUAL_LOCK),
         // show blocking overlay immediately
         blocking::load_manual_lock();
-        if blocking::lock_screen_due_at_start(blocking::is_manual_lock(), remaining) {
+        if blocking::lock_screen_due_at_start(blocking::is_manual_lock(), remaining, free_time::is_active()) {
             let msg = database::get_blocking_message();
             blocking::show_blocking_overlay(&msg);
         }

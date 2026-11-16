@@ -129,6 +129,9 @@ pub unsafe fn show_context_menu(hwnd: HWND) {
     let (pause_text, pause_flags) = if paused {
         // Currently manually paused - show resume option (always available)
         (i18n::t("tray.resume"), MF_BYPOSITION | MF_STRING)
+    } else if crate::free_time::is_active() {
+        // Nothing is counted during free time, idle or not
+        (i18n::t("tray.pause_free"), MF_BYPOSITION | MF_STRING | MF_GRAYED)
     } else if is_idle_paused() {
         // Currently idle-paused - grey out manual pause (already paused via idle)
         (i18n::t("tray.pause_idle"), MF_BYPOSITION | MF_STRING | MF_GRAYED)
@@ -169,6 +172,9 @@ pub unsafe fn show_context_menu(hwnd: HWND) {
             Err(PauseBlockedReason::TimeTooLow) => {
                 (i18n::t("tray.pause_time_low"), MF_BYPOSITION | MF_STRING | MF_GRAYED)
             }
+            Err(PauseBlockedReason::FreeTime) => {
+                (i18n::t("tray.pause_free"), MF_BYPOSITION | MF_STRING | MF_GRAYED)
+            }
             Err(PauseBlockedReason::Disabled) => {
                 (i18n::t("tray.pause_disabled"), MF_BYPOSITION | MF_STRING | MF_GRAYED)
             }
@@ -204,12 +210,49 @@ unsafe fn show_context_menu_with_pause(hwnd: HWND, hmenu: HMENU, pause_text: PCW
     insert_or_bail!(3, MF_BYPOSITION | MF_STRING, IDM_EXTEND_15 as usize, PCWSTR(extend15_text.as_ptr()));
     let extend45_text = i18n::wide("tray.extend_45");
     insert_or_bail!(4, MF_BYPOSITION | MF_STRING, IDM_EXTEND_45 as usize, PCWSTR(extend45_text.as_ptr()));
-    insert_or_bail!(5, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
+
+    // Free time (passcode): end it while it's on, otherwise a choice of
+    // lengths. The submenu belongs to `hmenu` once inserted, and goes with it.
+    let free_left = crate::free_time::seconds_left();
+    let free_text: Vec<u16>;
+    if free_left > 0 {
+        let mins = (free_left + 59) / 60;
+        free_text = i18n::to_wide(&i18n::t("tray.free_end").replace("{mins}", &mins.to_string()));
+        insert_or_bail!(5, MF_BYPOSITION | MF_STRING, IDM_FREE_END as usize, PCWSTR(free_text.as_ptr()));
+    } else {
+        let Ok(submenu) = CreatePopupMenu() else {
+            eprintln!("[Tray] Failed to create the free time menu - skipping this open");
+            let _ = DestroyMenu(hmenu);
+            return;
+        };
+        for (id, key) in [
+            (IDM_FREE_30, "tray.free_30"),
+            (IDM_FREE_60, "tray.free_60"),
+            (IDM_FREE_120, "tray.free_120"),
+            (IDM_FREE_180, "tray.free_180"),
+        ] {
+            let text = i18n::wide(key);
+            if AppendMenuW(submenu, MF_STRING, id as usize, PCWSTR(text.as_ptr())).is_err() {
+                eprintln!("[Tray] Failed to build the free time menu - skipping this open");
+                let _ = DestroyMenu(submenu);
+                let _ = DestroyMenu(hmenu);
+                return;
+            }
+        }
+        free_text = i18n::wide("tray.free_menu");
+        if InsertMenuW(hmenu, 5, MF_BYPOSITION | MF_POPUP | MF_STRING, submenu.0 as usize, PCWSTR(free_text.as_ptr())).is_err() {
+            eprintln!("[Tray] Failed to build context menu - skipping this open");
+            let _ = DestroyMenu(submenu);
+            let _ = DestroyMenu(hmenu);
+            return;
+        }
+    }
+    insert_or_bail!(6, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
 
     // Pause menu item with dynamic text
-    insert_or_bail!(6, pause_flags, IDM_PAUSE_TOGGLE as usize, pause_text);
+    insert_or_bail!(7, pause_flags, IDM_PAUSE_TOGGLE as usize, pause_text);
 
-    let mut idx = 7;
+    let mut idx = 8;
 
     // Show idle status if idle-paused
     if is_idle_paused() {
@@ -345,6 +388,36 @@ pub unsafe extern "system" fn window_proc(
                         crate::time_request::notify_passcode_extend(
                             "passcode_extend.source.tray_menu",
                             45,
+                            get_remaining_seconds(),
+                        );
+                    }
+                }
+                IDM_FREE_30 | IDM_FREE_60 | IDM_FREE_120 | IDM_FREE_180 => {
+                    let minutes = match menu_id {
+                        IDM_FREE_30 => 30,
+                        IDM_FREE_60 => 60,
+                        IDM_FREE_120 => 120,
+                        _ => 180,
+                    };
+                    if verify_passcode_for_action(hwnd, PasscodeAction::FreeTime) {
+                        match crate::free_time::start(minutes) {
+                            Ok(()) => crate::time_request::notify_free_time_started(
+                                "passcode_extend.source.tray_menu",
+                                minutes,
+                            ),
+                            Err(crate::free_time::StartRefused::ManualLock) => {
+                                let text = i18n::wide("free.reply.locked");
+                                let title = i18n::wide("tray.free_menu");
+                                MessageBoxW(hwnd, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONINFORMATION);
+                            }
+                            Err(crate::free_time::StartRefused::OutOfRange) => {}
+                        }
+                    }
+                }
+                IDM_FREE_END => {
+                    if verify_passcode_for_action(hwnd, PasscodeAction::EndFreeTime) && crate::free_time::end() {
+                        crate::time_request::notify_free_time_ended(
+                            Some("passcode_extend.source.tray_menu"),
                             get_remaining_seconds(),
                         );
                     }

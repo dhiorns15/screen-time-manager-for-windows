@@ -355,10 +355,10 @@ pub fn end_manual_lock() -> bool {
     was_on
 }
 
-/// The lock screen's title: a parent's lock while time is left isn't
-/// "Time's up!".
-fn lock_title_key(manual_lock: bool, remaining: i32) -> &'static str {
-    if manual_lock && remaining > 0 {
+/// The lock screen's title: a parent's lock while time (or free time) is
+/// left isn't "Time's up!".
+fn lock_title_key(manual_lock: bool, remaining: i32, free_time: bool) -> &'static str {
+    if manual_lock && (remaining > 0 || free_time) {
         "blocking.parent_lock_title"
     } else {
         "blocking.times_up"
@@ -366,15 +366,31 @@ fn lock_title_key(manual_lock: bool, remaining: i32) -> &'static str {
 }
 
 /// Whether the lock screen comes up at startup: a manual lock, or no time
-/// left.
-pub fn lock_screen_due_at_start(manual_lock: bool, remaining: i32) -> bool {
-    manual_lock || remaining <= 0
+/// left and no free time on (see free_time.rs).
+pub fn lock_screen_due_at_start(manual_lock: bool, remaining: i32, free_time: bool) -> bool {
+    manual_lock || (remaining <= 0 && !free_time)
 }
 
 /// Whether the rollover to a new day takes the lock screen down: the new
 /// day has time and no manual lock is on.
 pub fn rollover_hides_lock_screen(manual_lock: bool, remaining: i32) -> bool {
     !manual_lock && remaining > 0
+}
+
+/// Whether the lock screen comes down for free time: it's up without a
+/// parent's lock, i.e. because time ran out. Checked when free time starts
+/// and every tick, in case an out-of-time lock landed just as free time
+/// started from a bot.
+pub fn free_time_lifts_lock_screen(free_time: bool, overlay_up: bool, manual_lock: bool) -> bool {
+    free_time && overlay_up && !manual_lock
+}
+
+/// Every tick: take an out-of-time lock screen down during free time (see
+/// `free_time_lifts_lock_screen`).
+pub unsafe fn enforce_free_time() {
+    if free_time_lifts_lock_screen(crate::free_time::is_active(), is_blocking_overlay_visible(), is_manual_lock()) {
+        hide_blocking_overlay();
+    }
 }
 
 /// Whether the accounting tick has to (re)show the lock screen for a manual
@@ -797,8 +813,9 @@ unsafe fn apply_hide_overlay(hwnd: HWND) {
     // Hide secondary monitor overlays
     hide_secondary_overlays();
 
-    // Show mini overlay again if there's remaining time
-    if REMAINING_SECONDS.load(Ordering::SeqCst) > 0 {
+    // Show mini overlay again if there's remaining time, or free time (which
+    // it then shows)
+    if REMAINING_SECONDS.load(Ordering::SeqCst) > 0 || crate::free_time::is_active() {
         crate::mini_overlay::show_mini_overlay();
     }
 }
@@ -835,7 +852,9 @@ unsafe fn unlock_with_passcode(hwnd: HWND) {
         return;
     }
     end_manual_lock();
-    if REMAINING_SECONDS.load(Ordering::SeqCst) <= 0 {
+    // During free time a lock screen is a parent's lock (no out-of-time
+    // lock then), and ending it is all that's needed.
+    if REMAINING_SECONDS.load(Ordering::SeqCst) <= 0 && !crate::free_time::is_active() {
         extend_time(15);
         crate::time_request::notify_passcode_extend(
             "passcode_extend.source.lock_screen",
@@ -1040,7 +1059,11 @@ pub unsafe extern "system" fn blocking_overlay_proc(
             };
             DrawTextW(
                 hdc,
-                &mut i18n::t(lock_title_key(is_manual_lock(), REMAINING_SECONDS.load(Ordering::SeqCst)))
+                &mut i18n::t(lock_title_key(
+                    is_manual_lock(),
+                    REMAINING_SECONDS.load(Ordering::SeqCst),
+                    crate::free_time::is_active(),
+                ))
                     .encode_utf16()
                     .collect::<Vec<_>>(),
                 &mut title_rect,
@@ -2079,9 +2102,11 @@ mod tests {
 
     #[test]
     fn the_title_fits_why_the_screen_is_locked() {
-        assert_eq!(lock_title_key(true, 40 * 60), "blocking.parent_lock_title");
-        assert_eq!(lock_title_key(true, 0), "blocking.times_up", "a parent's lock with no time left");
-        assert_eq!(lock_title_key(false, 0), "blocking.times_up");
+        assert_eq!(lock_title_key(true, 40 * 60, false), "blocking.parent_lock_title");
+        assert_eq!(lock_title_key(true, 0, false), "blocking.times_up", "a parent's lock with no time left");
+        assert_eq!(lock_title_key(false, 0, false), "blocking.times_up");
+        // A parent's lock during free time, with the day's time used up
+        assert_eq!(lock_title_key(true, 0, true), "blocking.parent_lock_title");
     }
 
     #[test]
@@ -2098,15 +2123,31 @@ mod tests {
     fn a_bedtime_lock_with_time_left_comes_back_at_every_start() {
         // `lock` at 21:00 with 40 minutes left; then the lock screen's Shut
         // Down button, its countdown, a kill or an update, and a new start.
-        assert!(lock_screen_due_at_start(true, 40 * 60));
+        assert!(lock_screen_due_at_start(true, 40 * 60, false));
         // ...and after midnight, with a fresh day's time
-        assert!(lock_screen_due_at_start(true, 120 * 60));
+        assert!(lock_screen_due_at_start(true, 120 * 60, false));
         assert!(!rollover_hides_lock_screen(true, 120 * 60), "kept up at the rollover");
         // Without a manual lock, as before: up only with no time left
-        assert!(!lock_screen_due_at_start(false, 40 * 60));
-        assert!(lock_screen_due_at_start(false, 0));
+        assert!(!lock_screen_due_at_start(false, 40 * 60, false));
+        assert!(lock_screen_due_at_start(false, 0, false));
         assert!(rollover_hides_lock_screen(false, 120 * 60));
         assert!(!rollover_hides_lock_screen(false, 0), "a 0-minute day stays locked");
+    }
+
+    #[test]
+    fn free_time_takes_down_only_an_out_of_time_lock() {
+        assert!(free_time_lifts_lock_screen(true, true, false));
+        assert!(!free_time_lifts_lock_screen(true, true, true), "a parent's lock wins");
+        assert!(!free_time_lifts_lock_screen(false, true, false), "no free time: stays");
+        assert!(!free_time_lifts_lock_screen(true, false, false), "nothing up");
+    }
+
+    #[test]
+    fn free_time_carried_over_a_restart_keeps_the_out_of_time_lock_down() {
+        assert!(!lock_screen_due_at_start(false, 0, true));
+        // A parent's lock still wins
+        assert!(lock_screen_due_at_start(true, 0, true));
+        assert!(lock_screen_due_at_start(true, 40 * 60, true));
     }
 
     #[test]

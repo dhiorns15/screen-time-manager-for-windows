@@ -16,9 +16,10 @@ use serenity::client::{Context, EventHandler};
 use crate::database;
 use crate::i18n;
 use crate::remote_commands::{
-    cmd_clearlockout, cmd_extend, cmd_getpin, cmd_history, cmd_lock, cmd_msg, cmd_pause,
+    cmd_clearlockout, cmd_extend, cmd_free, cmd_getpin, cmd_history, cmd_lock, cmd_msg, cmd_pause,
     cmd_reduce, cmd_reset, cmd_resume, cmd_rotatingpin, cmd_setlimit, cmd_setmessage, cmd_setpin,
-    cmd_status, cmd_time, cmd_unlock, cmd_update, cmd_weekly, dispatch_minutes, measure_server_clock,
+    cmd_status, cmd_time, cmd_unlock, cmd_update, cmd_weekly, dispatch_minutes, free_grant_detail,
+    measure_server_clock,
     minutes_arg, reply_names_account, retry_delay, split_command, split_message, stale_age,
     stale_note, with_account, BotLifecycle, ChatMarkup, RateLimit, StartAction, WeeklyMarkup,
     DISCORD_MAX_MESSAGE, DISCORD_TIME_URL, STALE_NOTE_INTERVAL,
@@ -184,7 +185,10 @@ impl EventHandler for Handler {
             "e120" => Some("+120 min".to_string()),
             "reset" => Some("reset to daily limit".to_string()),
             "unlock" if crate::blocking::is_blocking_overlay_visible()
-                && crate::blocking::get_remaining_seconds() > 0 => Some("unlocked".to_string()),
+                && (crate::blocking::get_remaining_seconds() > 0 || crate::free_time::is_active()) => {
+                Some("unlocked".to_string())
+            }
+            "free" => free_grant_detail(args),
             _ => None,
         };
 
@@ -200,6 +204,7 @@ impl EventHandler for Handler {
             "msg" => cmd_msg(args),
             "lock" | "stop" => cmd_lock(),
             "unlock" => cmd_unlock(),
+            "free" => cmd_free(args, "!free"),
             "reset" => cmd_reset(),
             "setmessage" => cmd_setmessage(args),
             "setpin" => setpin_and_delete(&ctx, &msg, args).await,
@@ -287,6 +292,7 @@ fn help_text() -> String {
         ("!lock", i18n::t("dc.cmd.lock")),
         ("!stop", i18n::t("dc.cmd.stop")),
         ("!unlock", i18n::t("dc.cmd.unlock")),
+        ("!free <mins|off>", i18n::t("dc.cmd.free")),
         ("!reset", i18n::t("dc.cmd.reset")),
         ("!setmessage <text>", i18n::t("dc.cmd.setmessage")),
         ("!setpin <pin>", i18n::t("dc.cmd.setpin")),
@@ -575,7 +581,7 @@ mod tests {
         let help = help_text();
         for cmd in [
             "!status", "!time", "!extend", "!reduce", "!pause", "!resume", "!history", "!weekly", "!msg",
-            "!lock", "!stop", "!unlock", "!reset", "!setmessage", "!setpin", "!setlimit", "!rotatingpin",
+            "!lock", "!stop", "!unlock", "!free", "!reset", "!setmessage", "!setpin", "!setlimit", "!rotatingpin",
             "!getpin", "!clearlockout", "!update", "!e30", "!e60", "!e120", "!whoami", "!help",
         ] {
             assert!(help.lines().any(|l| l.starts_with(&format!("{cmd} "))), "{cmd} missing from:\n{help}");

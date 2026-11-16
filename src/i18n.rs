@@ -273,12 +273,12 @@ fn en(key: &str) -> &'static str {
         "tg.reduce.success_suffix" => "",
 
         "tg.pause.already_paused" => "Timer is already paused. Use /resume to continue.",
-        "tg.pause.idle_paused" => "Timer is already paused (idle). It will resume automatically when input is detected.",
+        "tg.pause.idle_paused" => "Timer is already paused (idle). It resumes by itself as soon as the PC is used again.",
         "tg.pause.success" => "Timer paused",
         "tg.pause.failed" => "Timer was not paused (unexpected state)",
         "tg.pause.cannot" => "Cannot pause:",
 
-        "tg.resume.idle_auto" => "Timer is idle-paused. It will resume automatically when input is detected.",
+        "tg.resume.idle_auto" => "Timer is idle-paused. It resumes by itself as soon as the PC is used again.",
         "tg.resume.not_paused" => "Timer is not paused",
         "tg.resume.success" => "Timer resumed",
         "tg.resume.failed" => "Timer is still paused (unexpected state)",
@@ -648,6 +648,36 @@ fn en(key: &str) -> &'static str {
         "update.notify.downgraded" => "Screen Time Manager was changed to an older version:",
         "watchdog.restart_pending" => "and was asked to start again, but hadn't started 30 seconds later - the watchdog keeps checking and will report if it doesn't come back.",
 
+        // ----- Free time (bot `free`, tray menu) -----
+        "tray.free_menu" => "Free time",
+        "tray.free_30" => "30 minutes",
+        "tray.free_60" => "1 hour",
+        "tray.free_120" => "2 hours",
+        "tray.free_180" => "3 hours",
+        "tray.free_end" => "End free time ({mins}m left)",
+        "tray.pause_free" => "Pause (free time is on)",
+        "pause.free_time" => "Free time is on, so nothing is being counted",
+        "passcode.action.free_time" => "Enter the code to start free time",
+        "passcode.action.end_free_time" => "Enter the code to end free time",
+        "tg.cmd.free" => "Free time: stop the countdown for that many minutes (up to 1440); /free off ends it, /free shows it",
+        "dc.cmd.free" => "Free time: stop the countdown for that many minutes (up to 1440); !free off ends it, !free shows it",
+        "bot.status.free_time" => "Not counting - free time",
+        "free.status.left" => "Free time: {time} left",
+        "free.reply.none" => "No free time is on.",
+        "free.reply.started" => "Free time for {time}: the countdown is stopped and no screen time is used.",
+        "free.reply.countdown_waits" => "The countdown waits at {time} and carries on when free time ends.",
+        "free.reply.no_time_after" => "No screen time is left today: the lock screen comes back when free time ends.",
+        "free.reply.ended" => "Free time ended - the countdown is running again.",
+        "free.reply.locked" => "The PC is locked by a parent - unlock it first, then start free time.",
+        "free.reply.lock_over_free" => "Free time keeps running down underneath ({time} left).",
+        "free.reply.usage" => "Give the free time in minutes, from 1 to {max}, e.g. {cmd} 90. {cmd} off ends it, {cmd} on its own shows it.",
+        "free.after.no_time" => "No screen time left today - the lock screen is back.",
+        "free.notify.started" => "got free time with the passcode:",
+        "free.notify.ended" => "- free time is over",
+        "free.notify.ended_early" => "- free time was ended with the passcode",
+        "free.warning.no_time" => "Free time ends in 5 minutes, and there's no screen time left today. Time to save your work!",
+        "free.warning.low_time" => "Free time ends in 5 minutes. After that you have {time} of screen time left.",
+
         // Fallback - return empty string for unknown keys (should not happen in practice)
         _ => "",
     }
@@ -823,12 +853,12 @@ fn de(key: &str) -> &'static str {
         "tg.reduce.success_suffix" => "verringert",
 
         "tg.pause.already_paused" => "Timer ist bereits pausiert. Verwenden Sie /resume zum Fortsetzen.",
-        "tg.pause.idle_paused" => "Timer ist bereits pausiert (Leerlauf). Er wird automatisch fortgesetzt, wenn Eingabe erkannt wird.",
+        "tg.pause.idle_paused" => "Timer ist bereits pausiert (Leerlauf). Er läuft von selbst weiter, sobald der PC wieder benutzt wird.",
         "tg.pause.success" => "Timer pausiert",
         "tg.pause.failed" => "Timer wurde nicht pausiert (unerwarteter Zustand)",
         "tg.pause.cannot" => "Kann nicht pausieren:",
 
-        "tg.resume.idle_auto" => "Timer ist im Leerlauf pausiert. Er wird automatisch fortgesetzt, wenn Eingabe erkannt wird.",
+        "tg.resume.idle_auto" => "Timer ist im Leerlauf pausiert. Er läuft von selbst weiter, sobald der PC wieder benutzt wird.",
         "tg.resume.not_paused" => "Timer ist nicht pausiert",
         "tg.resume.success" => "Timer fortgesetzt",
         "tg.resume.failed" => "Timer ist noch pausiert (unerwarteter Zustand)",
@@ -1198,6 +1228,36 @@ fn de(key: &str) -> &'static str {
         "update.notify.downgraded" => "Bildschirmzeit Manager wurde auf eine ältere Version umgestellt:",
         "watchdog.restart_pending" => "und sollte neu starten, lief aber 30 Sekunden später noch nicht - der Watchdog prüft weiter und meldet sich, falls er nicht wiederkommt.",
 
+        // ----- Freie Zeit (Bot-Befehl `free`, Tray-Menü) -----
+        "tray.free_menu" => "Freie Zeit",
+        "tray.free_30" => "30 Minuten",
+        "tray.free_60" => "1 Stunde",
+        "tray.free_120" => "2 Stunden",
+        "tray.free_180" => "3 Stunden",
+        "tray.free_end" => "Freie Zeit beenden (noch {mins} Min)",
+        "tray.pause_free" => "Pause (freie Zeit läuft)",
+        "pause.free_time" => "Es läuft freie Zeit, also wird nichts gezählt",
+        "passcode.action.free_time" => "Code eingeben, um freie Zeit zu geben",
+        "passcode.action.end_free_time" => "Code eingeben, um die freie Zeit zu beenden",
+        "tg.cmd.free" => "Freie Zeit: den Countdown so viele Minuten anhalten (bis 1440); /free off beendet sie, /free zeigt sie an",
+        "dc.cmd.free" => "Freie Zeit: den Countdown so viele Minuten anhalten (bis 1440); !free off beendet sie, !free zeigt sie an",
+        "bot.status.free_time" => "Zählt nicht - freie Zeit",
+        "free.status.left" => "Freie Zeit: noch {time}",
+        "free.reply.none" => "Es läuft keine freie Zeit.",
+        "free.reply.started" => "Freie Zeit für {time}: der Countdown steht, es wird keine Bildschirmzeit verbraucht.",
+        "free.reply.countdown_waits" => "Der Countdown wartet bei {time} und läuft weiter, wenn die freie Zeit endet.",
+        "free.reply.no_time_after" => "Heute ist keine Bildschirmzeit mehr übrig: der Sperrbildschirm kommt zurück, wenn die freie Zeit endet.",
+        "free.reply.ended" => "Freie Zeit beendet - der Countdown läuft wieder.",
+        "free.reply.locked" => "Der PC ist von einem Elternteil gesperrt - erst entsperren, dann freie Zeit geben.",
+        "free.reply.lock_over_free" => "Die freie Zeit läuft darunter weiter ab (noch {time}).",
+        "free.reply.usage" => "Geben Sie die freie Zeit in Minuten an, von 1 bis {max}, z. B. {cmd} 90. {cmd} off beendet sie, {cmd} allein zeigt sie an.",
+        "free.after.no_time" => "Heute ist keine Bildschirmzeit mehr übrig - der Sperrbildschirm ist wieder da.",
+        "free.notify.started" => "hat mit dem Code freie Zeit bekommen:",
+        "free.notify.ended" => "- die freie Zeit ist vorbei",
+        "free.notify.ended_early" => "- die freie Zeit wurde mit dem Code beendet",
+        "free.warning.no_time" => "Die freie Zeit endet in 5 Minuten, und heute ist keine Bildschirmzeit mehr übrig. Jetzt speichern!",
+        "free.warning.low_time" => "Die freie Zeit endet in 5 Minuten. Danach bleiben noch {time} Bildschirmzeit.",
+
         // Fallback to English
         _ => en(key),
     }
@@ -1290,6 +1350,50 @@ mod tests {
             assert!(!en(key).is_empty(), "missing English text for {key}");
             assert!(!de(key).is_empty(), "missing German text for {key}");
             assert_ne!(en(key), de(key), "German text for {key} is just the English fallback");
+        }
+    }
+
+    #[test]
+    fn free_time_keys_are_translated() {
+        for key in [
+            "tray.free_menu", "tray.free_30", "tray.free_60", "tray.free_120", "tray.free_180", "tray.free_end",
+            "tray.pause_free", "pause.free_time", "passcode.action.free_time", "passcode.action.end_free_time",
+            "tg.cmd.free", "dc.cmd.free", "bot.status.free_time", "free.status.left", "free.reply.none",
+            "free.reply.started", "free.reply.countdown_waits", "free.reply.no_time_after", "free.reply.ended",
+            "free.reply.locked", "free.reply.lock_over_free", "free.reply.usage", "free.after.no_time",
+            "free.notify.started", "free.notify.ended", "free.notify.ended_early", "free.warning.no_time",
+            "free.warning.low_time",
+        ] {
+            assert!(!en(key).is_empty(), "missing English text for {key}");
+            assert!(!de(key).is_empty(), "missing German text for {key}");
+            assert_ne!(en(key), de(key), "German text for {key} is just the English fallback");
+        }
+        let placeholders = [
+            ("tray.free_end", "{mins}"),
+            ("free.status.left", "{time}"),
+            ("free.reply.started", "{time}"),
+            ("free.reply.countdown_waits", "{time}"),
+            ("free.reply.lock_over_free", "{time}"),
+            ("free.warning.low_time", "{time}"),
+            ("free.reply.usage", "{cmd}"),
+            ("free.reply.usage", "{max}"),
+        ];
+        for (key, placeholder) in placeholders {
+            assert!(en(key).contains(placeholder) && de(key).contains(placeholder), "{key} needs {placeholder}");
+        }
+        // The warning texts name the warning time
+        assert_eq!(crate::free_time::END_WARNING_SECS, 5 * 60);
+        // Bot texts go to Discord too: nothing in them may read as a mention.
+        for key in ["free.reply.usage", "free.notify.started", "free.notify.ended"] {
+            assert!(!en(key).contains('@') && !de(key).contains('@'), "{key}");
+        }
+    }
+
+    #[test]
+    fn idle_texts_say_any_use_resumes_the_timer() {
+        for key in ["tg.pause.idle_paused", "tg.resume.idle_auto"] {
+            assert!(!en(key).contains("input"), "{key}");
+            assert!(!de(key).contains("Eingabe"), "{key}");
         }
     }
 

@@ -191,6 +191,17 @@ fn format_time_compact(seconds: i32) -> String {
     }
 }
 
+/// Free time left for the mini overlay: "45:12" under an hour, "3h05" from
+/// an hour (seconds dropped, so "FREE 23h59" still fits the window).
+fn format_free_compact(seconds: i32) -> String {
+    let seconds = seconds.max(0);
+    if seconds >= 3600 {
+        format!("{}h{:02}", seconds / 3600, (seconds % 3600) / 60)
+    } else {
+        format!("{}:{:02}", seconds / 60, seconds % 60)
+    }
+}
+
 /// Get color based on remaining time
 fn get_time_color(seconds: i32) -> u32 {
     if seconds < 0 {
@@ -224,6 +235,9 @@ pub enum PauseBlockedReason {
     CooldownActive { seconds_remaining: i32 },
     MinActiveTimeNotMet { seconds_remaining: i32 },
     TimeTooLow,
+    /// Free time is on: nothing is being counted, so there's nothing to
+    /// pause (and pausing would only use up the pause allowance).
+    FreeTime,
 }
 
 /// Check if pause is currently available and return reason if not
@@ -231,6 +245,10 @@ pub fn can_pause() -> Result<(), PauseBlockedReason> {
     // Already paused - can always unpause
     if IS_PAUSED.load(Ordering::SeqCst) {
         return Ok(());
+    }
+
+    if crate::free_time::is_active() {
+        return Err(PauseBlockedReason::FreeTime);
     }
 
     // Check if pause feature is enabled
@@ -405,6 +423,12 @@ fn force_resume() {
     resume_timer();
 }
 
+/// End a pause in progress because free time started: it's counted as it
+/// stands, and no more of the pause allowance goes while nothing is counted.
+pub fn end_pause_for_free_time() {
+    resume_timer(); // no-op unless paused
+}
+
 // ============================================================================
 // Idle Detection Functions
 // ============================================================================
@@ -539,10 +563,19 @@ unsafe fn check_day_rollover(force: bool) {
     }
 }
 
-/// Check idle state and update IS_IDLE_PAUSED accordingly
+/// Check idle state and update IS_IDLE_PAUSED accordingly. Idle means no
+/// keyboard or mouse input and no other sign of use (sound playing, an app
+/// keeping the display on, a controller in use, a full-screen app - see
+/// activity.rs) for the timeout.
 fn check_idle_state() {
+    let enabled = database::is_idle_enabled();
+    // Signs of use are only gathered while they can matter. Never while the
+    // session is locked: a locked session is frozen whatever plays on, and
+    // a song left playing mustn't read as the child coming back.
+    crate::activity::set_counting(enabled && !IS_LOCK_PAUSED.load(Ordering::SeqCst));
+
     // Skip if idle detection is disabled
-    if !database::is_idle_enabled() {
+    if !enabled {
         // If it was idle-paused but feature got disabled, resume
         if IS_IDLE_PAUSED.load(Ordering::SeqCst) {
             IS_IDLE_PAUSED.store(false, Ordering::SeqCst);
@@ -550,7 +583,11 @@ fn check_idle_state() {
         return;
     }
 
-    let idle_seconds = get_idle_seconds();
+    let idle_seconds = crate::activity::effective_idle_secs(
+        get_idle_seconds(),
+        crate::activity::last_signal_ms(),
+        unsafe { GetTickCount64() },
+    );
     let threshold_seconds = database::get_idle_timeout_minutes() * 60;
     let currently_idle_paused = IS_IDLE_PAUSED.load(Ordering::SeqCst);
 
@@ -646,6 +683,7 @@ pub fn flush_on_exit() {
         resume_timer();
     }
     persist_day_counters();
+    crate::free_time::save();
 }
 
 /// What a tick does with the time that passed.
@@ -654,16 +692,25 @@ enum TickMode {
     /// Nothing counts: the lock overlay is up, or (not manually paused) the
     /// session is idle or locked.
     Frozen,
+    /// Free time: nothing counts against the allowance or the pause (free
+    /// time itself runs down separately, in real time - see free_time.rs).
+    Free,
     /// Manually paused: the time counts against the pause.
     Pause,
     /// Running: the time counts down the remaining allowance.
     Countdown,
 }
 
-fn tick_mode(blocked: bool, paused: bool, idle_paused: bool, locked: bool) -> TickMode {
+fn tick_mode(blocked: bool, free: bool, paused: bool, idle_paused: bool, locked: bool) -> TickMode {
     if blocked {
         // The lock overlay always froze both: it used to stop this timer.
+        // During free time it can only be a parent's lock (the out-of-time
+        // lock doesn't come up then, see `zero_time_lock_due`).
         TickMode::Frozen
+    } else if free {
+        // Ahead of a pause: a pause left on must not use up the allowance
+        // for it while nothing is being counted anyway.
+        TickMode::Free
     } else if paused {
         TickMode::Pause
     } else if idle_paused || locked {
@@ -696,12 +743,20 @@ fn crossed_threshold(prev: i32, new: i32, threshold: i32) -> bool {
     prev > threshold && new <= threshold
 }
 
-/// Whether the lock overlay has to come up: no time left and not already
-/// locked. Checked every tick, not just when a countdown step reaches zero,
+/// Whether the lock overlay has to come up: no time left, not already
+/// locked, and no free time on (it comes back up the tick after free time
+/// ends). Checked every tick, not just when a countdown step reaches zero,
 /// so a limit cut to 0 (bot or Settings), a reset to a 0-minute day, or a
 /// rollover onto one locks too. Negative remaining means "no limit".
-fn zero_time_lock_due(remaining: i32, blocked: bool) -> bool {
-    remaining == 0 && !blocked
+fn zero_time_lock_due(remaining: i32, blocked: bool, free: bool) -> bool {
+    remaining == 0 && !blocked && !free
+}
+
+/// Whether the child is warned that free time is about to end: they'll have
+/// no more screen time than the first low-time warning's threshold after it
+/// (otherwise there's nothing to warn about), and nothing hides the warning.
+fn free_time_end_warning_due(remaining: i32, first_warning_secs: i32, blocked: bool) -> bool {
+    !blocked && remaining >= 0 && remaining <= first_warning_secs
 }
 
 /// The pause duration after counting `secs` more, and whether the pause has
@@ -721,7 +776,8 @@ fn pause_step(prev: i32, secs: i32, max: i32) -> (i32, bool) {
 pub unsafe fn on_accounting_tick() {
     let now = GetTickCount64();
     let last = LAST_TICK_MS.swap(now, Ordering::SeqCst);
-    let credit = tick_credit_ms(now.saturating_sub(last));
+    let gap = now.saturating_sub(last);
+    let credit = tick_credit_ms(gap);
     let tick = TICK_COUNT.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
     let periodic = tick.is_multiple_of(PERIODIC_SAVE_TICKS);
 
@@ -733,13 +789,20 @@ pub unsafe fn on_accounting_tick() {
 
     crate::blocking::enforce_manual_lock();
 
+    // Free time runs down by the whole gap, sleep included (it's real time),
+    // whatever the timer is doing - before the mode is worked out, so the
+    // tick it ends on counts normally again.
+    run_down_free_time(gap);
+    crate::blocking::enforce_free_time();
+
     let mode = tick_mode(
         crate::blocking::is_blocking_overlay_visible(),
+        crate::free_time::is_active(),
         IS_PAUSED.load(Ordering::SeqCst),
         IS_IDLE_PAUSED.load(Ordering::SeqCst),
         IS_LOCK_PAUSED.load(Ordering::SeqCst),
     );
-    let secs = if mode == TickMode::Frozen {
+    let secs = if matches!(mode, TickMode::Frozen | TickMode::Free) {
         CREDIT_CARRY_MS.store(0, Ordering::SeqCst);
         0
     } else {
@@ -750,7 +813,7 @@ pub unsafe fn on_accounting_tick() {
     match mode {
         TickMode::Pause => accrue_pause(secs),
         TickMode::Countdown => count_down(secs),
-        TickMode::Frozen => {}
+        TickMode::Frozen | TickMode::Free => {}
     }
 
     enforce_zero_time();
@@ -846,11 +909,37 @@ unsafe fn count_down(secs: i32) {
     }
 }
 
+/// Run free time down by `gap_ms` (see free_time.rs). Shortly before it
+/// ends the child is warned if little or no screen time is left after it;
+/// when it ends the parent is told, and with no time left the lock screen
+/// comes back on this same tick (`enforce_zero_time`).
+unsafe fn run_down_free_time(gap_ms: u64) {
+    match crate::free_time::run_down(gap_ms) {
+        crate::free_time::RunDown::Nothing => {}
+        crate::free_time::RunDown::EndsSoon => {
+            let remaining = REMAINING_SECONDS.load(Ordering::SeqCst);
+            let (first_warning_mins, _) = database::get_warning_config(1);
+            let first_warning_secs = i32::try_from(first_warning_mins.saturating_mul(60)).unwrap_or(i32::MAX);
+            if free_time_end_warning_due(remaining, first_warning_secs, crate::blocking::is_blocking_overlay_visible()) {
+                crate::overlay::show_overlay(&crate::time_request::free_time_ending_text(remaining), 10);
+            }
+        }
+        crate::free_time::RunDown::Ended => {
+            crate::time_request::notify_free_time_ended(None, REMAINING_SECONDS.load(Ordering::SeqCst));
+            update_mini_overlay();
+        }
+    }
+}
+
 /// Bring up the lock overlay if there's no time left (see `zero_time_lock_due`).
 /// A manual pause in progress ends here and is counted.
 unsafe fn enforce_zero_time() {
     let remaining = REMAINING_SECONDS.load(Ordering::SeqCst);
-    if !zero_time_lock_due(remaining, crate::blocking::is_blocking_overlay_visible()) {
+    if !zero_time_lock_due(
+        remaining,
+        crate::blocking::is_blocking_overlay_visible(),
+        crate::free_time::is_active(),
+    ) {
         return;
     }
     resume_timer(); // no-op unless paused
@@ -895,12 +984,16 @@ pub unsafe extern "system" fn mini_overlay_proc(
             let mut rect: RECT = zeroed();
             GetClientRect(hwnd, &mut rect).ok();
 
+            let free_left = crate::free_time::seconds_left();
+            let free = free_left > 0;
             let paused = IS_PAUSED.load(Ordering::SeqCst);
             let idle_paused = IS_IDLE_PAUSED.load(Ordering::SeqCst);
             let locked = IS_LOCK_PAUSED.load(Ordering::SeqCst);
 
             // Background color changes when paused
-            let bg_color = if paused {
+            let bg_color = if free {
+                0x00223322 // Dark green during free time
+            } else if paused {
                 0x00332200 // Brownish when manually paused
             } else if locked {
                 0x00332222 // Dark red-ish when locked
@@ -916,7 +1009,10 @@ pub unsafe extern "system" fn mini_overlay_proc(
             // Get remaining time and pause info
             let remaining = REMAINING_SECONDS.load(Ordering::SeqCst);
 
-            let (display_text, color) = if paused {
+            let (display_text, color) = if free {
+                // Free time left, not the allowance: that isn't moving.
+                (format!("FREE {}", format_free_compact(free_left)), 0x0066DD66_u32) // Green
+            } else if paused {
                 // Show pause indicator and remaining pause time
                 let pause_duration = CURRENT_PAUSE_DURATION.load(Ordering::SeqCst);
                 let max_duration = PAUSE_MAX_SECONDS.load(Ordering::SeqCst);
@@ -1011,21 +1107,73 @@ mod tests {
 
     #[test]
     fn lock_overlay_freezes_everything() {
-        assert_eq!(tick_mode(true, false, false, false), TickMode::Frozen);
-        assert_eq!(tick_mode(true, true, false, false), TickMode::Frozen);
+        assert_eq!(tick_mode(true, false, false, false, false), TickMode::Frozen);
+        assert_eq!(tick_mode(true, false, true, false, false), TickMode::Frozen);
     }
 
     #[test]
     fn manual_pause_accrues_even_when_idle_or_locked() {
-        assert_eq!(tick_mode(false, true, false, false), TickMode::Pause);
-        assert_eq!(tick_mode(false, true, true, true), TickMode::Pause);
+        assert_eq!(tick_mode(false, false, true, false, false), TickMode::Pause);
+        assert_eq!(tick_mode(false, false, true, true, true), TickMode::Pause);
     }
 
     #[test]
     fn idle_and_session_lock_freeze_the_countdown() {
-        assert_eq!(tick_mode(false, false, true, false), TickMode::Frozen);
-        assert_eq!(tick_mode(false, false, false, true), TickMode::Frozen);
-        assert_eq!(tick_mode(false, false, false, false), TickMode::Countdown);
+        assert_eq!(tick_mode(false, false, false, true, false), TickMode::Frozen);
+        assert_eq!(tick_mode(false, false, false, false, true), TickMode::Frozen);
+        assert_eq!(tick_mode(false, false, false, false, false), TickMode::Countdown);
+    }
+
+    #[test]
+    fn free_time_counts_nothing() {
+        assert_eq!(tick_mode(false, true, false, false, false), TickMode::Free);
+        // Idle or Windows-locked during free time: still nothing counted
+        assert_eq!(tick_mode(false, true, false, true, false), TickMode::Free);
+        assert_eq!(tick_mode(false, true, false, false, true), TickMode::Free);
+    }
+
+    #[test]
+    fn a_pause_during_free_time_uses_no_pause_allowance() {
+        assert_eq!(tick_mode(false, true, true, false, false), TickMode::Free);
+        assert_eq!(tick_mode(false, true, true, true, true), TickMode::Free);
+    }
+
+    #[test]
+    fn a_parent_lock_during_free_time_still_locks() {
+        // The lock screen is up: frozen (free time runs down underneath)
+        assert_eq!(tick_mode(true, true, false, false, false), TickMode::Frozen);
+        assert_eq!(tick_mode(true, true, true, true, true), TickMode::Frozen);
+    }
+
+    #[test]
+    fn no_out_of_time_lock_during_free_time() {
+        assert!(!zero_time_lock_due(0, false, true));
+        // ...and it comes back once free time is over
+        assert!(zero_time_lock_due(0, false, false));
+        assert!(!zero_time_lock_due(600, false, false));
+    }
+
+    #[test]
+    fn free_time_end_warning_only_when_little_is_left_after() {
+        let ten_minutes = 600;
+        assert!(free_time_end_warning_due(0, ten_minutes, false), "no time left: locks at the end");
+        assert!(free_time_end_warning_due(300, ten_minutes, false));
+        assert!(free_time_end_warning_due(600, ten_minutes, false));
+        assert!(!free_time_end_warning_due(3600, ten_minutes, false), "plenty left");
+        assert!(!free_time_end_warning_due(-1, ten_minutes, false), "no limit");
+        assert!(!free_time_end_warning_due(0, ten_minutes, true), "behind a parent's lock");
+    }
+
+    #[test]
+    fn free_time_fits_the_mini_overlay() {
+        assert_eq!(format_free_compact(0), "0:00");
+        assert_eq!(format_free_compact(59), "0:59");
+        assert_eq!(format_free_compact(45 * 60 + 12), "45:12");
+        assert_eq!(format_free_compact(3599), "59:59");
+        assert_eq!(format_free_compact(3600), "1h00");
+        assert_eq!(format_free_compact(3 * 3600 + 5 * 60 + 59), "3h05");
+        assert_eq!(format_free_compact(24 * 3600), "24h00");
+        assert!(format!("FREE {}", format_free_compact(24 * 3600 - 1)).len() <= 10);
     }
 
     #[test]
@@ -1072,17 +1220,17 @@ mod tests {
 
     #[test]
     fn zero_time_locks_whenever_not_locked_already() {
-        assert!(zero_time_lock_due(0, false));
-        assert!(!zero_time_lock_due(0, true));
-        assert!(!zero_time_lock_due(1, false));
-        assert!(!zero_time_lock_due(-1, false), "negative means no limit");
+        assert!(zero_time_lock_due(0, false, false));
+        assert!(!zero_time_lock_due(0, true, false));
+        assert!(!zero_time_lock_due(1, false, false));
+        assert!(!zero_time_lock_due(-1, false, false), "negative means no limit");
     }
 
     #[test]
     fn extended_time_is_not_locked_on_the_next_tick() {
         // After an out-of-time show was undone because an extension arrived
         // (blocking::show_unless_time_arrived), the next tick doesn't retry.
-        assert!(!zero_time_lock_due(15 * 60, false));
+        assert!(!zero_time_lock_due(15 * 60, false, false));
     }
 
     /// A stand-in for the saved in-flight pause and the paused flag.

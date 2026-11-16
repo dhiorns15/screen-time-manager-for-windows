@@ -14,9 +14,10 @@ use teloxide::RequestError;
 use crate::database;
 use crate::i18n;
 use crate::remote_commands::{
-    cmd_clearlockout, cmd_extend, cmd_getpin, cmd_history, cmd_lock, cmd_msg, cmd_pause,
+    cmd_clearlockout, cmd_extend, cmd_free, cmd_getpin, cmd_history, cmd_lock, cmd_msg, cmd_pause,
     cmd_reduce, cmd_reset, cmd_resume, cmd_rotatingpin, cmd_setlimit, cmd_setmessage, cmd_setpin,
-    cmd_status, cmd_time, cmd_unlock, cmd_update, cmd_weekly, dispatch_minutes, measure_server_clock,
+    cmd_status, cmd_time, cmd_unlock, cmd_update, cmd_weekly, dispatch_minutes, free_grant_detail,
+    measure_server_clock,
     minutes_arg, reply_names_account, retry_delay, split_command, split_message, stale_age,
     stale_note, with_account, BotLifecycle, ChatMarkup, RateLimit, StartAction, WeeklyMarkup,
     STALE_NOTE_INTERVAL, TELEGRAM_MAX_MESSAGE, TELEGRAM_TIME_URL,
@@ -79,6 +80,8 @@ enum Command {
     /// `/lock`, or its alias `/stop`.
     Lock,
     Unlock,
+    /// `/free <minutes>`, `/free off` or `/free`.
+    Free(String),
     Reset,
     Setmessage(String),
     Setpin(String),
@@ -141,6 +144,7 @@ fn parse_command(text: &str, bot_username: Option<&str>) -> ParsedText {
         "msg" => Command::Msg(args),
         "lock" | "stop" => Command::Lock,
         "unlock" => Command::Unlock,
+        "free" => Command::Free(args),
         "reset" => Command::Reset,
         "setmessage" => Command::Setmessage(args),
         "setpin" => Command::Setpin(args),
@@ -175,6 +179,7 @@ fn help_text() -> String {
         ("/lock", i18n::t("tg.cmd.lock")),
         ("/stop", i18n::t("tg.cmd.stop")),
         ("/unlock", i18n::t("tg.cmd.unlock")),
+        ("/free <mins|off>", i18n::t("tg.cmd.free")),
         ("/reset", i18n::t("tg.cmd.reset")),
         ("/setmessage <text>", i18n::t("tg.cmd.setmessage")),
         ("/setpin <pin>", i18n::t("tg.cmd.setpin")),
@@ -743,7 +748,10 @@ async fn handle_command(
         Command::E120 => Some("+120 min".to_string()),
         Command::Reset => Some("reset to daily limit".to_string()),
         Command::Unlock if crate::blocking::is_blocking_overlay_visible()
-            && crate::blocking::get_remaining_seconds() > 0 => Some("unlocked".to_string()),
+            && (crate::blocking::get_remaining_seconds() > 0 || crate::free_time::is_active()) => {
+            Some("unlocked".to_string())
+        }
+        Command::Free(args) => free_grant_detail(args),
         _ => None,
     };
 
@@ -766,6 +774,7 @@ async fn handle_command(
         Command::Msg(text) => cmd_msg(&text),
         Command::Lock => cmd_lock(),
         Command::Unlock => cmd_unlock(),
+        Command::Free(args) => cmd_free(&args, "/free"),
         Command::Reset => cmd_reset(),
         Command::Setmessage(text) => cmd_setmessage(&text),
         Command::Setpin(pin) => setpin_and_delete(&bot, &msg, &pin).await,
@@ -973,6 +982,9 @@ mod tests {
             Some((Command::Msg("Dinner is ready!".to_string()), "msg".to_string()))
         );
         assert_eq!(command("/msg"), Some((Command::Msg(String::new()), "msg".to_string())));
+        assert_eq!(command("/Free 90"), Some((Command::Free("90".to_string()), "free".to_string())));
+        assert_eq!(command("/free off"), Some((Command::Free("off".to_string()), "free".to_string())));
+        assert_eq!(command("/free"), Some((Command::Free(String::new()), "free".to_string())));
     }
 
     #[test]
@@ -1006,7 +1018,7 @@ mod tests {
         let help = help_text();
         for name in [
             "start", "status", "time", "extend", "reduce", "pause", "resume", "history", "weekly", "msg", "lock",
-            "stop", "unlock", "reset", "setmessage", "setpin", "setlimit", "rotatingpin", "getpin",
+            "stop", "unlock", "free", "reset", "setmessage", "setpin", "setlimit", "rotatingpin", "getpin",
             "clearlockout", "update", "e30", "e60", "e120", "chatid", "help",
         ] {
             assert!(command(&format!("/{name}")).is_some(), "/{name} isn't parsed");

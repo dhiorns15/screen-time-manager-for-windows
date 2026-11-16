@@ -100,9 +100,19 @@ Your child can pause the timer for meals, homework, or breaks without needing yo
 
 You can change all three in Settings, under "Pause Timer". Set the daily pause to 0 to turn pausing off (a pause that's running then ends straight away).
 
-**Auto-pause when idle** stops the timer after 5 minutes without keyboard or mouse input, so a child who walks away doesn't keep losing time. It's on by default. Playing with a controller or watching a video doesn't count as input either, so if that matters for your child, turn it off (or lengthen the wait) in Settings, under "Idle Detection".
+**Auto-pause when idle** stops the timer after 5 minutes without anyone using the PC, so a child who walks away doesn't keep losing time. It's on by default; change the wait or turn it off in Settings, under "Idle Detection". Besides the keyboard and mouse, any of these counts as using the PC and keeps the timer running: sound playing (a muted or silent video doesn't count), an app keeping the screen on (as video players do), a game controller being used, or a full-screen app or game. A locked screen always stops the timer.
 
 You can view pause usage in "Today's Stats..." from the tray menu.
+
+---
+
+## Free Time
+
+You can give your child free time: for the length you choose, the PC can be used and no screen time is used up. The countdown stops where it is, the low-time warnings don't come, and if the time had run out the lock screen goes away until the free time ends. Start it from the tray menu ("Free time", with the passcode) or remotely with `/free 90` (Telegram) or `!free 90` (Discord), up to 1440 minutes; `/free off` ends it early and `/free` shows how much is left. The small timer shows "FREE" and the time left.
+
+Free time runs in real time - give 60 minutes at 3 pm and it ends at about 4 pm, whether the PC is used, left alone, locked or asleep in between. It carries on across a restart or midnight, and changing the PC's clock doesn't make it last longer. When it ends the countdown carries on from where it was; if no time is left, the lock screen comes back. If little or no time will be left, your child is warned 5 minutes before free time ends. You get a message when it ends, and when it is started or ended from the tray menu. Free time isn't counted as time used in the stats.
+
+Your lock (`/lock`) wins: free time can't be started while it's on, and locking during free time locks at once (the free time keeps running down meanwhile).
 
 ---
 
@@ -128,6 +138,7 @@ You can monitor and control screen time from your phone using Telegram. This is 
 - `/reset` - Set the remaining time back to today's full limit
 - `/lock` (or `/stop`) - Show the lock screen now; it stays until you unlock, extend or reset (or the passcode is entered), even across a restart or midnight
 - `/unlock` - End your lock without changing remaining time; the lock screen goes if there's still time left
+- `/free 90` - Free time: stop the countdown for 90 minutes (up to 1440; see [Free Time](#free-time)). `/free off` ends it, `/free` shows what's left
 - `/pause` - Pause the timer
 - `/resume` - Resume the timer
 - `/history` - See today's pause activity
@@ -176,6 +187,7 @@ You can also monitor and control screen time from a Discord channel, using a Dis
 - `!reset` - Set the remaining time back to today's full limit
 - `!lock` (or `!stop`) - Show the lock screen now; it stays until you unlock, extend or reset (or the passcode is entered), even across a restart or midnight
 - `!unlock` - End your lock without changing remaining time; the lock screen goes if there's still time left
+- `!free 90` - Free time: stop the countdown for 90 minutes (up to 1440; see [Free Time](#free-time)). `!free off` ends it, `!free` shows what's left
 - `!pause` - Pause the timer
 - `!resume` - Resume the timer
 - `!history` - See today's pause activity

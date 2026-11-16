@@ -326,6 +326,49 @@ pub fn notify_low_time(minutes: u32, remaining_seconds: i32) {
     notify_live(&text);
 }
 
+/// Free time was started on this PC (`source_key`: where - the tray menu,
+/// with the passcode). Through the alert queue, like the passcode-extend
+/// alert: the passcode being used is worth knowing about either way. Free
+/// time started from a bot is answered in that chat instead.
+pub fn notify_free_time_started(source_key: &str, minutes: i32) {
+    let text = format!(
+        "🎁 {} {} {} ({})",
+        current_windows_username(),
+        i18n::t("free.notify.started"),
+        format_hm(minutes.saturating_mul(60)),
+        i18n::t(source_key),
+    );
+    watchdog::raise_alert(&text);
+}
+
+/// Free time ended: it ran out (`source_key` `None`), or was ended on this
+/// PC (`Some`: where). Through the alert queue - the parent needs to know
+/// the countdown (or the lock screen) is back. Ended from a bot, the reply
+/// says so instead.
+pub fn notify_free_time_ended(source_key: Option<&str>, remaining_seconds: i32) {
+    let header = match source_key {
+        None => i18n::t("free.notify.ended").to_string(),
+        Some(key) => format!("{} ({})", i18n::t("free.notify.ended_early"), i18n::t(key)),
+    };
+    let after = if remaining_seconds == 0 {
+        i18n::t("free.after.no_time").to_string()
+    } else {
+        format!("{}: {}", i18n::t("tg.status.remaining"), format_hm(remaining_seconds))
+    };
+    let text = format!("⏱ {} {}\n⏳ {}", current_windows_username(), header, after);
+    watchdog::raise_alert(&text);
+}
+
+/// The child's warning shortly before free time ends (see
+/// `mini_overlay::run_down_free_time`), with the screen time left after it.
+pub fn free_time_ending_text(remaining_seconds: i32) -> String {
+    if remaining_seconds <= 0 {
+        i18n::t("free.warning.no_time").to_string()
+    } else {
+        i18n::t("free.warning.low_time").replace("{time}", &format_hm(remaining_seconds))
+    }
+}
+
 /// Called the moment remaining time hits zero and the blocking overlay
 /// triggers - the actual enforcement event, so worth a push regardless of
 /// whether either warning threshold was configured/reached first. Through
