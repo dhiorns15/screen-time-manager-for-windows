@@ -20,7 +20,7 @@ use windows::{
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Controls::*,
-            Input::KeyboardAndMouse::{EnableWindow, SetFocus, VK_ESCAPE, VK_RETURN},
+            Input::KeyboardAndMouse::{EnableWindow, IsWindowEnabled, SetFocus, VK_ESCAPE, VK_RETURN},
             WindowsAndMessaging::*,
         },
     },
@@ -120,6 +120,66 @@ unsafe fn run_modal_loop(dlg: HWND) {
                 DispatchMessageW(&msg);
             }
         }
+    }
+}
+
+thread_local! {
+    /// Owners that `begin_modal` disabled, by the dialog they wait for.
+    static MODAL_OWNERS: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Make `dlg` modal to `owner`: the owner takes no input until `end_modal`.
+/// The setup wizards used to leave Settings clickable behind them, so its
+/// Save could write the old fields back over what the wizard had just saved.
+/// An owner that is already disabled (it is itself waiting for another
+/// dialog) is left to whoever disabled it.
+unsafe fn begin_modal(dlg: HWND, owner: HWND) {
+    if owner.0.is_null() || !IsWindow(owner).as_bool() || !IsWindowEnabled(owner).as_bool() {
+        return;
+    }
+    let _ = EnableWindow(owner, false);
+    MODAL_OWNERS.with(|m| m.borrow_mut().push((dlg.0 as usize, owner.0 as usize)));
+}
+
+/// Give back the owner `begin_modal` disabled for `dlg`, once; later calls
+/// do nothing. Called before the dialog is destroyed where possible, so
+/// Windows activates the owner rather than some other program's window.
+unsafe fn end_modal(dlg: HWND) {
+    let owner = MODAL_OWNERS.with(|m| {
+        let mut m = m.borrow_mut();
+        let i = m.iter().position(|(d, _)| *d == dlg.0 as usize)?;
+        Some(m.remove(i).1)
+    });
+    if let Some(owner) = owner {
+        let owner = HWND(owner as *mut std::ffi::c_void);
+        if IsWindow(owner).as_bool() {
+            let _ = EnableWindow(owner, true);
+        }
+    }
+}
+
+/// Close a modal dialog (Finish, Cancel, its close button).
+unsafe fn close_modal(dlg: HWND) {
+    end_modal(dlg);
+    let _ = DestroyWindow(dlg);
+}
+
+/// Show `dlg` modal to `owner` and wait until it is gone. However it ends -
+/// Finish, Cancel, the close button, the owner being destroyed, or the app
+/// quitting (WM_QUIT) - the owner gets its input back and, if it still
+/// exists, the focus.
+unsafe fn run_owned_modal(dlg: HWND, owner: HWND) {
+    begin_modal(dlg, owner);
+    let _ = ShowWindow(dlg, SW_SHOW);
+    let _ = SetForegroundWindow(dlg);
+    run_modal_loop(dlg);
+    end_modal(dlg);
+    if IsWindow(dlg).as_bool() {
+        // The loop ended on WM_QUIT: the app is closing.
+        let _ = DestroyWindow(dlg);
+    }
+    if !owner.0.is_null() && IsWindow(owner).as_bool() {
+        let _ = SetForegroundWindow(owner);
     }
 }
 
@@ -2298,6 +2358,13 @@ fn set_wizard_chat(chat: Option<DetectedChat>) {
 /// Show the Telegram setup wizard. Returns whether it saved a configuration
 /// (it does so on reaching its last step, whether or not Finish is clicked).
 pub unsafe fn show_telegram_wizard(parent_hwnd: HWND) -> bool {
+    // One at a time: the wizard's state is shared (statics below).
+    let open = HWND(WIZARD_HWND.load(AtomicOrdering::SeqCst));
+    if !open.0.is_null() && IsWindow(open).as_bool() {
+        let _ = SetForegroundWindow(open);
+        return false;
+    }
+
     // Reset wizard state
     WIZARD_STEP = 1;
     WIZARD_TOKEN = None;
@@ -2334,9 +2401,7 @@ pub unsafe fn show_telegram_wizard(parent_hwnd: HWND) -> bool {
 
     if let Ok(hwnd) = wizard_hwnd {
         WIZARD_HWND.store(hwnd.0, AtomicOrdering::SeqCst);
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetForegroundWindow(hwnd);
-        run_modal_loop(hwnd);
+        run_owned_modal(hwnd, parent_hwnd);
     }
 
     WIZARD_HWND.store(std::ptr::null_mut(), AtomicOrdering::SeqCst);
@@ -2372,10 +2437,12 @@ unsafe extern "system" fn wizard_proc(
         }
         WM_CLOSE => {
             // Close only this wizard (see run_modal_loop).
-            DestroyWindow(hwnd).ok();
+            close_modal(hwnd);
             LRESULT(0)
         }
         WM_DESTROY => {
+            // Also when Settings, its owner, is destroyed.
+            end_modal(hwnd);
             KillTimer(hwnd, TIMER_POLL_TELEGRAM).ok();
             WIZARD_POLLING = false;
             LRESULT(0)
@@ -3004,7 +3071,7 @@ unsafe fn update_wizard_buttons(hwnd: HWND) {
 unsafe fn handle_wizard_command(hwnd: HWND, id: i32) {
     match id {
         ID_WIZARD_CANCEL => {
-            DestroyWindow(hwnd).ok();
+            close_modal(hwnd);
         }
         ID_WIZARD_BACK => {
             if WIZARD_STEP > 1 {
@@ -3075,7 +3142,7 @@ unsafe fn handle_wizard_command(hwnd: HWND, id: i32) {
                 let _ = InvalidateRect(hwnd, None, true);
             } else {
                 // Finish
-                DestroyWindow(hwnd).ok();
+                close_modal(hwnd);
             }
         }
         ID_WIZARD_TOKEN_EDIT => {
@@ -3304,11 +3371,20 @@ static mut DC_WIZARD_CHANNEL_ID: Option<String> = None;
 static mut DC_WIZARD_USER_ID: Option<String> = None;
 /// Whether this run of the wizard saved a configuration.
 static mut DC_WIZARD_SAVED: bool = false;
+/// The Discord wizard window while it is open.
+static DC_WIZARD_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 const DC_WIZARD_TOTAL_STEPS: i32 = 5;
 
 /// Show the Discord setup wizard. Returns whether it saved a configuration
 /// (it does so on reaching its last step, whether or not Finish is clicked).
 pub unsafe fn show_discord_wizard(parent_hwnd: HWND) -> bool {
+    // One at a time: the wizard's state is shared (statics above).
+    let open = HWND(DC_WIZARD_HWND.load(AtomicOrdering::SeqCst));
+    if !open.0.is_null() && IsWindow(open).as_bool() {
+        let _ = SetForegroundWindow(open);
+        return false;
+    }
+
     // Reset wizard state
     DC_WIZARD_STEP = 1;
     DC_WIZARD_TOKEN = None;
@@ -3344,10 +3420,10 @@ pub unsafe fn show_discord_wizard(parent_hwnd: HWND) -> bool {
     );
 
     if let Ok(hwnd) = wizard_hwnd {
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetForegroundWindow(hwnd);
-        run_modal_loop(hwnd);
+        DC_WIZARD_HWND.store(hwnd.0, AtomicOrdering::SeqCst);
+        run_owned_modal(hwnd, parent_hwnd);
     }
+    DC_WIZARD_HWND.store(std::ptr::null_mut(), AtomicOrdering::SeqCst);
     DC_WIZARD_SAVED
 }
 
@@ -3374,7 +3450,12 @@ unsafe extern "system" fn dc_wizard_proc(
         }
         WM_CLOSE => {
             // Close only this wizard (see run_modal_loop).
-            DestroyWindow(hwnd).ok();
+            close_modal(hwnd);
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            // Also when Settings, its owner, is destroyed.
+            end_modal(hwnd);
             LRESULT(0)
         }
         WM_NCDESTROY => {
@@ -3947,7 +4028,7 @@ unsafe fn update_dc_wizard_buttons(hwnd: HWND) {
 unsafe fn handle_dc_wizard_command(hwnd: HWND, id: i32) {
     match id {
         ID_DC_WIZARD_CANCEL => {
-            DestroyWindow(hwnd).ok();
+            close_modal(hwnd);
         }
         ID_DC_WIZARD_BACK => {
             if DC_WIZARD_STEP > 1 {
@@ -4040,7 +4121,7 @@ unsafe fn handle_dc_wizard_command(hwnd: HWND, id: i32) {
                 let _ = InvalidateRect(hwnd, None, true);
             } else {
                 // Finish
-                DestroyWindow(hwnd).ok();
+                close_modal(hwnd);
             }
         }
         ID_DC_WIZARD_TOKEN_EDIT => {
@@ -4109,6 +4190,47 @@ fn send_discord_test_message(token: &str, channel_id: std::num::NonZeroU64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hidden top-level window (owned by `owner` if given) for the modal
+    /// tests; never shown.
+    unsafe fn hidden_window(owner: Option<HWND>) -> HWND {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0), w!("STATIC"), w!(""), WS_POPUP,
+            0, 0, 10, 10, owner.unwrap_or_default(), HMENU::default(), None, None,
+        )
+        .expect("create test window")
+    }
+
+    #[test]
+    fn a_wizard_disables_its_owner_until_it_closes() {
+        unsafe {
+            let settings = hidden_window(None);
+            let wizard = hidden_window(Some(settings));
+            begin_modal(wizard, settings);
+            assert!(!IsWindowEnabled(settings).as_bool(), "Settings must not take clicks behind the wizard");
+            close_modal(wizard);
+            assert!(IsWindowEnabled(settings).as_bool(), "Finish/Cancel/close give Settings back");
+            assert!(!IsWindow(wizard).as_bool());
+
+            // Destroyed some other way (its owner going away): WM_DESTROY's
+            // end_modal, or the cleanup after the loop, re-enables; repeating
+            // it is harmless.
+            let wizard = hidden_window(Some(settings));
+            begin_modal(wizard, settings);
+            end_modal(wizard);
+            end_modal(wizard);
+            assert!(IsWindowEnabled(settings).as_bool());
+            let _ = DestroyWindow(wizard);
+
+            // An owner already disabled by someone else stays disabled.
+            let _ = EnableWindow(settings, false);
+            let wizard = hidden_window(Some(settings));
+            begin_modal(wizard, settings);
+            close_modal(wizard);
+            assert!(!IsWindowEnabled(settings).as_bool());
+            let _ = DestroyWindow(settings);
+        }
+    }
 
     /// The newest chat in a `getUpdates` body, whatever its id.
     fn parse_latest_chat(body: &str) -> Option<DetectedChat> {
