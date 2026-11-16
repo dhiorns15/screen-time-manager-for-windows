@@ -140,7 +140,7 @@ pub unsafe fn show_context_menu(hwnd: HWND) {
         match can_pause() {
             Ok(()) => {
                 let budget_mins = get_remaining_pause_budget() / 60;
-                let text = format!("Pause Timer ({}m left)", budget_mins);
+                let text = i18n::t("tray.pause_left").replace("{mins}", &budget_mins.to_string());
                 // Need to leak the string for the menu (will be cleaned up with menu)
                 let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
                 let ptr = wide.as_ptr();
@@ -152,7 +152,7 @@ pub unsafe fn show_context_menu(hwnd: HWND) {
             }
             Err(PauseBlockedReason::CooldownActive { seconds_remaining }) => {
                 let mins = (seconds_remaining + 59) / 60; // Round up
-                let text = format!("Pause ({}m cooldown)", mins);
+                let text = i18n::t("tray.pause_cooldown").replace("{mins}", &mins.to_string());
                 let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
                 let ptr = wide.as_ptr();
                 std::mem::forget(wide);
@@ -160,7 +160,7 @@ pub unsafe fn show_context_menu(hwnd: HWND) {
             }
             Err(PauseBlockedReason::MinActiveTimeNotMet { seconds_remaining }) => {
                 let mins = (seconds_remaining + 59) / 60;
-                let text = format!("Pause (wait {}m)", mins);
+                let text = i18n::t("tray.pause_wait").replace("{mins}", &mins.to_string());
                 let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
                 let ptr = wide.as_ptr();
                 std::mem::forget(wide);

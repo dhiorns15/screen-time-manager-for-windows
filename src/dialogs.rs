@@ -21,6 +21,7 @@ use windows::{
         UI::{
             Controls::*,
             Input::KeyboardAndMouse::{EnableWindow, IsWindowEnabled, SetFocus, VK_ESCAPE, VK_RETURN},
+            Shell::{Shell_NotifyIconW, NIF_TIP, NIM_MODIFY},
             WindowsAndMessaging::*,
         },
     },
@@ -1589,7 +1590,11 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                                 1 => Language::German,
                                 _ => Language::English,
                             };
+                            let changed = lang != i18n::current();
                             i18n::set_language(lang);
+                            if changed {
+                                refresh_tray_tooltip();
+                            }
                         }
                     }
 
@@ -1695,10 +1700,11 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
     SETTINGS_CONTENT_HEIGHT = 0;
     SETTINGS_SCROLLABLE = false;
 
+    let window_title = i18n::wide("window.settings");
     let dialog_hwnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_DLGMODALFRAME,
         dialog_class,
-        w!("Screen Time Settings"),
+        PCWSTR(window_title.as_ptr()),
         WS_POPUP | WS_CAPTION | WS_SYSMENU,
         (screen_width - dialog_width) / 2,
         (screen_height - dialog_height) / 2,
@@ -1728,6 +1734,23 @@ static mut SETTINGS_SCROLL_POS: i32 = 0;
 static mut SETTINGS_SCROLLABLE: bool = false;
 /// The red "still the default passcode" label, if shown.
 static mut SETTINGS_DEFAULT_PASSCODE_WARNING: HWND = HWND(std::ptr::null_mut());
+
+/// Show the tray icon's tooltip in the language now set (it used to keep
+/// the old language until the app restarted). Menus, dialogs and messages
+/// read the language each time they're shown; the tooltip is set once.
+unsafe fn refresh_tray_tooltip() {
+    let nid = std::ptr::addr_of_mut!(crate::tray::NOTIFY_ICON_DATA);
+    let Some(nid) = (*nid).as_mut() else {
+        return; // no tray icon (yet); it's added with the current language
+    };
+    nid.szTip = [0; 128];
+    for (i, c) in i18n::t("tray.tooltip").encode_utf16().take(127).enumerate() {
+        nid.szTip[i] = c;
+    }
+    let mut modify = *nid;
+    modify.uFlags = NIF_TIP;
+    let _ = Shell_NotifyIconW(NIM_MODIFY, &modify);
+}
 
 /// Set a Settings edit field's text (nothing if the field doesn't exist).
 unsafe fn set_field_text(edit: HWND, text: &str) {
@@ -2261,8 +2284,7 @@ pub unsafe fn show_stats_dialog(parent_hwnd: HWND) {
                 }
 
                 // Get weekday name
-                let weekday_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
-                let weekday_name = weekday_names.get(weekday as usize).unwrap_or(&"Unknown");
+                let weekday_name = i18n::weekday(weekday as usize);
 
                 // Title font (DPI scaled, ClearType quality = 5)
                 let title_font = CreateFontW(
@@ -2322,7 +2344,7 @@ pub unsafe fn show_stats_dialog(parent_hwnd: HWND) {
 
                 SelectObject(hdc, value_font);
                 SetTextColor(hdc, COLORREF(0x00333333));
-                let limit_str = format!("{} min", daily_limit_minutes);
+                let limit_str = format!("{} {}", daily_limit_minutes, i18n::t("stats.minutes"));
                 let mut value_rect = RECT { left: value_x, top: y, right: rect.right - scale(15), bottom: y + scale(22) };
                 DrawTextW(hdc, &mut limit_str.encode_utf16().collect::<Vec<_>>(), &mut value_rect, DT_SINGLELINE);
                 y += scale(24);
@@ -2376,7 +2398,7 @@ pub unsafe fn show_stats_dialog(parent_hwnd: HWND) {
 
                     SelectObject(hdc, value_font);
                     SetTextColor(hdc, COLORREF(0x00333333));
-                    let pause_used_str = format!("{} / {} min", pause_used_seconds / 60, pause_config.daily_budget_minutes);
+                    let pause_used_str = format!("{} / {} {}", pause_used_seconds / 60, pause_config.daily_budget_minutes, i18n::t("stats.minutes"));
                     let mut value_rect = RECT { left: value_x, top: y, right: rect.right - scale(15), bottom: y + scale(22) };
                     DrawTextW(hdc, &mut pause_used_str.encode_utf16().collect::<Vec<_>>(), &mut value_rect, DT_SINGLELINE);
                     y += scale(24);

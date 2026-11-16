@@ -628,6 +628,12 @@ fn en(key: &str) -> &'static str {
         "blocking.request_already_sent" => "✅ Already sent! Wait",
         "blocking.parent_lock_title" => "Locked by a parent",
 
+        // ----- Tray pause items and Stats units, in the chosen language -----
+        "tray.pause_left" => "Pause Timer ({mins}m left)",
+        "tray.pause_cooldown" => "Pause ({mins}m cooldown)",
+        "tray.pause_wait" => "Pause (wait {mins}m)",
+        "stats.minutes" => "min",
+
         // Fallback - return empty string for unknown keys (should not happen in practice)
         _ => "",
     }
@@ -1157,6 +1163,12 @@ fn de(key: &str) -> &'static str {
         "blocking.request_not_sent" => "⚠️ Nicht gesendet - der Bot ist nicht fertig eingerichtet",
         "blocking.request_already_sent" => "✅ Bereits gesendet! Warten",
         "blocking.parent_lock_title" => "Von den Eltern gesperrt",
+
+        // ----- Pause-Einträge im Tray-Menü, Einheit in der Statistik -----
+        "tray.pause_left" => "Timer pausieren (noch {mins} Min)",
+        "tray.pause_cooldown" => "Pause (Wartezeit {mins} Min)",
+        "tray.pause_wait" => "Pause (in {mins} Min möglich)",
+        "stats.minutes" => "Min",
 
         // Fallback to English
         _ => en(key),
