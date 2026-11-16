@@ -13,7 +13,7 @@ use windows::{
             CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, EndPaint,
             EnumDisplayMonitors, FillRect, InvalidateRect, RoundRect, SelectObject, SetBkMode,
             SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, FW_BOLD, FW_NORMAL,
-            HDC, HFONT, HMONITOR, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
+            HDC, HFONT, HGDIOBJ, HMONITOR, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
         },
         Media::Audio::{PlaySoundW, SND_ALIAS, SND_ASYNC},
         System::LibraryLoader::GetModuleHandleW,
@@ -841,11 +841,10 @@ pub unsafe extern "system" fn blocking_overlay_proc(
             );
 
             // Separator line before passcode section
-            let sep_pen = CreatePen(PS_SOLID, 1, COLORREF(0x00444444));
-            SelectObject(hdc, sep_pen);
-            let _ = windows::Win32::Graphics::Gdi::MoveToEx(hdc, panel_x + scale(40), panel_y + scale(265), None);
-            let _ = windows::Win32::Graphics::Gdi::LineTo(hdc, panel_x + panel_width - scale(40), panel_y + scale(265));
-            let _ = DeleteObject(sep_pen);
+            draw_with(hdc, CreatePen(PS_SOLID, 1, COLORREF(0x00444444)).into(), || {
+                let _ = windows::Win32::Graphics::Gdi::MoveToEx(hdc, panel_x + scale(40), panel_y + scale(265), None);
+                let _ = windows::Win32::Graphics::Gdi::LineTo(hdc, panel_x + panel_width - scale(40), panel_y + scale(265));
+            });
 
             // "Enter passcode:" label
             let mut passcode_label_rect = RECT {
@@ -862,11 +861,10 @@ pub unsafe extern "system" fn blocking_overlay_proc(
             );
 
             // Separator + "request more time" section (no passcode needed)
-            let sep2_pen = CreatePen(PS_SOLID, 1, COLORREF(0x00444444));
-            SelectObject(hdc, sep2_pen);
-            let _ = windows::Win32::Graphics::Gdi::MoveToEx(hdc, panel_x + scale(40), panel_y + scale(476), None);
-            let _ = windows::Win32::Graphics::Gdi::LineTo(hdc, panel_x + panel_width - scale(40), panel_y + scale(476));
-            let _ = DeleteObject(sep2_pen);
+            draw_with(hdc, CreatePen(PS_SOLID, 1, COLORREF(0x00444444)).into(), || {
+                let _ = windows::Win32::Graphics::Gdi::MoveToEx(hdc, panel_x + scale(40), panel_y + scale(476), None);
+                let _ = windows::Win32::Graphics::Gdi::LineTo(hdc, panel_x + panel_width - scale(40), panel_y + scale(476));
+            });
 
             SelectObject(hdc, label_font);
             SetTextColor(hdc, COLORREF(0x00AAAAAA));
@@ -915,15 +913,15 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                     0, 0, 0, 0, 0, 0, 5, 0,
                     w!("Segoe UI"),
                 );
-                SelectObject(hdc, error_font);
-                let mut error_rect = passcode_notice_rect(panel_x, panel_y, panel_width, panel_height);
-                DrawTextW(
-                    hdc,
-                    &mut text.encode_utf16().collect::<Vec<_>>(),
-                    &mut error_rect,
-                    DT_CENTER | DT_SINGLELINE,
-                );
-                let _ = DeleteObject(error_font);
+                draw_with(hdc, error_font.into(), || {
+                    let mut error_rect = passcode_notice_rect(panel_x, panel_y, panel_width, panel_height);
+                    DrawTextW(
+                        hdc,
+                        &mut text.encode_utf16().collect::<Vec<_>>(),
+                        &mut error_rect,
+                        DT_CENTER | DT_SINGLELINE,
+                    );
+                });
             }
 
             // Cleanup fonts
@@ -1212,6 +1210,22 @@ pub unsafe extern "system" fn blocking_overlay_proc(
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+/// Select `object` (a pen, font or brush made for this one drawing step)
+/// into `hdc`, run `draw`, put back whatever was selected before, then delete
+/// `object`. Returns whether the delete worked. The documentation says not
+/// to delete an object while it is still selected into a DC (DeleteObject
+/// then fails); the lock screen's WM_PAINT used to do that with its two
+/// separator pens and the passcode-notice font on every repaint, once a
+/// second. (On Windows 11 a test of that pattern showed no handles left
+/// behind - GDI defers such a delete until the object is deselected - but
+/// that isn't something to rely on.)
+unsafe fn draw_with(hdc: HDC, object: HGDIOBJ, draw: impl FnOnce()) -> bool {
+    let previous = SelectObject(hdc, object);
+    draw();
+    SelectObject(hdc, previous);
+    DeleteObject(object).as_bool()
 }
 
 /// Create one child control of the blocking overlay, unplaced (see
@@ -1756,6 +1770,25 @@ mod tests {
         assert!(!countdown_should_run(true, true), "Windows lock screen");
         assert!(!countdown_should_run(false, false), "switched away");
         assert!(!countdown_should_run(false, true));
+    }
+
+    #[test]
+    fn paint_objects_are_freed_after_drawing() {
+        use windows::Win32::System::Threading::{GetCurrentProcess, GetGuiResources, GR_GDIOBJECTS};
+        unsafe {
+            let hdc = CreateCompatibleDC(None);
+            assert!(!hdc.is_invalid());
+            let gdi_objects = || GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+
+            let before = gdi_objects();
+            for _ in 0..500 {
+                assert!(draw_with(hdc, CreatePen(PS_SOLID, 1, COLORREF(0)).into(), || {}));
+                let font = CreateFontW(15, 0, 0, 0, FW_BOLD.0 as i32, 0, 0, 0, 0, 0, 0, 5, 0, w!("Segoe UI"));
+                assert!(draw_with(hdc, font.into(), || {}));
+            }
+            assert_eq!(gdi_objects(), before, "a thousand paint objects later");
+            let _ = DeleteDC(hdc);
+        }
     }
 
     #[test]
