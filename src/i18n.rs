@@ -222,7 +222,7 @@ fn en(key: &str) -> &'static str {
         "blocking.signout_now" => "SIGNING OUT IN:",
 
         // ----- About Dialog -----
-        "about.text" => concat!("Screen Time Manager v", env!("CARGO_PKG_VERSION"), "\n\nA parental control application for managing screen time.\n\n(c) Simon Pamies"),
+        "about.text" => concat!("Screen Time Manager v", env!("CARGO_PKG_VERSION"), "\n\nA parental control application for managing screen time.\n\n(c) Screen Time Manager contributors"),
 
         // ----- Pause Reasons -----
         "pause.disabled" => "Pause feature is disabled",
@@ -772,7 +772,7 @@ fn de(key: &str) -> &'static str {
         "blocking.signout_now" => "ABMELDUNG IN:",
 
         // ----- About Dialog -----
-        "about.text" => concat!("Bildschirmzeit Manager v", env!("CARGO_PKG_VERSION"), "\n\nEine Kindersicherungs-App zur Verwaltung der Bildschirmzeit.\n\n(c) Simon Pamies"),
+        "about.text" => concat!("Bildschirmzeit Manager v", env!("CARGO_PKG_VERSION"), "\n\nEine Kindersicherungs-App zur Verwaltung der Bildschirmzeit.\n\n(c) Screen Time Manager contributors"),
 
         // ----- Pause Reasons -----
         "pause.disabled" => "Pause-Funktion ist deaktiviert",

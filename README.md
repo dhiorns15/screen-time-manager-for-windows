@@ -8,7 +8,6 @@ No complicated setup. No special accounts needed. Just install it and configure 
 
 Confirmed to be effectively blocking Fortnite, Roblox and Minecraft.
 
-Originally created by Simon Pamies ([spamsch/screen-time-manager-for-windows](https://github.com/spamsch/screen-time-manager-for-windows)); this project continues from his work.
 
 ---
 
@@ -338,4 +337,4 @@ The [release workflow](.github/workflows/release.yml) refuses a tag that doesn't
 
 ## License
 
-MIT - see [LICENSE](LICENSE). Originally written by Simon Pamies.
+MIT - see [LICENSE](LICENSE).

@@ -37,11 +37,11 @@ fn main() {
          BEGIN\n\
          BLOCK \"040904b0\"\n\
          BEGIN\n\
-         VALUE \"CompanyName\", \"Shadow\"\n\
+         VALUE \"CompanyName\", \"Screen Time Manager contributors\"\n\
          VALUE \"FileDescription\", \"Screen Time Manager\"\n\
          VALUE \"FileVersion\", \"{version}.0\"\n\
          VALUE \"InternalName\", \"screen-time-manager\"\n\
-         VALUE \"LegalCopyright\", \"Copyright (C) Shadow. MIT License.\"\n\
+         VALUE \"LegalCopyright\", \"Copyright (C) Screen Time Manager contributors. MIT License.\"\n\
          VALUE \"OriginalFilename\", \"screen-time-manager.exe\"\n\
          VALUE \"ProductName\", \"Screen Time Manager\"\n\
          VALUE \"ProductVersion\", \"{version}.0\"\n\
