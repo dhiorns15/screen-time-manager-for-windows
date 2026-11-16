@@ -6,18 +6,22 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serenity::all::{ChannelId, CreateMessage, GatewayIntents, Http, Message, Ready};
+use serenity::all::{
+    ChannelId, ClientBuilder, CreateAllowedMentions, CreateMessage, GatewayIntents, Http, HttpBuilder,
+    Message, Ready, UserId,
+};
 use serenity::async_trait;
-use serenity::client::{Client, Context, EventHandler};
+use serenity::client::{Context, EventHandler};
 
 use crate::database;
 use crate::i18n;
 use crate::remote_commands::{
     cmd_clearlockout, cmd_extend, cmd_getpin, cmd_history, cmd_lock, cmd_msg, cmd_pause,
     cmd_reduce, cmd_reset, cmd_resume, cmd_rotatingpin, cmd_setlimit, cmd_setmessage, cmd_setpin,
-    cmd_status, cmd_time, cmd_unlock, cmd_update, cmd_weekly, measure_server_clock, retry_delay,
-    split_message, stale_age, stale_note, BotLifecycle, ChatMarkup, RateLimit, StartAction,
-    WeeklyMarkup, DISCORD_MAX_MESSAGE, DISCORD_TIME_URL, STALE_NOTE_INTERVAL,
+    cmd_status, cmd_time, cmd_unlock, cmd_update, cmd_weekly, dispatch_minutes, measure_server_clock,
+    minutes_arg, reply_names_account, retry_delay, split_command, split_message, stale_age,
+    stale_note, with_account, BotLifecycle, ChatMarkup, RateLimit, StartAction, WeeklyMarkup,
+    DISCORD_MAX_MESSAGE, DISCORD_TIME_URL, STALE_NOTE_INTERVAL,
 };
 use crate::time_request;
 
@@ -65,6 +69,21 @@ static CONNECTED: AtomicBool = AtomicBool::new(false);
 struct Handler {
     channel_id: ChannelId,
     admin_user_id: Option<u64>,
+    /// Whether this generation has posted its "started" notice. One Handler
+    /// serves one client, i.e. one bot generation.
+    announced: AtomicBool,
+}
+
+/// Who a message from the bot may ping: only the configured admin user
+/// (same as the alert queue's, see watchdog.rs's `discord_allowed_mentions`).
+/// Without it Discord turns every user, role, @everyone or @here mention in
+/// the text into a ping - including any in a time request's note, which the
+/// child types. Set as the client's default, so it covers every message the
+/// bot sends (replies, notices, direct messages).
+fn allowed_mentions(admin_user_id: Option<u64>) -> CreateAllowedMentions {
+    // `UserId::new` panics on 0 (and a panic aborts the app).
+    let admin = admin_user_id.and_then(NonZeroU64::new).map(UserId::from);
+    CreateAllowedMentions::new().users(admin)
 }
 
 #[async_trait]
@@ -74,22 +93,26 @@ impl EventHandler for Handler {
         CONNECTED.store(true, Ordering::SeqCst);
         // Message ages are judged by Discord's clock, not the PC's alone.
         measure_server_clock(DISCORD_TIME_URL).await;
-        // Fires on every (re)connect, including a session-handoff reconnect
-        // under Fast User Switching (see session.rs) - so this doubles as an
-        // "active user changed" notice, not just a genuine app startup one.
-        let text = format!(
-            "{}\n👤 {}: {}",
-            i18n::t("tg.notify.started"),
-            i18n::t("tg.status.user"),
-            crate::remote_commands::current_windows_username(),
-        );
+        // `ready` fires on every new gateway session, including a
+        // re-identify after sleep or a dropped connection - the notice goes
+        // out once per bot generation, like Telegram's. A generation starts
+        // whenever the bot (re)starts, including a session hand-off under
+        // Fast User Switching (see session.rs), so it doubles as an "active
+        // user changed" notice, not just a genuine app startup one.
+        if self.announced.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let text = format!("{}\n{}", i18n::t("tg.notify.started"), crate::remote_commands::user_line());
         let _ = self.channel_id.say(&ctx.http, text).await;
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
         // Between a stop (this session lost the console) and the shards
-        // closing, messages can still arrive - they're for the session that
-        // now owns the console, whose own bot handles them.
+        // closing, messages can still arrive. They're ignored, and the bot
+        // of the session that now owns the console doesn't see them either:
+        // it only gets messages sent after it has connected. So a command
+        // sent during a hand-over (or an app restart) gets no reply and has
+        // to be sent again.
         if LIFECYCLE.shutdown_requested() {
             return;
         }
@@ -102,9 +125,8 @@ impl EventHandler for Handler {
         let Some(rest) = msg.content.strip_prefix('!') else {
             return;
         };
-        let mut parts = rest.splitn(2, ' ');
-        let cmd = parts.next().unwrap_or("").to_lowercase();
-        let args = parts.next().unwrap_or("").trim();
+        let (cmd, args) = split_command(rest);
+        let cmd = cmd.to_lowercase();
 
         // Always answer !whoami so a user can discover their own ID during setup,
         // even before an admin user is configured.
@@ -153,9 +175,8 @@ impl EventHandler for Handler {
         // pending "request more time" from the blocking overlay - figure out
         // beforehand whether this one actually qualifies (mirrors the
         // success conditions the command itself checks internally).
-        let parsed_extend_mins = if cmd == "extend" { args.parse::<i32>().ok() } else { None };
         let grant_detail: Option<String> = match cmd.as_str() {
-            "extend" => parsed_extend_mins
+            "extend" => minutes_arg(args)
                 .filter(|m| *m > 0 && *m <= 120)
                 .map(|m| format!("+{m} min")),
             "e30" => Some("+30 min".to_string()),
@@ -170,8 +191,8 @@ impl EventHandler for Handler {
         let response = match cmd.as_str() {
             "status" => cmd_status(),
             "time" => cmd_time(),
-            "extend" => dispatch_minutes(args, cmd_extend),
-            "reduce" => dispatch_minutes(args, cmd_reduce),
+            "extend" => dispatch_minutes(args, "!extend", cmd_extend),
+            "reduce" => dispatch_minutes(args, "!reduce", cmd_reduce),
             "pause" => cmd_pause(),
             "resume" => cmd_resume(),
             "history" => cmd_history(),
@@ -197,6 +218,7 @@ impl EventHandler for Handler {
             "help" => help_text(),
             _ => i18n::t("dc.error.unknown_cmd").to_string(),
         };
+        let response = if reply_names_account(&cmd) { with_account(response) } else { response };
 
         if let Some(detail) = grant_detail {
             time_request::resolve_if_pending("Discord", &detail);
@@ -251,13 +273,6 @@ async fn getpin_by_dm(ctx: &Context, msg: &Message) -> String {
     }
 }
 
-fn dispatch_minutes(args: &str, f: impl Fn(i32) -> String) -> String {
-    match args.parse::<i32>() {
-        Ok(mins) => f(mins),
-        Err(_) => i18n::t("dc.error.specify_number").to_string(),
-    }
-}
-
 fn help_text() -> String {
     let commands = [
         ("!status", i18n::t("dc.cmd.status")),
@@ -270,6 +285,7 @@ fn help_text() -> String {
         ("!weekly", i18n::t("dc.cmd.weekly")),
         ("!msg <text>", i18n::t("dc.cmd.msg")),
         ("!lock", i18n::t("dc.cmd.lock")),
+        ("!stop", i18n::t("dc.cmd.stop")),
         ("!unlock", i18n::t("dc.cmd.unlock")),
         ("!reset", i18n::t("dc.cmd.reset")),
         ("!setmessage <text>", i18n::t("dc.cmd.setmessage")),
@@ -415,6 +431,8 @@ pub fn stop_bot_thread() {
 /// Proactively push a message to the configured channel, outside of any
 /// incoming command (e.g. a "requesting more time" notification triggered
 /// from the blocking overlay). No-op if the bot isn't connected/configured.
+/// Mentions can only ping the admin (the client's default allowed mentions,
+/// see `allowed_mentions`).
 pub fn notify_admin(text: &str) {
     let http = BOT_HTTP.lock().unwrap().clone();
     let channel_id = *NOTIFY_CHANNEL_ID.lock().unwrap();
@@ -481,7 +499,12 @@ async fn run_bot(settings: Settings) {
 
     let mut failures = 0u32;
     let mut client = loop {
-        let build = Client::builder(&token, intents).event_handler(Handler { channel_id, admin_user_id });
+        // As `Client::builder`, but with the mention restriction set on the
+        // HTTP client every send goes through - including `notify_admin`'s
+        // and `signal_shutdown`'s, which reuse it (BOT_HTTP).
+        let http = HttpBuilder::new(&token).default_allowed_mentions(allowed_mentions(admin_user_id)).build();
+        let handler = Handler { channel_id, admin_user_id, announced: AtomicBool::new(false) };
+        let build = ClientBuilder::new_with_http(http, intents).event_handler(handler);
         let built = tokio::select! {
             res = tokio::time::timeout(CLIENT_BUILD_TIMEOUT, build) => res,
             () = LIFECYCLE.wait_for_shutdown() => return,
@@ -522,5 +545,40 @@ async fn run_bot(settings: Settings) {
         // attempt still waiting for the network) is cancelled when this
         // generation's runtime is dropped.
         shard_manager.shutdown_all().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_messages_may_ping_only_the_admin() {
+        let json = |admin| serde_json::to_value(allowed_mentions(admin)).unwrap();
+        // An empty `parse` list: no @everyone/@here, roles or other users,
+        // whatever the text says. Only the listed user can be pinged.
+        assert_eq!(json(Some(42)), serde_json::json!({"parse": [], "users": ["42"], "roles": []}));
+        assert_eq!(json(None), serde_json::json!({"parse": [], "users": [], "roles": []}));
+        assert_eq!(json(Some(0)), json(None), "0 isn't a user (and would panic)");
+    }
+
+    /// The restriction is the client's default, so it reaches every send
+    /// made with `say` (which sets no allowed mentions of its own).
+    #[test]
+    fn the_client_sends_with_the_restriction_by_default() {
+        let http = HttpBuilder::new("token").default_allowed_mentions(allowed_mentions(Some(42))).build();
+        assert_eq!(http.default_allowed_mentions, Some(allowed_mentions(Some(42))));
+    }
+
+    #[test]
+    fn help_lists_every_command() {
+        let help = help_text();
+        for cmd in [
+            "!status", "!time", "!extend", "!reduce", "!pause", "!resume", "!history", "!weekly", "!msg",
+            "!lock", "!stop", "!unlock", "!reset", "!setmessage", "!setpin", "!setlimit", "!rotatingpin",
+            "!getpin", "!clearlockout", "!update", "!e30", "!e60", "!e120", "!whoami", "!help",
+        ] {
+            assert!(help.lines().any(|l| l.starts_with(&format!("{cmd} "))), "{cmd} missing from:\n{help}");
+        }
     }
 }

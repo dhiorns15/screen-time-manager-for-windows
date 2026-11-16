@@ -40,43 +40,136 @@ pub fn join_words(parts: &[&str]) -> String {
     parts.iter().filter(|p| !p.is_empty()).copied().collect::<Vec<_>>().join(" ")
 }
 
-pub fn cmd_status() -> String {
-    let remaining = blocking::get_remaining_seconds();
-    let paused = mini_overlay::is_paused();
-    let idle_paused = mini_overlay::is_idle_paused();
-    let pause_budget = mini_overlay::get_remaining_pause_budget();
+/// The "👤 User: <account>" line. Limits, the lock-screen message and the
+/// timer are per Windows account, and a command acts on whichever account
+/// owns the console when it arrives - so replies that read or change them
+/// say which account that was.
+pub fn user_line() -> String {
+    format!("👤 {}: {}", i18n::t("tg.status.user"), current_windows_username())
+}
 
-    let status_emoji = if remaining <= 60 {
+/// `reply` with the `user_line` added - see `reply_names_account`.
+pub fn with_account(reply: String) -> String {
+    format!("{reply}\n{}", user_line())
+}
+
+/// Whether the reply to the bot command `name` (lowercase, no prefix) ends
+/// with the account it acted on (`with_account`). `status` and `history`
+/// include it in their own text already.
+pub fn reply_names_account(name: &str) -> bool {
+    matches!(
+        name,
+        "time" | "extend" | "e30" | "e60" | "e120" | "reduce" | "reset" | "lock" | "stop" | "unlock"
+            | "pause" | "resume" | "setlimit" | "setmessage"
+    )
+}
+
+/// What the timer is doing right now, for `status`. Mirrors the order in
+/// mini_overlay.rs's `tick_mode`: the app's lock screen freezes everything,
+/// then a manual pause, then idle or the Windows lock screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimerState {
+    /// Counting down.
+    Running,
+    /// Paused by hand (counts against the pause budget).
+    Paused,
+    /// Stopped because nobody is using the PC.
+    Idle,
+    /// Stopped because Windows is locked (or another account has the screen).
+    WindowsLocked,
+    /// The app's lock screen is up because the time ran out.
+    OutOfTime,
+    /// The app's lock screen is up although there is time left (`lock`).
+    Locked,
+}
+
+/// `TimerState` from the individual flags. `manual_lock` says whether the
+/// app's lock screen was put up by hand (`lock`) rather than by running out
+/// of time; `None` when that isn't known, and then a lock screen with time
+/// left counts as a manual lock.
+pub fn timer_state(
+    blocked: bool,
+    manual_lock: Option<bool>,
+    remaining: i32,
+    paused: bool,
+    idle_paused: bool,
+    windows_locked: bool,
+) -> TimerState {
+    if blocked {
+        if manual_lock.unwrap_or(remaining > 0) {
+            TimerState::Locked
+        } else {
+            TimerState::OutOfTime
+        }
+    } else if paused {
+        TimerState::Paused
+    } else if idle_paused {
+        TimerState::Idle
+    } else if windows_locked {
+        TimerState::WindowsLocked
+    } else {
+        TimerState::Running
+    }
+}
+
+/// The timer's state right now. The manual-lock flag (`None` here) is for
+/// the caller to fill in once the app tracks it - see `timer_state`.
+pub fn current_timer_state() -> TimerState {
+    timer_state(
+        blocking::is_blocking_overlay_visible(),
+        None,
+        blocking::get_remaining_seconds(),
+        mini_overlay::is_paused(),
+        mini_overlay::is_idle_paused(),
+        mini_overlay::IS_LOCK_PAUSED.load(Ordering::SeqCst),
+    )
+}
+
+/// The i18n key of `status`'s text for `state`.
+fn timer_state_key(state: TimerState) -> &'static str {
+    match state {
+        TimerState::Running => "bot.status.running",
+        TimerState::Paused => "bot.status.paused",
+        TimerState::Idle => "bot.status.idle",
+        TimerState::WindowsLocked => "bot.status.windows_locked",
+        TimerState::OutOfTime => "bot.status.out_of_time",
+        TimerState::Locked => "bot.status.locked",
+    }
+}
+
+fn remaining_emoji(remaining: i32) -> &'static str {
+    if remaining <= 60 {
         "🔴"
     } else if remaining <= 300 {
         "🟠"
     } else {
         "🟢"
-    };
+    }
+}
 
-    let pause_status = if paused {
-        i18n::t("tg.status.yes")
-    } else if idle_paused {
-        i18n::t("tg.status.idle")
-    } else {
-        i18n::t("tg.status.no")
-    };
+pub fn cmd_status() -> String {
+    status_text(current_timer_state())
+}
+
+/// `status`'s reply, with the timer's state given by the caller.
+pub fn status_text(state: TimerState) -> String {
+    let remaining = blocking::get_remaining_seconds();
+    let pause_budget = mini_overlay::get_remaining_pause_budget();
 
     format!(
         "{}\n\
          ━━━━━━━━━━━━━━━━━━\n\
-         👤 {}: {}\n\
+         {}\n\
          {} {}: {}\n\
-         ⏸ {}: {}\n\
+         ⏱ {}: {}\n\
          🔋 {}: {}",
         i18n::t("tg.status.header"),
-        i18n::t("tg.status.user"),
-        current_windows_username(),
-        status_emoji,
+        user_line(),
+        remaining_emoji(remaining),
         i18n::t("tg.status.remaining"),
         format_hm(remaining),
-        i18n::t("tg.status.paused"),
-        pause_status,
+        i18n::t("bot.status.timer"),
+        i18n::t(timer_state_key(state)),
         i18n::t("tg.status.pause_budget"),
         format_hm(pause_budget)
     )
@@ -84,16 +177,37 @@ pub fn cmd_status() -> String {
 
 pub fn cmd_time() -> String {
     let remaining = blocking::get_remaining_seconds();
+    format!(
+        "{} {}",
+        remaining_emoji(remaining),
+        i18n::t("bot.time.remaining").replace("{time}", &format_hm(remaining))
+    )
+}
 
-    let emoji = if remaining <= 60 {
-        "🔴"
-    } else if remaining <= 300 {
-        "🟠"
-    } else {
-        "🟢"
-    };
+/// Split the text after a command prefix ("/" or "!") into the command name
+/// and its arguments (trimmed): "extend  30" -> ("extend", "30"). The name
+/// ends at the first whitespace of any kind, so "msg\nHello" works too.
+pub fn split_command(rest: &str) -> (&str, &str) {
+    match rest.find(char::is_whitespace) {
+        Some(i) => (&rest[..i], rest[i..].trim()),
+        None => (rest, ""),
+    }
+}
 
-    format!("{} {} remaining", emoji, format_hm(remaining))
+/// A command's minutes argument: a whole number, possibly negative (the
+/// command itself explains the allowed range). `None` if missing or not a
+/// number ("30min", "thirty").
+pub fn minutes_arg(args: &str) -> Option<i32> {
+    args.trim().parse().ok()
+}
+
+/// Run `f` with the minutes in `args`, or explain how to give them, with
+/// `example_command` (e.g. "/extend") as the example.
+pub fn dispatch_minutes(args: &str, example_command: &str, f: impl FnOnce(i32) -> String) -> String {
+    match minutes_arg(args) {
+        Some(minutes) => f(minutes),
+        None => format!("{} {example_command} 30", i18n::t("bot.error.specify_minutes")),
+    }
 }
 
 pub fn cmd_extend(minutes: i32) -> String {
@@ -217,6 +331,35 @@ pub fn escape_discord_markdown(s: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// Text someone other than the parent typed (the child's note on a time
+/// request), made safe to post on Discord: shown as an inline code span, in
+/// which Discord renders no formatting, headings, quotes, links, masked
+/// links, emoji or mentions. Backticks (which would end the span) and line
+/// breaks or other control characters are replaced. Pings are blocked
+/// separately, by the allowed mentions every message is sent with.
+pub fn discord_literal(text: &str) -> String {
+    let inner: String = text
+        .chars()
+        .map(|c| match c {
+            '`' => '\'',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    let inner = inner.trim();
+    if inner.is_empty() {
+        return String::new();
+    }
+    format!("`{inner}`")
+}
+
+/// The same text for Telegram, which posts it as plain text (no parse
+/// mode), so only line breaks and other control characters are replaced -
+/// the note is meant to be one line.
+pub fn telegram_literal(text: &str) -> String {
+    text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect::<String>().trim().to_string()
 }
 
 /// 14-day usage table (minutes active / paused per day) for one user, sent
@@ -1236,6 +1379,86 @@ mod tests {
         assert_eq!(escape_discord_markdown("max_the_great"), "max\\_the\\_great");
         assert_eq!(escape_discord_markdown("a*b~c`d|e"), "a\\*b\\~c\\`d\\|e");
         assert_eq!(escape_discord_markdown("anna.b-1"), "anna.b-1");
+    }
+
+    #[test]
+    fn child_text_is_posted_literally() {
+        assert_eq!(discord_literal("saving my game"), "`saving my game`");
+        // Mentions, markdown, masked links and headings all sit inside one
+        // code span, which Discord shows as typed.
+        let nasty = "@everyone <@&123> **hi** [free](https://x.example) # big";
+        assert_eq!(discord_literal(nasty), format!("`{nasty}`"));
+        // A backtick can't end the span early; line breaks can't start a
+        // heading or quote on a new line.
+        assert_eq!(discord_literal("a`b``c"), "`a'b''c`");
+        assert_eq!(discord_literal("one\n> two\r\n# three"), "`one > two  # three`");
+        assert_eq!(discord_literal("  padded  "), "`padded`");
+        assert_eq!(discord_literal(" ` "), "`'`");
+        assert_eq!(discord_literal("\n"), "");
+        assert!(!discord_literal("x`y`z").trim_matches('`').contains('`'));
+
+        assert_eq!(telegram_literal("hi\nthere <b>"), "hi there <b>");
+    }
+
+    #[test]
+    fn commands_split_into_name_and_trimmed_arguments() {
+        assert_eq!(split_command("extend 30"), ("extend", "30"));
+        assert_eq!(split_command("extend  30 "), ("extend", "30"));
+        assert_eq!(split_command("extend"), ("extend", ""));
+        assert_eq!(split_command("msg\nDinner!"), ("msg", "Dinner!"));
+        assert_eq!(split_command("setlimit saturday 180"), ("setlimit", "saturday 180"));
+        assert_eq!(split_command(""), ("", ""));
+    }
+
+    #[test]
+    fn minutes_arguments() {
+        assert_eq!(minutes_arg("30"), Some(30));
+        assert_eq!(minutes_arg(" 30 "), Some(30));
+        assert_eq!(minutes_arg("-5"), Some(-5), "the command explains the range");
+        assert_eq!(minutes_arg("500"), Some(500));
+        assert_eq!(minutes_arg(""), None);
+        assert_eq!(minutes_arg("30min"), None);
+        assert_eq!(minutes_arg("thirty"), None);
+        assert_eq!(minutes_arg("99999999999"), None);
+    }
+
+    #[test]
+    fn replies_that_name_the_account() {
+        for name in [
+            "time", "extend", "e30", "e60", "e120", "reduce", "reset", "lock", "stop", "unlock", "pause",
+            "resume", "setlimit", "setmessage",
+        ] {
+            assert!(reply_names_account(name), "{name}");
+        }
+        // status/history have it already; the rest aren't per account.
+        for name in ["status", "history", "weekly", "msg", "setpin", "getpin", "update", "help", "Extend"] {
+            assert!(!reply_names_account(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn timer_state_reports_what_the_countdown_is_doing() {
+        use TimerState::*;
+        let state = |blocked, manual, remaining, paused, idle, locked| {
+            timer_state(blocked, manual, remaining, paused, idle, locked)
+        };
+        assert_eq!(state(false, None, 600, false, false, false), Running);
+        assert_eq!(state(false, None, 600, true, false, false), Paused);
+        assert_eq!(state(false, None, 600, false, true, false), Idle);
+        assert_eq!(state(false, None, 600, false, false, true), WindowsLocked);
+        // A manual pause wins over idle/locked, as in `tick_mode`.
+        assert_eq!(state(false, None, 600, true, true, true), Paused);
+        // The app's lock screen freezes everything.
+        assert_eq!(state(true, None, 0, true, true, true), OutOfTime);
+        assert_eq!(state(true, None, 600, false, false, false), Locked, "time left: locked by hand");
+        // A known manual-lock flag decides, whatever the time left.
+        assert_eq!(state(true, Some(true), 0, false, false, false), Locked);
+        assert_eq!(state(true, Some(false), 600, false, false, false), OutOfTime);
+        assert_eq!(state(false, Some(true), 600, false, false, false), Running);
+        // Each state has its own text.
+        let keys: std::collections::HashSet<_> =
+            [Running, Paused, Idle, WindowsLocked, OutOfTime, Locked].map(timer_state_key).into_iter().collect();
+        assert_eq!(keys.len(), 6);
     }
 
     #[test]

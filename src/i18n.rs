@@ -596,6 +596,31 @@ fn en(key: &str) -> &'static str {
         // ----- Daily update reminder -----
         "update.notify.reminder" => "Reminder: Screen Time Manager has an update waiting:",
 
+        // ----- Bots: forgiving commands, timer state, help, clock alert -----
+        "bot.error.specify_minutes" => "Please give a number of minutes, e.g.",
+        "bot.time.remaining" => "{time} remaining",
+        "bot.status.timer" => "Timer",
+        "bot.status.running" => "Running",
+        "bot.status.paused" => "Paused",
+        "bot.status.idle" => "Paused (idle)",
+        "bot.status.windows_locked" => "Stopped - Windows is locked",
+        "bot.status.out_of_time" => "Stopped - out of time, lock screen showing",
+        "bot.status.locked" => "Stopped - screen locked with the lock command",
+        "clock_tamper.notify.title" => "The system clock was just changed on {user}.",
+        "dc.cmd.stop" => "Lock the screen (same as !lock)",
+        "tg.start.welcome" => "Welcome to Screen Time Manager Bot!",
+        "tg.start.help_hint" => "Use /help to see available commands.",
+        "tg.help.header" => "Screen Time Manager commands:",
+        "tg.help.plain_text" => "Any other text you send is shown on the screen for 10 seconds.",
+        "tg.cmd.weekly" => "Show a 2-week usage table",
+        "tg.cmd.unlock" => "Unlock without changing remaining time (only if time is left)",
+        "tg.cmd.setmessage" => "Change the blocking screen message (e.g., /setmessage Time for a break!)",
+        "tg.cmd.setpin" => "Change the passcode (e.g., /setpin 1234)",
+        "tg.cmd.setlimit" => "Set daily limit in minutes (e.g., /setlimit 90 or /setlimit saturday 180)",
+        "tg.cmd.rotatingpin" => "Toggle the rotating daily PIN on/off (e.g., /rotatingpin on)",
+        "tg.cmd.getpin" => "Get today's rotating PIN (if enabled)",
+        "tg.cmd.clearlockout" => "Clear the passcode lockout after wrong codes",
+
         // Fallback - return empty string for unknown keys (should not happen in practice)
         _ => "",
     }
@@ -1094,6 +1119,31 @@ fn de(key: &str) -> &'static str {
         // ----- Tägliche Update-Erinnerung -----
         "update.notify.reminder" => "Erinnerung: Für den Bildschirmzeit Manager wartet ein Update:",
 
+        // ----- Bots: nachsichtige Befehle, Timer-Zustand, Hilfe, Uhrzeit-Warnung -----
+        "bot.error.specify_minutes" => "Bitte geben Sie eine Anzahl Minuten an, z.B.",
+        "bot.time.remaining" => "Noch {time} übrig",
+        "bot.status.timer" => "Zeitzählung",
+        "bot.status.running" => "Läuft",
+        "bot.status.paused" => "Pausiert",
+        "bot.status.idle" => "Pausiert (Leerlauf)",
+        "bot.status.windows_locked" => "Angehalten - Windows ist gesperrt",
+        "bot.status.out_of_time" => "Angehalten - keine Zeit mehr, Sperrbildschirm wird angezeigt",
+        "bot.status.locked" => "Angehalten - Bildschirm mit dem Befehl lock gesperrt",
+        "clock_tamper.notify.title" => "Auf dem Konto {user} wurde soeben die Systemuhr geändert.",
+        "dc.cmd.stop" => "Bildschirm sperren (wie !lock)",
+        "tg.start.welcome" => "Willkommen beim Bildschirmzeit Manager Bot!",
+        "tg.start.help_hint" => "Mit /help sehen Sie alle verfügbaren Befehle.",
+        "tg.help.header" => "Bildschirmzeit Manager Befehle:",
+        "tg.help.plain_text" => "Jeder andere Text, den Sie senden, wird 10 Sekunden lang auf dem Bildschirm angezeigt.",
+        "tg.cmd.weekly" => "2-Wochen-Nutzungstabelle anzeigen",
+        "tg.cmd.unlock" => "Entsperren ohne verbleibende Zeit zu ändern (nur wenn noch Zeit übrig ist)",
+        "tg.cmd.setmessage" => "Sperrbildschirm-Nachricht ändern (z.B. /setmessage Zeit für eine Pause!)",
+        "tg.cmd.setpin" => "Code ändern (z.B. /setpin 1234)",
+        "tg.cmd.setlimit" => "Tageslimit in Minuten setzen (z.B. /setlimit 90 oder /setlimit saturday 180)",
+        "tg.cmd.rotatingpin" => "Rotierenden Tages-Code ein-/ausschalten (z.B. /rotatingpin on)",
+        "tg.cmd.getpin" => "Heutigen rotierenden Code abrufen (falls aktiviert)",
+        "tg.cmd.clearlockout" => "Code-Sperre nach falschen Codes aufheben",
+
         // Fallback to English
         _ => en(key),
     }
@@ -1185,5 +1235,30 @@ mod tests {
         assert_ne!(en(key), de(key), "German text for {key} is just the English fallback");
         // Goes to Discord too: nothing in it may read as a mention.
         assert!(!en(key).contains('@') && !de(key).contains('@'), "{key}");
+    }
+
+    /// Keys added for the bot review fixes (forgiving Telegram commands,
+    /// timer state in `status`, translated Telegram help, clock alert).
+    #[test]
+    fn bot_review_keys_are_translated() {
+        let keys = [
+            "bot.error.specify_minutes", "bot.time.remaining", "bot.status.timer", "bot.status.running",
+            "bot.status.paused", "bot.status.idle", "bot.status.windows_locked", "bot.status.out_of_time",
+            "bot.status.locked", "clock_tamper.notify.title", "dc.cmd.stop", "tg.start.welcome",
+            "tg.start.help_hint", "tg.help.header", "tg.help.plain_text", "tg.cmd.weekly", "tg.cmd.unlock",
+            "tg.cmd.setmessage", "tg.cmd.setpin", "tg.cmd.setlimit", "tg.cmd.rotatingpin", "tg.cmd.getpin",
+            "tg.cmd.clearlockout",
+        ];
+        for key in keys {
+            assert!(!en(key).is_empty(), "missing English text for {key}");
+            assert!(!de(key).is_empty(), "missing German text for {key}");
+            assert_ne!(en(key), de(key), "German text for {key} is just the English fallback");
+        }
+        for text in [en("bot.time.remaining"), de("bot.time.remaining")] {
+            assert!(text.contains("{time}"), "{text}");
+        }
+        for text in [en("clock_tamper.notify.title"), de("clock_tamper.notify.title")] {
+            assert!(text.contains("{user}"), "{text}");
+        }
     }
 }

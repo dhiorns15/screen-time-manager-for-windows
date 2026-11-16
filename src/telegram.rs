@@ -7,9 +7,8 @@ use std::time::Duration;
 use teloxide::prelude::*;
 use teloxide::dispatching::DefaultKey;
 use teloxide::error_handlers::LoggingErrorHandler;
-use teloxide::types::{ParseMode, UserId};
+use teloxide::types::{Me, ParseMode, UserId};
 use teloxide::update_listeners::Polling;
-use teloxide::utils::command::BotCommands;
 use teloxide::RequestError;
 
 use crate::database;
@@ -17,9 +16,10 @@ use crate::i18n;
 use crate::remote_commands::{
     cmd_clearlockout, cmd_extend, cmd_getpin, cmd_history, cmd_lock, cmd_msg, cmd_pause,
     cmd_reduce, cmd_reset, cmd_resume, cmd_rotatingpin, cmd_setlimit, cmd_setmessage, cmd_setpin,
-    cmd_status, cmd_time, cmd_unlock, cmd_update, cmd_weekly, measure_server_clock, retry_delay,
-    split_message, stale_age, stale_note, BotLifecycle, ChatMarkup, RateLimit, StartAction,
-    WeeklyMarkup, STALE_NOTE_INTERVAL, TELEGRAM_MAX_MESSAGE, TELEGRAM_TIME_URL,
+    cmd_status, cmd_time, cmd_unlock, cmd_update, cmd_weekly, dispatch_minutes, measure_server_clock,
+    minutes_arg, reply_names_account, retry_delay, split_command, split_message, stale_age,
+    stale_note, with_account, BotLifecycle, ChatMarkup, RateLimit, StartAction, WeeklyMarkup,
+    STALE_NOTE_INTERVAL, TELEGRAM_MAX_MESSAGE, TELEGRAM_TIME_URL,
 };
 use crate::time_request;
 
@@ -58,61 +58,145 @@ static ADMIN_CHAT_ID: Mutex<Option<i64>> = Mutex::new(None);
 /// connect, e.g. offline at startup, whose messages would just be lost.
 static CONNECTED: AtomicBool = AtomicBool::new(false);
 
-#[derive(BotCommands, Clone, Debug)]
-#[command(rename_rule = "lowercase", description = "Screen Time Manager commands:")]
+/// A bot command. Parsed by `parse_command` rather than teloxide's
+/// `BotCommands` derive, which matches command names case-sensitively and
+/// parses a number from the untrimmed rest of the message - so `/Extend 30`,
+/// `/extend  30` or `/extend` alone were all answered "Unknown command".
+/// Arguments are kept as typed (trimmed) and checked by the command itself,
+/// the same as on Discord.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Command {
-    #[command(description = "Start the bot")]
     Start,
-    #[command(description = "Show remaining time and status")]
     Status,
-    #[command(description = "Quick time check")]
     Time,
-    #[command(description = "Extend time by minutes (e.g., /extend 30)")]
-    Extend(i32),
-    #[command(description = "Reduce time by minutes (e.g., /reduce 30)")]
-    Reduce(i32),
-    #[command(description = "Pause the timer")]
+    Extend(String),
+    Reduce(String),
     Pause,
-    #[command(description = "Resume the timer")]
     Resume,
-    #[command(description = "Show today's pause activity")]
     History,
-    #[command(description = "Show a 2-week usage table")]
     Weekly,
-    #[command(description = "Show a message on screen (e.g., /msg Do your homework!)")]
     Msg(String),
-    #[command(description = "Lock the screen")]
+    /// `/lock`, or its alias `/stop`.
     Lock,
-    #[command(description = "Lock the screen (alias)")]
-    Stop,
-    #[command(description = "Unlock without changing remaining time (only if time is left)")]
     Unlock,
-    #[command(description = "Reset timer to daily limit")]
     Reset,
-    #[command(description = "Change the blocking screen message (e.g., /setmessage Time for a break!)")]
     Setmessage(String),
-    #[command(description = "Change the passcode (e.g., /setpin 1234)")]
     Setpin(String),
-    #[command(description = "Set daily limit in minutes (e.g., /setlimit 90 or /setlimit saturday 180)")]
     Setlimit(String),
-    #[command(description = "Toggle the rotating daily PIN on/off (e.g., /rotatingpin on)")]
     Rotatingpin(String),
-    #[command(description = "Get today's rotating PIN (if enabled)")]
     Getpin,
-    #[command(description = "Clear the passcode lockout after wrong codes")]
     Clearlockout,
-    #[command(description = "Install the latest version, if a newer one is available")]
     Update,
-    #[command(description = "Extend by 30 minutes")]
     E30,
-    #[command(description = "Extend by 60 minutes")]
     E60,
-    #[command(description = "Extend by 120 minutes")]
     E120,
-    #[command(description = "Get your chat ID for setup")]
     Chatid,
-    #[command(description = "Show this help message")]
     Help,
+}
+
+/// What a message's text is, as far as commands go.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ParsedText {
+    /// Doesn't start with "/": shown on screen (see `build_dispatcher`).
+    NotACommand,
+    /// "/cmd@other_bot" in a group: for another bot, so not answered.
+    ForAnotherBot,
+    /// A "/" command this bot doesn't know.
+    Unknown,
+    /// The command, and the name it was sent as (lowercase - "stop" for
+    /// `/stop`, which is `Command::Lock`).
+    Command(Command, String),
+}
+
+/// Parse a message's text as a command for the bot `bot_username` (without
+/// the "@"; `None` if unknown, and then only commands without "@bot" are
+/// taken). Command names and the "@bot" part are matched without regard to
+/// case; arguments are everything after the first whitespace, trimmed.
+fn parse_command(text: &str, bot_username: Option<&str>) -> ParsedText {
+    let Some(rest) = text.strip_prefix('/') else {
+        return ParsedText::NotACommand;
+    };
+    let (head, args) = split_command(rest);
+    let (name, addressee) = match head.split_once('@') {
+        Some((name, bot)) => (name, Some(bot)),
+        None => (head, None),
+    };
+    if let Some(addressee) = addressee {
+        if !bot_username.is_some_and(|me| me.eq_ignore_ascii_case(addressee)) {
+            return ParsedText::ForAnotherBot;
+        }
+    }
+    let name = name.to_ascii_lowercase();
+    let args = args.to_string();
+    let command = match name.as_str() {
+        "start" => Command::Start,
+        "status" => Command::Status,
+        "time" => Command::Time,
+        "extend" => Command::Extend(args),
+        "reduce" => Command::Reduce(args),
+        "pause" => Command::Pause,
+        "resume" => Command::Resume,
+        "history" => Command::History,
+        "weekly" => Command::Weekly,
+        "msg" => Command::Msg(args),
+        "lock" | "stop" => Command::Lock,
+        "unlock" => Command::Unlock,
+        "reset" => Command::Reset,
+        "setmessage" => Command::Setmessage(args),
+        "setpin" => Command::Setpin(args),
+        "setlimit" => Command::Setlimit(args),
+        "rotatingpin" => Command::Rotatingpin(args),
+        "getpin" => Command::Getpin,
+        "clearlockout" => Command::Clearlockout,
+        "update" => Command::Update,
+        "e30" => Command::E30,
+        "e60" => Command::E60,
+        "e120" => Command::E120,
+        "chatid" => Command::Chatid,
+        "help" => Command::Help,
+        _ => return ParsedText::Unknown,
+    };
+    ParsedText::Command(command, name)
+}
+
+/// `/help`'s reply, in the app's language.
+fn help_text() -> String {
+    let commands = [
+        ("/start", i18n::t("tg.cmd.start")),
+        ("/status", i18n::t("tg.cmd.status")),
+        ("/time", i18n::t("tg.cmd.time")),
+        ("/extend <mins>", i18n::t("tg.cmd.extend")),
+        ("/reduce <mins>", i18n::t("tg.cmd.reduce")),
+        ("/pause", i18n::t("tg.cmd.pause")),
+        ("/resume", i18n::t("tg.cmd.resume")),
+        ("/history", i18n::t("tg.cmd.history")),
+        ("/weekly", i18n::t("tg.cmd.weekly")),
+        ("/msg <text>", i18n::t("tg.cmd.msg")),
+        ("/lock", i18n::t("tg.cmd.lock")),
+        ("/stop", i18n::t("tg.cmd.stop")),
+        ("/unlock", i18n::t("tg.cmd.unlock")),
+        ("/reset", i18n::t("tg.cmd.reset")),
+        ("/setmessage <text>", i18n::t("tg.cmd.setmessage")),
+        ("/setpin <pin>", i18n::t("tg.cmd.setpin")),
+        ("/setlimit <mins>", i18n::t("tg.cmd.setlimit")),
+        ("/rotatingpin <on|off>", i18n::t("tg.cmd.rotatingpin")),
+        ("/getpin", i18n::t("tg.cmd.getpin")),
+        ("/clearlockout", i18n::t("tg.cmd.clearlockout")),
+        ("/update", i18n::t("tg.cmd.update")),
+        ("/e30", i18n::t("tg.cmd.e30")),
+        ("/e60", i18n::t("tg.cmd.e60")),
+        ("/e120", i18n::t("tg.cmd.e120")),
+        ("/chatid", i18n::t("tg.cmd.chatid")),
+        ("/help", i18n::t("tg.cmd.help")),
+    ];
+
+    let mut response = format!("{}\n", i18n::t("tg.help.header"));
+    for (cmd, desc) in commands {
+        response.push_str(&format!("{cmd} - {desc}\n"));
+    }
+    response.push('\n');
+    response.push_str(i18n::t("tg.help.plain_text"));
+    response
 }
 
 /// A single-threaded tokio runtime, for spots that only ever run one task at
@@ -481,23 +565,29 @@ fn build_dispatcher(bot: Bot, admin_chat_id: Option<i64>) -> Dispatcher<Bot, Req
             Ok(())
         });
 
-    // Command handler
+    // Command handler: every text starting with "/" (`Me` is this bot's own
+    // account, which the dispatcher fetches when it starts).
     let command_handler = Update::filter_message()
-        .filter_command::<Command>()
-        .endpoint(move |bot: Bot, msg: Message, cmd: Command| {
-            handle_command(bot, msg, cmd, admin_chat_id)
+        .filter_map(|msg: Message, me: Me| match parse_command(msg.text()?, me.user.username.as_deref()) {
+            ParsedText::NotACommand => None,
+            parsed => Some(parsed),
+        })
+        .endpoint(move |bot: Bot, msg: Message, parsed: ParsedText| async move {
+            match parsed {
+                ParsedText::Command(cmd, name) => handle_command(bot, msg, cmd, &name, admin_chat_id).await,
+                ParsedText::Unknown => {
+                    bot.send_message(msg.chat.id, i18n::t("tg.error.unknown_cmd")).await?;
+                    Ok(())
+                }
+                ParsedText::ForAnotherBot | ParsedText::NotACommand => Ok(()),
+            }
         });
 
     // Fallback handler: show plain text as on-screen message (authorized users only)
     let fallback_handler = Update::filter_message()
         .endpoint(move |bot: Bot, msg: Message| async move {
             if let Some(text) = msg.text() {
-                if text.starts_with('/') {
-                    bot.send_message(
-                        msg.chat.id,
-                        i18n::t("tg.error.unknown_cmd")
-                    ).await?;
-                } else if !text.is_empty() {
+                if !text.is_empty() {
                     // Check authorization (silently ignored otherwise)
                     if authorize(&bot, &msg, admin_chat_id).await == AuthDecision::Allow {
                         unsafe {
@@ -604,6 +694,7 @@ async fn handle_command(
     bot: Bot,
     msg: Message,
     cmd: Command,
+    name: &str,
     admin_chat_id: Option<i64>,
 ) -> ResponseResult<()> {
     let sender_id = msg.chat.id.0;
@@ -612,10 +703,11 @@ async fn handle_command(
     match &cmd {
         Command::Start => {
             let welcome = format!(
-                "Welcome to Screen Time Manager Bot!\n\n\
-                 Your chat ID is: {}\n\n\
-                 Use /help to see available commands.",
-                sender_id
+                "{}\n\n{} {}\n\n{}",
+                i18n::t("tg.start.welcome"),
+                i18n::t("tg.chatid.your_id"),
+                sender_id,
+                i18n::t("tg.start.help_hint"),
             );
             bot.send_message(msg.chat.id, welcome).await?;
             return Ok(());
@@ -645,7 +737,7 @@ async fn handle_command(
     // pending "request more time" from the blocking overlay - figure out
     // beforehand (while `cmd` is still borrowable) whether this one qualifies.
     let grant_detail: Option<String> = match &cmd {
-        Command::Extend(mins) if *mins > 0 && *mins <= 120 => Some(format!("+{mins} min")),
+        Command::Extend(args) => minutes_arg(args).filter(|m| *m > 0 && *m <= 120).map(|m| format!("+{m} min")),
         Command::E30 => Some("+30 min".to_string()),
         Command::E60 => Some("+60 min".to_string()),
         Command::E120 => Some("+120 min".to_string()),
@@ -665,15 +757,14 @@ async fn handle_command(
         Command::Start => unreachable!(), // Handled above
         Command::Status => cmd_status(),
         Command::Time => cmd_time(),
-        Command::Extend(mins) => cmd_extend(mins),
-        Command::Reduce(mins) => cmd_reduce(mins),
+        Command::Extend(args) => dispatch_minutes(&args, "/extend", cmd_extend),
+        Command::Reduce(args) => dispatch_minutes(&args, "/reduce", cmd_reduce),
         Command::Pause => cmd_pause(),
         Command::Resume => cmd_resume(),
         Command::History => cmd_history(),
         Command::Weekly => cmd_weekly(WeeklyMarkup::TelegramHtml),
         Command::Msg(text) => cmd_msg(&text),
         Command::Lock => cmd_lock(),
-        Command::Stop => cmd_lock(),
         Command::Unlock => cmd_unlock(),
         Command::Reset => cmd_reset(),
         Command::Setmessage(text) => cmd_setmessage(&text),
@@ -691,8 +782,9 @@ async fn handle_command(
         Command::E60 => cmd_extend(60),
         Command::E120 => cmd_extend(120),
         Command::Chatid => unreachable!(), // Handled above
-        Command::Help => Command::descriptions().to_string(),
+        Command::Help => help_text(),
     };
+    let response = if reply_names_account(name) { with_account(response) } else { response };
 
     if let Some(detail) = grant_detail {
         time_request::resolve_if_pending("Telegram", &detail);
@@ -843,6 +935,86 @@ mod tests {
         assert_eq!(pin_destination(false, Some((1_087_968_824, true)), true), PinDestination::Nobody);
         assert_eq!(pin_destination(false, Some((42, false)), true), PinDestination::Nobody);
         assert_eq!(pin_destination(false, None, false), PinDestination::Nobody);
+    }
+
+    const ME: Option<&str> = Some("family_screen_bot");
+
+    fn command(text: &str) -> Option<(Command, String)> {
+        match parse_command(text, ME) {
+            ParsedText::Command(cmd, name) => Some((cmd, name)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn commands_are_parsed_forgivingly() {
+        let extend = |args: &str| Some((Command::Extend(args.to_string()), "extend".to_string()));
+        assert_eq!(command("/extend 30"), extend("30"));
+        assert_eq!(command("/Extend 30"), extend("30"));
+        assert_eq!(command("/EXTEND 30"), extend("30"));
+        assert_eq!(command("/extend  30"), extend("30"));
+        assert_eq!(command("/extend 30 "), extend("30"));
+        assert_eq!(command("/extend\n30"), extend("30"));
+        // Not a number: the command itself asks for one (see dispatch_minutes).
+        assert_eq!(command("/extend 30min"), extend("30min"));
+        assert_eq!(command("/extend"), extend(""));
+        assert_eq!(minutes_arg("30min"), None);
+        assert_eq!(minutes_arg(""), None);
+
+        assert_eq!(command("/Status"), Some((Command::Status, "status".to_string())));
+        assert_eq!(command("/stop"), Some((Command::Lock, "stop".to_string())));
+        assert_eq!(command("/E30"), Some((Command::E30, "e30".to_string())));
+        assert_eq!(
+            command("/setlimit  Saturday 180"),
+            Some((Command::Setlimit("Saturday 180".to_string()), "setlimit".to_string()))
+        );
+        assert_eq!(
+            command("/msg Dinner is ready!"),
+            Some((Command::Msg("Dinner is ready!".to_string()), "msg".to_string()))
+        );
+        assert_eq!(command("/msg"), Some((Command::Msg(String::new()), "msg".to_string())));
+    }
+
+    #[test]
+    fn commands_addressed_to_a_bot() {
+        assert_eq!(command("/status@family_screen_bot"), Some((Command::Status, "status".to_string())));
+        assert_eq!(command("/Status@Family_Screen_Bot"), Some((Command::Status, "status".to_string())));
+        assert_eq!(
+            command("/extend@family_screen_bot 30"),
+            Some((Command::Extend("30".to_string()), "extend".to_string()))
+        );
+        assert_eq!(parse_command("/status@some_other_bot", ME), ParsedText::ForAnotherBot);
+        assert_eq!(parse_command("/frobnicate@some_other_bot", ME), ParsedText::ForAnotherBot);
+        assert_eq!(parse_command("/status@", ME), ParsedText::ForAnotherBot);
+        // Own name unknown: only commands without "@bot" are taken.
+        assert_eq!(parse_command("/status@family_screen_bot", None), ParsedText::ForAnotherBot);
+        assert_eq!(parse_command("/status", None), ParsedText::Command(Command::Status, "status".to_string()));
+    }
+
+    #[test]
+    fn other_texts() {
+        assert_eq!(parse_command("/frobnicate", ME), ParsedText::Unknown);
+        assert_eq!(parse_command("/", ME), ParsedText::Unknown);
+        assert_eq!(parse_command("/statusx", ME), ParsedText::Unknown);
+        assert_eq!(parse_command("Dinner is ready", ME), ParsedText::NotACommand);
+        assert_eq!(parse_command("please /extend 30", ME), ParsedText::NotACommand);
+        assert_eq!(parse_command("", ME), ParsedText::NotACommand);
+    }
+
+    #[test]
+    fn every_command_is_parsed_and_in_the_help() {
+        let help = help_text();
+        for name in [
+            "start", "status", "time", "extend", "reduce", "pause", "resume", "history", "weekly", "msg", "lock",
+            "stop", "unlock", "reset", "setmessage", "setpin", "setlimit", "rotatingpin", "getpin",
+            "clearlockout", "update", "e30", "e60", "e120", "chatid", "help",
+        ] {
+            assert!(command(&format!("/{name}")).is_some(), "/{name} isn't parsed");
+            assert!(
+                help.lines().any(|l| l.starts_with(&format!("/{name} "))),
+                "/{name} missing from:\n{help}"
+            );
+        }
     }
 
     #[test]

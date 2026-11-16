@@ -582,17 +582,6 @@ fn bot_state() -> BotState {
     }
 }
 
-/// Same fan-out as time_request.rs's notifications, with per-platform text
-/// where the command syntax differs.
-fn notify_bots(tg_text: &str, dc_text: &str) {
-    if database::get_telegram_config().enabled {
-        telegram::notify_admin(tg_text);
-    }
-    if database::get_discord_config().enabled {
-        discord::notify_admin(dc_text);
-    }
-}
-
 /// Starts the tray app's background update work, off the UI thread.
 pub fn start_background_tasks() {
     std::thread::spawn(announce_version_change);
@@ -788,7 +777,9 @@ pub fn watch_for_stalled_update(target: Version) {
             shown(log_path(), LOG_FILE),
             shown(setup_log_path(), SETUP_LOG_FILE),
         );
-        notify_bots(&text, &text);
+        // Through the alert queue: kept and retried if no bot is connected
+        // in this session or the PC is offline right now.
+        crate::watchdog::raise_alert(&text);
     });
 }
 
