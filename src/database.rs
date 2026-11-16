@@ -101,11 +101,11 @@ fn prepare_settings_connection(conn: &Connection) -> Result<(), Box<dyn std::err
         // Lock screen timeout (seconds before shutdown, default 10 minutes)
         ("lock_screen_timeout", "600"),
         // Idle detection settings
-        // Off unless a parent turns it on: "no keyboard/mouse input" also
-        // describes controller gaming and watching videos, which would
-        // otherwise stop the clock. Only written when the key is missing, so
-        // an install that already has a stored value keeps it.
-        ("idle_enabled", "0"),              // 1 = enabled, 0 = disabled
+        // On unless a parent turns it off: a child who walks away shouldn't
+        // keep losing time. Only written when the key is missing, so an
+        // install that already has a stored value keeps it (see
+        // `idle_enabled_from` for missing and empty values).
+        ("idle_enabled", "1"),              // 1 = enabled, 0 = disabled
         ("idle_timeout_minutes", "5"),      // Minutes of inactivity before auto-pause
     ];
 
@@ -1193,9 +1193,17 @@ pub fn get_pause_log_today() -> Vec<String> {
 
 /// Check if idle detection is enabled
 pub fn is_idle_enabled() -> bool {
-    get_setting("idle_enabled")
-        .map(|s| s == "1")
-        .unwrap_or(false)
+    idle_enabled_from(get_setting("idle_enabled").as_deref())
+}
+
+/// Idle auto-pause is on unless "off" was saved: a missing or empty value
+/// (a new install, a recreated database) means on, like the first-run
+/// default. Settings saves "1" or "0".
+fn idle_enabled_from(stored: Option<&str>) -> bool {
+    match stored.map(str::trim) {
+        None | Some("") => true,
+        Some(value) => value == "1",
+    }
 }
 
 /// Get idle timeout in minutes (minimum 1)
@@ -2569,6 +2577,23 @@ mod tests {
         assert_eq!(clamp_lock_screen_timeout(-600), 60);
         assert_eq!(clamp_lock_screen_timeout(i32::MIN), 60, "negative never means \"never\"");
         assert_eq!(clamp_lock_screen_timeout(i32::MAX), i32::MAX);
+    }
+
+    #[test]
+    fn idle_pause_is_on_unless_switched_off() {
+        assert!(idle_enabled_from(None), "never chosen");
+        assert!(idle_enabled_from(Some("")), "empty");
+        assert!(idle_enabled_from(Some("1")));
+        assert!(!idle_enabled_from(Some("0")), "a saved \"off\" is respected");
+
+        // A new install (or a recreated database) starts with it on, 5 minutes.
+        let conn = Connection::open_in_memory().unwrap();
+        prepare_settings_connection(&conn).unwrap();
+        let stored = |key: &str| -> String {
+            conn.query_row("SELECT value FROM settings WHERE key = ?1", params![key], |r| r.get(0)).unwrap()
+        };
+        assert!(idle_enabled_from(Some(&stored("idle_enabled"))));
+        assert_eq!(stored("idle_timeout_minutes"), "5");
     }
 
     #[test]
