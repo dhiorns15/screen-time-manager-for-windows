@@ -175,6 +175,58 @@ static REQUEST_NOTE_EDIT_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std:
 static REQUEST_COOLDOWN_REMAINING: AtomicI32 = AtomicI32::new(0);
 const REQUEST_COOLDOWN_SECONDS: i32 = 300;
 
+/// Whether the lock screen offers "request more time" (a bot is enabled),
+/// as decided when it was last shown - WM_PAINT draws the reason label or
+/// the "enable a bot" hint to match the controls.
+static REQUEST_AVAILABLE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the request section is offered: a bot is enabled in the
+/// configuration.
+fn request_offered(telegram_enabled: bool, discord_enabled: bool) -> bool {
+    telegram_enabled || discord_enabled
+}
+
+/// Whether a request would reach the admin now: an enabled bot is connected
+/// with an admin chat/channel set (its `can_notify`). That's as far as the
+/// app can tell - `time_request::request_more_time` hands the message over
+/// without reporting whether it was delivered.
+fn request_reaches_admin(
+    telegram_enabled: bool,
+    telegram_connected: bool,
+    discord_enabled: bool,
+    discord_connected: bool,
+) -> bool {
+    (telegram_enabled && telegram_connected) || (discord_enabled && discord_connected)
+}
+
+fn request_can_go_out() -> bool {
+    request_reaches_admin(
+        get_telegram_config().enabled,
+        crate::telegram::can_notify(),
+        get_discord_config().enabled,
+        crate::discord::can_notify(),
+    )
+}
+
+/// Show or hide the request section from the bot configuration now. Called
+/// each time the lock screen is shown. UI thread.
+unsafe fn sync_request_controls() {
+    let offered = request_offered(get_telegram_config().enabled, get_discord_config().enabled);
+    REQUEST_AVAILABLE.store(offered, Ordering::SeqCst);
+    let show = if offered { SW_SHOW } else { SW_HIDE };
+    for ptr in [REQUEST_NOTE_EDIT_HWND.load(Ordering::SeqCst), REQUEST_TIME_HWND.load(Ordering::SeqCst)] {
+        if !ptr.is_null() {
+            let _ = ShowWindow(HWND(ptr), show);
+        }
+    }
+    // A "not sent" from last time goes; a running cooldown keeps its text.
+    let btn = REQUEST_TIME_HWND.load(Ordering::SeqCst);
+    if !btn.is_null() && REQUEST_COOLDOWN_REMAINING.load(Ordering::SeqCst) <= 0 {
+        let text = i18n::wide("blocking.request_time_button");
+        SetWindowTextW(HWND(btn), PCWSTR(text.as_ptr())).ok();
+    }
+}
+
 /// Remaining time in seconds (negative means no limit/extension active)
 pub static REMAINING_SECONDS: AtomicI32 = AtomicI32::new(-1);
 
@@ -438,6 +490,7 @@ unsafe fn apply_show_overlay(hwnd: HWND) {
     if !note_ptr.is_null() {
         SetWindowTextW(HWND(note_ptr), w!("")).ok();
     }
+    sync_request_controls();
 
     let _ = InvalidateRect(hwnd, None, false);
 
@@ -861,32 +914,33 @@ pub unsafe extern "system" fn blocking_overlay_proc(
             create_child(hwnd, hinstance, w!("BUTTON"), &i18n::wide("blocking.unlock"), button, ID_UNLOCK_BUTTON);
             create_child(hwnd, hinstance, w!("BUTTON"), &i18n::wide("blocking.shutdown"), button, ID_SHUTDOWN_BUTTON);
 
-            // "Request more time" section - no passcode needed, only shown
-            // when a bot is actually configured to receive the notification.
+            // "Request more time" section - no passcode needed. Always
+            // created, hidden; shown or hidden from the bot configuration
+            // each time the lock screen comes up (sync_request_controls).
+            // They used to exist only if a bot was enabled when the app
+            // started, while WM_PAINT followed the live setting.
             // Layout: separator (WM_PAINT) -> reason label (WM_PAINT) ->
             // note edit -> request button. Must match WM_PAINT.
-            if get_telegram_config().enabled || get_discord_config().enabled {
-                if let Some(e) = create_child(
-                    hwnd,
-                    hinstance,
-                    w!("EDIT"),
-                    &[0],
-                    WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
-                    ID_REQUEST_NOTE_EDIT,
-                ) {
-                    REQUEST_NOTE_EDIT_HWND.store(e.0, Ordering::SeqCst);
-                    SendMessageW(e, EM_SETLIMITTEXT, WPARAM(100), LPARAM(0));
-                }
-                if let Some(h) = create_child(
-                    hwnd,
-                    hinstance,
-                    w!("BUTTON"),
-                    &i18n::wide("blocking.request_time_button"),
-                    button,
-                    ID_REQUEST_TIME_BUTTON,
-                ) {
-                    REQUEST_TIME_HWND.store(h.0, Ordering::SeqCst);
-                }
+            if let Some(e) = create_child(
+                hwnd,
+                hinstance,
+                w!("EDIT"),
+                &[0],
+                WS_CHILD | WS_BORDER | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+                ID_REQUEST_NOTE_EDIT,
+            ) {
+                REQUEST_NOTE_EDIT_HWND.store(e.0, Ordering::SeqCst);
+                SendMessageW(e, EM_SETLIMITTEXT, WPARAM(100), LPARAM(0));
+            }
+            if let Some(h) = create_child(
+                hwnd,
+                hinstance,
+                w!("BUTTON"),
+                &i18n::wide("blocking.request_time_button"),
+                WS_CHILD | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+                ID_REQUEST_TIME_BUTTON,
+            ) {
+                REQUEST_TIME_HWND.store(h.0, Ordering::SeqCst);
             }
 
             apply_fonts(hwnd);
@@ -1083,7 +1137,7 @@ pub unsafe extern "system" fn blocking_overlay_proc(
             SelectObject(hdc, label_font);
             SetTextColor(hdc, COLORREF(0x00AAAAAA));
 
-            if get_telegram_config().enabled || get_discord_config().enabled {
+            if REQUEST_AVAILABLE.load(Ordering::SeqCst) {
                 let mut note_label_rect = RECT {
                     left: panel_x,
                     top: panel_y + scale(486),
@@ -1218,6 +1272,19 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                             }
                             let note = note.trim();
                             let remaining = REMAINING_SECONDS.load(Ordering::SeqCst).max(0);
+                            let btn_ptr = REQUEST_TIME_HWND.load(Ordering::SeqCst);
+
+                            // "Sent!" only if a connected bot took it (see
+                            // request_can_go_out); otherwise say so, keep
+                            // the note, and let it be tried again.
+                            if !request_can_go_out() {
+                                if !btn_ptr.is_null() {
+                                    let text = i18n::wide("blocking.request_not_sent");
+                                    SetWindowTextW(HWND(btn_ptr), PCWSTR(text.as_ptr())).ok();
+                                }
+                                let _ = PlaySoundW(w!("SystemExclamation"), None, SND_ALIAS | SND_ASYNC);
+                                return LRESULT(0);
+                            }
 
                             crate::time_request::request_more_time(
                                 if note.is_empty() { None } else { Some(note.to_string()) },
@@ -1225,7 +1292,6 @@ pub unsafe extern "system" fn blocking_overlay_proc(
                             );
 
                             REQUEST_COOLDOWN_REMAINING.store(REQUEST_COOLDOWN_SECONDS, Ordering::SeqCst);
-                            let btn_ptr = REQUEST_TIME_HWND.load(Ordering::SeqCst);
                             if !btn_ptr.is_null() {
                                 let btn = HWND(btn_ptr);
                                 let _ = EnableWindow(btn, false);
@@ -1523,7 +1589,7 @@ unsafe fn layout_children(hwnd: HWND) {
     place(ID_UNLOCK_BUTTON, btn_x, btn_y, btn_width, btn_height);
     place(ID_SHUTDOWN_BUTTON, btn_x, btn_y + btn_height + scale(10), btn_width, btn_height);
 
-    // "Request more time" note and button (absent when no bot is configured)
+    // "Request more time" note and button (hidden when no bot is enabled)
     let request_width = scale(300);
     let request_x = (width - request_width) / 2;
     place(ID_REQUEST_NOTE_EDIT, request_x, panel_y + scale(508), request_width, scale(30));
@@ -1983,6 +2049,23 @@ mod tests {
         // Raising it again starts from that 0
         day.set_limit(30);
         assert_eq!(day.mins(), 30);
+    }
+
+    #[test]
+    fn the_request_section_follows_the_bot_settings() {
+        assert!(!request_offered(false, false), "no bot: the hint, no button");
+        assert!(request_offered(true, false), "set up after the app started");
+        assert!(request_offered(false, true));
+    }
+
+    #[test]
+    fn a_request_is_reported_sent_only_when_a_bot_can_take_it() {
+        assert!(request_reaches_admin(true, true, false, false));
+        assert!(request_reaches_admin(false, false, true, true));
+        assert!(request_reaches_admin(true, false, true, true), "Discord takes it");
+        assert!(!request_reaches_admin(true, false, false, false), "Telegram offline");
+        assert!(!request_reaches_admin(false, true, false, true), "connected but switched off");
+        assert!(!request_reaches_admin(false, false, false, false));
     }
 
     #[test]
