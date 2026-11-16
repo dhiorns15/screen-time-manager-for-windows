@@ -1971,13 +1971,10 @@ pub unsafe fn show_stats_dialog(parent_hwnd: HWND) {
                 // Get stats
                 let weekday = get_current_weekday();
                 let daily_limit_minutes = get_daily_limit(weekday);
-                let daily_limit_seconds = (daily_limit_minutes * 60) as i32;
                 let remaining_seconds = REMAINING_SECONDS.load(Ordering::SeqCst);
-                let used_seconds = if remaining_seconds >= 0 {
-                    daily_limit_seconds - remaining_seconds
-                } else {
-                    0
-                };
+                // The time actually counted today - not limit minus
+                // remaining, which any extension, reduction or reset threw off
+                let used_seconds = crate::mini_overlay::SESSION_ACTIVE_SECONDS.load(Ordering::SeqCst);
 
                 // Get pause stats
                 let pause_enabled = is_pause_enabled();
@@ -2186,8 +2183,14 @@ pub unsafe fn show_stats_dialog(parent_hwnd: HWND) {
                 let id = (wparam.0 & 0xFFFF) as i32;
 
                 if id == ID_RESET_TIMER {
-                    // Reset to daily limit (saved at once)
-                    crate::blocking::reset_to_daily_limit();
+                    // Reset to daily limit (saved at once), as the bot's
+                    // reset does: the lock screen goes (the reset also ends
+                    // a manual lock), and the admin is told
+                    let remaining = crate::blocking::reset_to_daily_limit();
+                    if remaining > 0 && crate::blocking::is_blocking_overlay_visible() {
+                        crate::blocking::hide_blocking_overlay();
+                    }
+                    crate::blocking::notify_local_reset("reset.source.stats", remaining);
 
                     let msg = i18n::wide("stats.timer_reset");
                     let title = i18n::wide("stats.timer_reset_title");

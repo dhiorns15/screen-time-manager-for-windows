@@ -621,6 +621,11 @@ fn en(key: &str) -> &'static str {
         "tg.cmd.getpin" => "Get today's rotating PIN (if enabled)",
         "tg.cmd.clearlockout" => "Clear the passcode lockout after wrong codes",
 
+        // ----- Stats reset alert, lock-screen time request -----
+        "reset.notify.header" => "used the passcode to reset today's timer to the daily limit",
+        "reset.source.stats" => "Stats window",
+        "blocking.request_not_sent" => "⚠️ Not sent - no connection. Try again",
+
         // Fallback - return empty string for unknown keys (should not happen in practice)
         _ => "",
     }
@@ -1144,6 +1149,11 @@ fn de(key: &str) -> &'static str {
         "tg.cmd.getpin" => "Heutigen rotierenden Code abrufen (falls aktiviert)",
         "tg.cmd.clearlockout" => "Code-Sperre nach falschen Codes aufheben",
 
+        // ----- Statistik-Zurücksetzen, Zeitanfrage am Sperrbildschirm -----
+        "reset.notify.header" => "hat mit dem Code den Timer für heute auf das Tageslimit zurückgesetzt",
+        "reset.source.stats" => "Statistik-Fenster",
+        "blocking.request_not_sent" => "⚠️ Nicht gesendet - keine Verbindung. Erneut versuchen",
+
         // Fallback to English
         _ => en(key),
     }
@@ -1221,6 +1231,15 @@ mod tests {
             "time_zone.notify.header", "time_zone.notify.old", "time_zone.notify.new",
             "time_zone.notify.dst_off", "time_zone.notify.suffix",
         ] {
+            assert!(!en(key).is_empty(), "missing English text for {key}");
+            assert!(!de(key).is_empty(), "missing German text for {key}");
+            assert_ne!(en(key), de(key), "German text for {key} is just the English fallback");
+        }
+    }
+
+    #[test]
+    fn stats_reset_and_request_keys_are_translated() {
+        for key in ["reset.notify.header", "reset.source.stats", "blocking.request_not_sent"] {
             assert!(!en(key).is_empty(), "missing English text for {key}");
             assert!(!de(key).is_empty(), "missing German text for {key}");
             assert_ne!(en(key), de(key), "German text for {key} is just the English fallback");

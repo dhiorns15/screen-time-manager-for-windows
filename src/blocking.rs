@@ -532,6 +532,27 @@ pub fn reset_to_daily_limit() -> i32 {
     limit_seconds
 }
 
+/// Tell the admin bot(s) the passcode was used on this PC to reset today's
+/// timer (`source_key`: where), like the passcode-extend alert - a reset
+/// from the bot answers there, one made on the PC used to tell nobody.
+pub fn notify_local_reset(source_key: &str, remaining_seconds: i32) {
+    use crate::remote_commands::{current_windows_username, format_hm};
+    let text = format!(
+        "🔄 {} {} ({})\n⏳ {}: {}",
+        current_windows_username(),
+        i18n::t("reset.notify.header"),
+        i18n::t(source_key),
+        i18n::t("tg.status.remaining"),
+        format_hm(remaining_seconds),
+    );
+    if get_telegram_config().enabled {
+        crate::telegram::notify_admin(&text);
+    }
+    if get_discord_config().enabled {
+        crate::discord::notify_admin(&text);
+    }
+}
+
 /// Minutes to seconds, saturating (a limit comes from the database).
 fn minutes_to_secs(minutes: u32) -> i32 {
     i32::try_from(minutes.saturating_mul(60)).unwrap_or(i32::MAX)
