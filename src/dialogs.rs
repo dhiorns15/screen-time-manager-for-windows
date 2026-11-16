@@ -660,7 +660,9 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                     if let Ok(h) = edit {
                         SendMessageW(h, WM_SETFONT, WPARAM(edit_font.0 as usize), LPARAM(1));
                         SendMessageW(h, EM_SETLIMITTEXT, WPARAM(4), LPARAM(0));
-                        let value = get_setting(WEEKDAY_KEYS[i]).unwrap_or_else(|| "120".to_string());
+                        // What the app uses: an empty or broken stored value
+                        // reads as the default, so show that, not the text.
+                        let value = crate::database::get_daily_limit(i as u32).to_string();
                         let wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
                         SetWindowTextW(h, PCWSTR(wide.as_ptr())).ok();
                         daily_handles[i] = h;
@@ -684,7 +686,7 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                         if let Ok(h) = edit2 {
                             SendMessageW(h, WM_SETFONT, WPARAM(edit_font.0 as usize), LPARAM(1));
                             SendMessageW(h, EM_SETLIMITTEXT, WPARAM(4), LPARAM(0));
-                            let value = get_setting(WEEKDAY_KEYS[i2]).unwrap_or_else(|| "120".to_string());
+                            let value = crate::database::get_daily_limit(i2 as u32).to_string();
                             let wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
                             SetWindowTextW(h, PCWSTR(wide.as_ptr())).ok();
                             daily_handles[i2] = h;
@@ -719,7 +721,8 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                 if let Ok(h) = w1_min {
                     SendMessageW(h, WM_SETFONT, WPARAM(edit_font.0 as usize), LPARAM(1));
                     SendMessageW(h, EM_SETLIMITTEXT, WPARAM(MINUTES_FIELD_MAX_CHARS), LPARAM(0));
-                    let value = get_setting("warning1_minutes").unwrap_or_else(|| "10".to_string());
+                    // What the app uses, as for the daily limits.
+                    let value = crate::database::get_warning_config(1).0.to_string();
                     let wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
                     SetWindowTextW(h, PCWSTR(wide.as_ptr())).ok();
                     w1_min_hwnd = h;
@@ -772,7 +775,7 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                 if let Ok(h) = w2_min {
                     SendMessageW(h, WM_SETFONT, WPARAM(edit_font.0 as usize), LPARAM(1));
                     SendMessageW(h, EM_SETLIMITTEXT, WPARAM(MINUTES_FIELD_MAX_CHARS), LPARAM(0));
-                    let value = get_setting("warning2_minutes").unwrap_or_else(|| "5".to_string());
+                    let value = crate::database::get_warning_config(2).0.to_string();
                     let wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
                     SetWindowTextW(h, PCWSTR(wide.as_ptr())).ok();
                     w2_min_hwnd = h;
@@ -985,9 +988,10 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                     WS_CHILD | WS_VISIBLE, scale(25), y_pos + scale(2), scale(70), scale(20), hwnd, HMENU::default(), hinstance, None,
                 );
                 if let Ok(h) = chat_id_label { SendMessageW(h, WM_SETFONT, WPARAM(label_font.0 as usize), LPARAM(1)); }
+                // Not ES_NUMBER: a group chat's ID is negative (checked on Save).
                 let telegram_chat_id = CreateWindowExW(
                     WINDOW_EX_STYLE(0x200), w!("EDIT"), w!(""),
-                    WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_NUMBER as u32),
+                    WS_CHILD | WS_VISIBLE | WS_BORDER,
                     scale(100), y_pos, scale(120), scale(22), hwnd, HMENU::default(), hinstance, None,
                 );
                 let mut telegram_chat_id_hwnd = HWND::default();
@@ -1324,6 +1328,10 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                     pause_max_duration: pause_hwnds[1],
                     pause_cooldown: pause_hwnds[2],
                 });
+                // What the fields showed on opening: Save writes only what
+                // differs from this.
+                let handles_ref = std::ptr::addr_of!(SETTINGS_EDIT_HANDLES);
+                SETTINGS_LOADED = (*handles_ref).as_ref().map(|h| read_settings_form(h));
 
                 LRESULT(0)
             }
@@ -1332,44 +1340,25 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
 
                 if id == ID_SETTINGS_SAVE {
                     if let Some(ref handles) = SETTINGS_EDIT_HANDLES {
-                        // Minute fields that must be at least 1: refuse to
-                        // save (nothing is written yet) and put 1 in the field.
-                        for (edit, error_key) in [
-                            (handles.lock_screen_timeout, "settings.error.shutdown_min"),
-                            (handles.pause_max_duration, "settings.error.pause_max_min"),
-                        ] {
-                            if read_number_field(edit) == Some(0) {
-                                SetWindowTextW(edit, w!("1")).ok();
-                                let msg = i18n::wide(error_key);
-                                let title = i18n::wide("settings.error");
-                                MessageBoxW(hwnd, PCWSTR(msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
-                                let _ = SetFocus(edit);
+                        // Only what the parent changed here is written (a
+                        // limit, message or PIN setting changed meanwhile by
+                        // a bot command is kept), and only once every changed
+                        // field is acceptable - nothing is written before.
+                        let now = read_settings_form(handles);
+                        let loaded_ref = std::ptr::addr_of!(SETTINGS_LOADED);
+                        let loaded = (*loaded_ref).clone().unwrap_or_else(|| now.clone());
+                        let min_lock = u32::try_from(crate::database::MIN_LOCK_SCREEN_TIMEOUT_MINS).unwrap_or(1);
+                        let changes = match plan_settings_save(&loaded, &now, min_lock) {
+                            Ok(changes) => changes,
+                            Err(error) => {
+                                let edit = settings_field_edit(handles, error.field);
+                                if error.kind == SettingsErrorKind::BelowOneMinute {
+                                    SetWindowTextW(edit, w!("1")).ok();
+                                }
+                                show_settings_field_error(hwnd, edit, &settings_error_text(&error));
                                 return LRESULT(0);
                             }
-                        }
-
-                        // Every minutes field: empty (left as it was), or a
-                        // whole number within its range. A huge number (say
-                        // 40000000 meaning "never") used to overflow.
-                        if let Some((edit, min, max)) = first_invalid_minutes_field(handles) {
-                            let msg = i18n::t("settings.error.minutes_range")
-                                .replace("{min}", &min.to_string())
-                                .replace("{max}", &max.to_string());
-                            show_settings_field_error(hwnd, edit, &msg);
-                            return LRESULT(0);
-                        }
-
-                        // Discord IDs: empty, or a number other than 0.
-                        for (edit, error_key) in [
-                            (handles.discord_channel_id, "settings.error.discord_channel_id"),
-                            (handles.discord_admin_user_id, "settings.error.discord_user_id"),
-                        ] {
-                            let text = field_text(edit);
-                            if !text.trim().is_empty() && parse_discord_id(&text).is_none() {
-                                show_settings_field_error(hwnd, edit, i18n::t(error_key));
-                                return LRESULT(0);
-                            }
-                        }
+                        };
 
                         // Handle passcode change first
                         let mut current_pass = String::new();
@@ -1404,8 +1393,11 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                                 return LRESULT(0);
                             }
 
-                            // Check new passcode requirements
-                            if new_pass.len() != 4 {
+                            // Check new passcode requirements: four digits,
+                            // as the bots' set-passcode command requires (only
+                            // digits can be typed into the passcode prompts,
+                            // so pasted letters would lock the parent out)
+                            if !is_valid_new_passcode(&new_pass) {
                                 let msg = i18n::wide("settings.error.passcode_length");
                                 let title = i18n::wide("settings.error");
                                 MessageBoxW(hwnd, PCWSTR(msg.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR);
@@ -1427,18 +1419,14 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                         }
 
                         // Save rotating PIN toggle
-                        if !handles.rotating_pin_enabled.0.is_null() {
-                            let checked = SendMessageW(handles.rotating_pin_enabled, BM_GETCHECK, WPARAM(0), LPARAM(0));
-                            crate::database::set_rotating_pin_enabled(checked.0 == 1);
+                        if let Some(enabled) = changes.rotating_pin {
+                            crate::database::set_rotating_pin_enabled(enabled);
                         }
 
                         // Save other settings
-                        for (i, &edit_hwnd) in handles.daily_limits.iter().enumerate() {
-                            if !edit_hwnd.0.is_null() {
-                                let mut buffer = [0u16; 16];
-                                let len = GetWindowTextW(edit_hwnd, &mut buffer);
-                                let value = String::from_utf16_lossy(&buffer[..len as usize]);
-                                set_setting(WEEKDAY_KEYS[i], &value);
+                        for (i, minutes) in changes.daily_limits.iter().enumerate() {
+                            if let Some(minutes) = minutes {
+                                set_setting(WEEKDAY_KEYS[i], &minutes.to_string());
                             }
                         }
 
@@ -1446,98 +1434,35 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                         // by the difference (nothing if it didn't change)
                         crate::blocking::apply_todays_limit_change();
 
-                        if !handles.warning1_minutes.0.is_null() {
-                            let mut buffer = [0u16; 16];
-                            let len = GetWindowTextW(handles.warning1_minutes, &mut buffer);
-                            let value = String::from_utf16_lossy(&buffer[..len as usize]);
-                            set_setting("warning1_minutes", &value);
+                        if let Some(minutes) = changes.warning1_minutes {
+                            set_setting("warning1_minutes", &minutes.to_string());
                         }
-                        if !handles.warning1_message.0.is_null() {
-                            let mut buffer = [0u16; 256];
-                            let len = GetWindowTextW(handles.warning1_message, &mut buffer);
-                            let value = String::from_utf16_lossy(&buffer[..len as usize]);
-                            set_setting("warning1_message", &value);
+                        if let Some(ref message) = changes.warning1_message {
+                            set_setting("warning1_message", message);
                         }
 
-                        if !handles.warning2_minutes.0.is_null() {
-                            let mut buffer = [0u16; 16];
-                            let len = GetWindowTextW(handles.warning2_minutes, &mut buffer);
-                            let value = String::from_utf16_lossy(&buffer[..len as usize]);
-                            set_setting("warning2_minutes", &value);
+                        if let Some(minutes) = changes.warning2_minutes {
+                            set_setting("warning2_minutes", &minutes.to_string());
                         }
-                        if !handles.warning2_message.0.is_null() {
-                            let mut buffer = [0u16; 256];
-                            let len = GetWindowTextW(handles.warning2_message, &mut buffer);
-                            let value = String::from_utf16_lossy(&buffer[..len as usize]);
-                            set_setting("warning2_message", &value);
+                        if let Some(ref message) = changes.warning2_message {
+                            set_setting("warning2_message", message);
                         }
 
-                        if !handles.blocking_message.0.is_null() {
-                            let mut buffer = [0u16; 256];
-                            let len = GetWindowTextW(handles.blocking_message, &mut buffer);
-                            let value = String::from_utf16_lossy(&buffer[..len as usize]);
-                            set_setting("blocking_message", &value);
+                        if let Some(ref message) = changes.blocking_message {
+                            set_setting("blocking_message", message);
                         }
 
-                        // Save Telegram settings (and restart a bot whose
-                        // settings changed, below)
+                        // Save Telegram and Discord settings - what was
+                        // changed here, the stored values for the rest - and
+                        // restart a bot whose settings changed, below
                         let telegram_before = get_telegram_config();
                         let discord_before = get_discord_config();
-                        let mut telegram_token = String::new();
-                        let mut telegram_chat_id = String::new();
-
-                        if !handles.telegram_token.0.is_null() {
-                            let mut buffer = [0u16; 512];
-                            let len = GetWindowTextW(handles.telegram_token, &mut buffer);
-                            telegram_token = String::from_utf16_lossy(&buffer[..len as usize]);
+                        if let Some((token, chat_id, enabled)) = merged_telegram(&changes.telegram, &telegram_before) {
+                            set_telegram_config(&token, &chat_id, enabled);
                         }
-
-                        if !handles.telegram_chat_id.0.is_null() {
-                            let mut buffer = [0u16; 64];
-                            let len = GetWindowTextW(handles.telegram_chat_id, &mut buffer);
-                            telegram_chat_id = String::from_utf16_lossy(&buffer[..len as usize]);
+                        if let Some((token, channel_id, user_id, enabled)) = merged_discord(&changes.discord, &discord_before) {
+                            set_discord_config(&token, &channel_id, &user_id, enabled);
                         }
-
-                        let telegram_enabled = if !handles.telegram_enabled.0.is_null() {
-                            let checked = SendMessageW(handles.telegram_enabled, BM_GETCHECK, WPARAM(0), LPARAM(0));
-                            checked.0 == 1
-                        } else {
-                            false
-                        };
-
-                        set_telegram_config(&telegram_token, &telegram_chat_id, telegram_enabled);
-
-                        // Save Discord settings
-                        let mut discord_token = String::new();
-                        let mut discord_channel_id = String::new();
-                        let mut discord_admin_user_id = String::new();
-
-                        if !handles.discord_token.0.is_null() {
-                            let mut buffer = [0u16; 512];
-                            let len = GetWindowTextW(handles.discord_token, &mut buffer);
-                            discord_token = String::from_utf16_lossy(&buffer[..len as usize]);
-                        }
-
-                        if !handles.discord_channel_id.0.is_null() {
-                            let mut buffer = [0u16; 64];
-                            let len = GetWindowTextW(handles.discord_channel_id, &mut buffer);
-                            discord_channel_id = String::from_utf16_lossy(&buffer[..len as usize]);
-                        }
-
-                        if !handles.discord_admin_user_id.0.is_null() {
-                            let mut buffer = [0u16; 64];
-                            let len = GetWindowTextW(handles.discord_admin_user_id, &mut buffer);
-                            discord_admin_user_id = String::from_utf16_lossy(&buffer[..len as usize]);
-                        }
-
-                        let discord_enabled = if !handles.discord_enabled.0.is_null() {
-                            let checked = SendMessageW(handles.discord_enabled, BM_GETCHECK, WPARAM(0), LPARAM(0));
-                            checked.0 == 1
-                        } else {
-                            false
-                        };
-
-                        set_discord_config(&discord_token, &discord_channel_id, &discord_admin_user_id, discord_enabled);
 
                         let telegram_changed = get_telegram_config() != telegram_before;
                         let discord_changed = get_discord_config() != discord_before;
@@ -1550,43 +1475,34 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                         // after every block") and at most a day; validated
                         // above, and the minimum enforced again where it's
                         // read (database::get_lock_screen_timeout).
-                        if let Some(secs) = read_number_field(handles.lock_screen_timeout).and_then(lock_screen_timeout_secs) {
+                        if let Some(secs) = changes.lock_screen_timeout_secs {
                             set_setting("lock_screen_timeout", &secs.to_string());
                         }
 
                         // Save idle detection settings
-                        if !handles.idle_enabled.0.is_null() {
-                            let checked = SendMessageW(handles.idle_enabled, BM_GETCHECK, WPARAM(0), LPARAM(0));
-                            set_setting("idle_enabled", if checked.0 == 1 { "1" } else { "0" });
+                        if let Some(enabled) = changes.idle_enabled {
+                            set_setting("idle_enabled", if enabled { "1" } else { "0" });
                         }
-                        if !handles.idle_timeout_minutes.0.is_null() {
-                            let mut buffer = [0u16; 16];
-                            let len = GetWindowTextW(handles.idle_timeout_minutes, &mut buffer);
-                            let value = String::from_utf16_lossy(&buffer[..len as usize]);
-                            if let Ok(mins) = value.parse::<u32>() {
-                                let clamped = mins.max(1);
-                                set_setting("idle_timeout_minutes", &clamped.to_string());
-                            }
+                        if let Some(minutes) = changes.idle_timeout {
+                            set_setting("idle_timeout_minutes", &minutes.to_string());
                         }
 
-                        // Save pause settings (same pattern as the idle
-                        // timeout; an empty field leaves the value as it was).
-                        // A daily budget of 0 switches pausing off.
-                        if let Some(budget) = read_number_field(handles.pause_daily_budget) {
+                        // Save pause settings. A daily budget of 0 switches
+                        // pausing off.
+                        if let Some(budget) = changes.pause_budget {
                             set_setting("pause_daily_budget", &budget.to_string());
                             set_setting("pause_enabled", if budget > 0 { "1" } else { "0" });
                         }
-                        if let Some(max) = read_number_field(handles.pause_max_duration) {
-                            set_setting("pause_max_duration", &max.max(1).to_string());
+                        if let Some(max) = changes.pause_max {
+                            set_setting("pause_max_duration", &max.to_string());
                         }
-                        if let Some(cooldown) = read_number_field(handles.pause_cooldown) {
+                        if let Some(cooldown) = changes.pause_cooldown {
                             set_setting("pause_cooldown", &cooldown.to_string());
                         }
 
                         // Save language setting
-                        if !handles.language.0.is_null() {
-                            let sel = SendMessageW(handles.language, CB_GETCURSEL, WPARAM(0), LPARAM(0));
-                            let lang = match sel.0 {
+                        if let Some(index) = changes.language {
+                            let lang = match index {
                                 1 => Language::German,
                                 _ => Language::English,
                             };
@@ -1615,6 +1531,7 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                     if show_telegram_wizard(hwnd) {
                         if let Some(ref handles) = SETTINGS_EDIT_HANDLES {
                             refresh_telegram_fields(handles);
+                            mark_bot_fields_loaded(handles, BotKind::Telegram);
                         }
                         crate::session::restart_remote_bots(true, false);
                     }
@@ -1624,6 +1541,7 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
                     if show_discord_wizard(hwnd) {
                         if let Some(ref handles) = SETTINGS_EDIT_HANDLES {
                             refresh_discord_fields(handles);
+                            mark_bot_fields_loaded(handles, BotKind::Discord);
                         }
                         crate::session::restart_remote_bots(false, true);
                     }
@@ -1679,6 +1597,7 @@ pub unsafe fn show_settings_dialog(parent_hwnd: HWND) {
             }
             WM_DESTROY => {
                 SETTINGS_EDIT_HANDLES = None;
+                SETTINGS_LOADED = None;
                 SETTINGS_DIALOG_OPEN = false;
                 SETTINGS_DEFAULT_PASSCODE_WARNING = HWND::default();
                 LRESULT(0)
@@ -1787,25 +1706,20 @@ unsafe fn refresh_discord_fields(handles: &SettingsEditHandles) {
     set_field_text(handles.discord_admin_user_id, &config.admin_user_id.map(|id| id.to_string()).unwrap_or_default());
 }
 
-/// The parsed value of a numeric edit field, `None` if empty or not a
-/// number (or the field doesn't exist).
-unsafe fn read_number_field(edit: HWND) -> Option<u32> {
-    if edit.0.is_null() {
-        return None;
-    }
-    let mut buffer = [0u16; 16];
-    let len = GetWindowTextW(edit, &mut buffer);
-    String::from_utf16_lossy(&buffer[..len.max(0) as usize]).trim().parse().ok()
-}
-
-/// A short edit field's text ("" if the field doesn't exist).
-unsafe fn field_text(edit: HWND) -> String {
+/// An edit field's text, at most `buffer_len - 1` characters ("" if the
+/// field doesn't exist).
+unsafe fn field_text(edit: HWND, buffer_len: usize) -> String {
     if edit.0.is_null() {
         return String::new();
     }
-    let mut buffer = [0u16; 64];
+    let mut buffer = vec![0u16; buffer_len];
     let len = GetWindowTextW(edit, &mut buffer);
     String::from_utf16_lossy(&buffer[..len.max(0) as usize])
+}
+
+/// Whether a Settings checkbox is ticked (`false` if it doesn't exist).
+unsafe fn checkbox_checked(checkbox: HWND) -> bool {
+    !checkbox.0.is_null() && SendMessageW(checkbox, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == 1
 }
 
 /// Characters a minutes field takes where no smaller limit is set (9999
@@ -1814,36 +1728,376 @@ const MINUTES_FIELD_MAX_CHARS: usize = 4;
 /// The longest lock-screen countdown Settings accepts: a day.
 const MAX_LOCK_SCREEN_TIMEOUT_MINS: u32 = 24 * 60;
 
-/// Whether a minutes field's text is acceptable: empty (the field is left
-/// as it was, or saved empty as before), or a whole number in `min..=max`.
-fn minutes_field_ok(text: &str, min: u32, max: u32) -> bool {
-    let text = text.trim();
-    text.is_empty() || text.parse::<u32>().is_ok_and(|n| (min..=max).contains(&n))
+/// What the Settings fields hold, as shown (the passcode fields aside).
+/// Read when the dialog opens (`SETTINGS_LOADED`) and again on Save; Save
+/// writes only the fields whose text differs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SettingsForm {
+    daily_limits: [String; 7],
+    warning1_minutes: String,
+    warning1_message: String,
+    warning2_minutes: String,
+    warning2_message: String,
+    blocking_message: String,
+    rotating_pin: bool,
+    telegram_enabled: bool,
+    telegram_token: String,
+    telegram_chat_id: String,
+    discord_enabled: bool,
+    discord_token: String,
+    discord_channel_id: String,
+    discord_admin_user_id: String,
+    lock_screen_timeout: String,
+    idle_enabled: bool,
+    idle_timeout: String,
+    pause_budget: String,
+    pause_max: String,
+    pause_cooldown: String,
+    /// The language list's selection (0 English, 1 German; -1 if none).
+    language: isize,
 }
 
-/// The first Settings minutes field whose text isn't acceptable, with the
-/// range it must be in.
-unsafe fn first_invalid_minutes_field(handles: &SettingsEditHandles) -> Option<(HWND, u32, u32)> {
-    let min_lock = u32::try_from(crate::database::MIN_LOCK_SCREEN_TIMEOUT_MINS).unwrap_or(1);
-    let fields = handles
-        .daily_limits
-        .iter()
-        .map(|&h| (h, 0, 9999))
-        .chain([
-            (handles.warning1_minutes, 0, 9999),
-            (handles.warning2_minutes, 0, 9999),
-            (handles.lock_screen_timeout, min_lock, MAX_LOCK_SCREEN_TIMEOUT_MINS),
-            (handles.idle_timeout_minutes, 0, 999),
-            (handles.pause_daily_budget, 0, 999),
-            (handles.pause_max_duration, 1, 999),
-            (handles.pause_cooldown, 0, 999),
-        ]);
-    for (edit, min, max) in fields {
-        if !minutes_field_ok(&field_text(edit), min, max) {
-            return Some((edit, min, max));
+/// The Settings fields as they were when the dialog opened (bot fields
+/// updated after a wizard saved them).
+static mut SETTINGS_LOADED: Option<SettingsForm> = None;
+
+/// Read the Settings fields. Each is read with the buffer Save always
+/// used for it, so a text is cut where it was before.
+unsafe fn read_settings_form(h: &SettingsEditHandles) -> SettingsForm {
+    SettingsForm {
+        daily_limits: std::array::from_fn(|i| field_text(h.daily_limits[i], 16)),
+        warning1_minutes: field_text(h.warning1_minutes, 16),
+        warning1_message: field_text(h.warning1_message, 256),
+        warning2_minutes: field_text(h.warning2_minutes, 16),
+        warning2_message: field_text(h.warning2_message, 256),
+        blocking_message: field_text(h.blocking_message, 256),
+        rotating_pin: checkbox_checked(h.rotating_pin_enabled),
+        telegram_enabled: checkbox_checked(h.telegram_enabled),
+        telegram_token: field_text(h.telegram_token, 512),
+        telegram_chat_id: field_text(h.telegram_chat_id, 64),
+        discord_enabled: checkbox_checked(h.discord_enabled),
+        discord_token: field_text(h.discord_token, 512),
+        discord_channel_id: field_text(h.discord_channel_id, 64),
+        discord_admin_user_id: field_text(h.discord_admin_user_id, 64),
+        lock_screen_timeout: field_text(h.lock_screen_timeout, 16),
+        idle_enabled: checkbox_checked(h.idle_enabled),
+        idle_timeout: field_text(h.idle_timeout_minutes, 16),
+        pause_budget: field_text(h.pause_daily_budget, 16),
+        pause_max: field_text(h.pause_max_duration, 16),
+        pause_cooldown: field_text(h.pause_cooldown, 16),
+        language: if h.language.0.is_null() {
+            -1
+        } else {
+            SendMessageW(h.language, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0
+        },
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BotKind {
+    Telegram,
+    Discord,
+}
+
+/// After a setup wizard saved and its bot's fields were refreshed: take
+/// them as loaded, so Save doesn't count them as the parent's changes.
+unsafe fn mark_bot_fields_loaded(handles: &SettingsEditHandles, bot: BotKind) {
+    let now = read_settings_form(handles);
+    let loaded = std::ptr::addr_of_mut!(SETTINGS_LOADED);
+    let Some(loaded) = (*loaded).as_mut() else { return };
+    match bot {
+        BotKind::Telegram => {
+            loaded.telegram_enabled = now.telegram_enabled;
+            loaded.telegram_token = now.telegram_token;
+            loaded.telegram_chat_id = now.telegram_chat_id;
+        }
+        BotKind::Discord => {
+            loaded.discord_enabled = now.discord_enabled;
+            loaded.discord_token = now.discord_token;
+            loaded.discord_channel_id = now.discord_channel_id;
+            loaded.discord_admin_user_id = now.discord_admin_user_id;
         }
     }
-    None
+}
+
+/// A Settings field that Save can refuse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsField {
+    DailyLimit(usize),
+    Warning1Minutes,
+    Warning1Message,
+    Warning2Minutes,
+    Warning2Message,
+    BlockingMessage,
+    TelegramChatId,
+    DiscordChannelId,
+    DiscordUserId,
+    LockScreenTimeout,
+    IdleTimeout,
+    PauseBudget,
+    PauseMax,
+    PauseCooldown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettingsErrorKind {
+    /// 0 where at least a minute is needed (the field is then set to 1).
+    BelowOneMinute,
+    /// Empty, not a whole number, or outside `min..=max` minutes.
+    Minutes { min: u32, max: u32 },
+    /// A message emptied: it would show a blank warning or lock screen.
+    EmptyMessage,
+    /// Not a usable chat, channel or user ID.
+    BadId,
+}
+
+/// Why Save refused, and which field to put the cursor in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SettingsError {
+    field: SettingsField,
+    kind: SettingsErrorKind,
+}
+
+/// Bot settings changed in the dialog (`None`: leave as stored).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct TelegramChanges {
+    token: Option<String>,
+    chat_id: Option<String>,
+    enabled: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DiscordChanges {
+    token: Option<String>,
+    channel_id: Option<String>,
+    admin_user_id: Option<String>,
+    enabled: Option<bool>,
+}
+
+/// What Save writes: only what the parent changed in the dialog, as it is
+/// to be stored (`None`: leave the stored value alone - it may have been
+/// changed by a bot command since the dialog opened).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SettingsChanges {
+    daily_limits: [Option<u32>; 7],
+    warning1_minutes: Option<u32>,
+    warning1_message: Option<String>,
+    warning2_minutes: Option<u32>,
+    warning2_message: Option<String>,
+    blocking_message: Option<String>,
+    rotating_pin: Option<bool>,
+    telegram: TelegramChanges,
+    discord: DiscordChanges,
+    lock_screen_timeout_secs: Option<i32>,
+    idle_enabled: Option<bool>,
+    idle_timeout: Option<u32>,
+    pause_budget: Option<u32>,
+    pause_max: Option<u32>,
+    pause_cooldown: Option<u32>,
+    language: Option<isize>,
+}
+
+/// A minutes field's value: a whole number in `min..=max`. `None` for
+/// anything else, including an empty field - it used to be saved as "",
+/// which the app then read as its default (120 minutes for a daily limit,
+/// 5 for a warning) while Settings showed it empty.
+fn parse_minutes(text: &str, min: u32, max: u32) -> Option<u32> {
+    text.trim().parse::<u32>().ok().filter(|n| (min..=max).contains(n))
+}
+
+/// A Telegram chat ID as typed: a whole number other than 0, negative for a
+/// group or channel (the field used to take digits only, so a group could
+/// only be set up through the wizard).
+fn parse_telegram_chat_id(text: &str) -> Option<i64> {
+    text.trim().parse::<i64>().ok().filter(|&id| id != 0)
+}
+
+/// A new passcode: exactly four digits 0-9, as the bots' set-passcode
+/// command requires. Anything else (pasted letters, say) could never be
+/// typed into the digits-only passcode prompts again.
+fn is_valid_new_passcode(code: &str) -> bool {
+    code.len() == 4 && code.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Check the fields the parent changed (`now` against `loaded`) and work
+/// out what to store. The first unacceptable field, top to bottom (after
+/// the two fields that must be at least a minute, checked first as
+/// before), refuses the whole save. Fields left as they were are neither
+/// checked nor written. `min_lock` is the shortest lock-screen countdown.
+fn plan_settings_save(loaded: &SettingsForm, now: &SettingsForm, min_lock: u32) -> Result<SettingsChanges, SettingsError> {
+    use SettingsErrorKind::*;
+    use SettingsField::*;
+    let refuse = |field, kind| Err(SettingsError { field, kind });
+
+    for (field, before, after) in [
+        (LockScreenTimeout, &loaded.lock_screen_timeout, &now.lock_screen_timeout),
+        (PauseMax, &loaded.pause_max, &now.pause_max),
+    ] {
+        if after != before && after.trim().parse::<u32>() == Ok(0) {
+            return refuse(field, BelowOneMinute);
+        }
+    }
+
+    let minutes = |field, before: &String, after: &String, min, max| -> Result<Option<u32>, SettingsError> {
+        if after == before {
+            return Ok(None);
+        }
+        parse_minutes(after, min, max).map(Some).ok_or(SettingsError { field, kind: Minutes { min, max } })
+    };
+    let message = |field, before: &String, after: &String| -> Result<Option<String>, SettingsError> {
+        if after == before {
+            Ok(None)
+        } else if after.trim().is_empty() {
+            Err(SettingsError { field, kind: EmptyMessage })
+        } else {
+            Ok(Some(after.clone()))
+        }
+    };
+    // Tokens and IDs are stored trimmed (a pasted trailing space or newline
+    // used to be kept, and the bot then never connected); an emptied field
+    // clears the setting, as before.
+    let changed_text = |before: &String, after: &String| (after != before).then(|| after.trim().to_string());
+    let id = |field, before: &String, after: &String, parse: &dyn Fn(&str) -> Option<String>| -> Result<Option<String>, SettingsError> {
+        match changed_text(before, after) {
+            None => Ok(None),
+            Some(text) if text.is_empty() => Ok(Some(text)),
+            Some(text) => parse(&text).map(Some).ok_or(SettingsError { field, kind: BadId }),
+        }
+    };
+    let flag = |before: bool, after: bool| (after != before).then_some(after);
+
+    let mut daily_limits = [None; 7];
+    for (i, limit) in daily_limits.iter_mut().enumerate() {
+        *limit = minutes(DailyLimit(i), &loaded.daily_limits[i], &now.daily_limits[i], 0, 9999)?;
+    }
+    let warning1_minutes = minutes(Warning1Minutes, &loaded.warning1_minutes, &now.warning1_minutes, 0, 9999)?;
+    let warning1_message = message(Warning1Message, &loaded.warning1_message, &now.warning1_message)?;
+    let warning2_minutes = minutes(Warning2Minutes, &loaded.warning2_minutes, &now.warning2_minutes, 0, 9999)?;
+    let warning2_message = message(Warning2Message, &loaded.warning2_message, &now.warning2_message)?;
+    let blocking_message = message(BlockingMessage, &loaded.blocking_message, &now.blocking_message)?;
+
+    let telegram = TelegramChanges {
+        token: changed_text(&loaded.telegram_token, &now.telegram_token),
+        chat_id: id(TelegramChatId, &loaded.telegram_chat_id, &now.telegram_chat_id, &|t| {
+            parse_telegram_chat_id(t).map(|n| n.to_string())
+        })?,
+        enabled: flag(loaded.telegram_enabled, now.telegram_enabled),
+    };
+    let discord = DiscordChanges {
+        token: changed_text(&loaded.discord_token, &now.discord_token),
+        channel_id: id(DiscordChannelId, &loaded.discord_channel_id, &now.discord_channel_id, &|t| {
+            parse_discord_id(t).map(|n| n.to_string())
+        })?,
+        admin_user_id: id(DiscordUserId, &loaded.discord_admin_user_id, &now.discord_admin_user_id, &|t| {
+            parse_discord_id(t).map(|n| n.to_string())
+        })?,
+        enabled: flag(loaded.discord_enabled, now.discord_enabled),
+    };
+
+    let lock_screen_timeout_secs = minutes(
+        LockScreenTimeout,
+        &loaded.lock_screen_timeout,
+        &now.lock_screen_timeout,
+        min_lock,
+        MAX_LOCK_SCREEN_TIMEOUT_MINS,
+    )?
+    .and_then(lock_screen_timeout_secs);
+    // 0 minutes of idle time is taken as 1, as before.
+    let idle_timeout = minutes(IdleTimeout, &loaded.idle_timeout, &now.idle_timeout, 0, 999)?.map(|m| m.max(1));
+    let pause_budget = minutes(PauseBudget, &loaded.pause_budget, &now.pause_budget, 0, 999)?;
+    let pause_max = minutes(PauseMax, &loaded.pause_max, &now.pause_max, 1, 999)?;
+    let pause_cooldown = minutes(PauseCooldown, &loaded.pause_cooldown, &now.pause_cooldown, 0, 999)?;
+
+    Ok(SettingsChanges {
+        daily_limits,
+        warning1_minutes,
+        warning1_message,
+        warning2_minutes,
+        warning2_message,
+        blocking_message,
+        rotating_pin: flag(loaded.rotating_pin, now.rotating_pin),
+        telegram,
+        discord,
+        lock_screen_timeout_secs,
+        idle_enabled: flag(loaded.idle_enabled, now.idle_enabled),
+        idle_timeout,
+        pause_budget,
+        pause_max,
+        pause_cooldown,
+        language: (now.language != loaded.language && now.language >= 0).then_some(now.language),
+    })
+}
+
+/// The Telegram settings to store: the parent's changes over the stored
+/// `config`. `None` if nothing changed.
+fn merged_telegram(changes: &TelegramChanges, config: &crate::database::TelegramConfig) -> Option<(String, String, bool)> {
+    if *changes == TelegramChanges::default() {
+        return None;
+    }
+    Some((
+        changes.token.clone().unwrap_or_else(|| config.bot_token.clone().unwrap_or_default()),
+        changes.chat_id.clone().unwrap_or_else(|| config.admin_chat_id.map(|id| id.to_string()).unwrap_or_default()),
+        changes.enabled.unwrap_or(config.enabled),
+    ))
+}
+
+/// The Discord settings to store: the parent's changes over the stored
+/// `config`. `None` if nothing changed.
+fn merged_discord(changes: &DiscordChanges, config: &crate::database::DiscordConfig) -> Option<(String, String, String, bool)> {
+    if *changes == DiscordChanges::default() {
+        return None;
+    }
+    let stored_id = |id: Option<u64>| id.map(|id| id.to_string()).unwrap_or_default();
+    Some((
+        changes.token.clone().unwrap_or_else(|| config.bot_token.clone().unwrap_or_default()),
+        changes.channel_id.clone().unwrap_or_else(|| stored_id(config.channel_id)),
+        changes.admin_user_id.clone().unwrap_or_else(|| stored_id(config.admin_user_id)),
+        changes.enabled.unwrap_or(config.enabled),
+    ))
+}
+
+/// The edit control of a refusable Settings field.
+fn settings_field_edit(h: &SettingsEditHandles, field: SettingsField) -> HWND {
+    match field {
+        SettingsField::DailyLimit(i) => h.daily_limits.get(i).copied().unwrap_or_default(),
+        SettingsField::Warning1Minutes => h.warning1_minutes,
+        SettingsField::Warning1Message => h.warning1_message,
+        SettingsField::Warning2Minutes => h.warning2_minutes,
+        SettingsField::Warning2Message => h.warning2_message,
+        SettingsField::BlockingMessage => h.blocking_message,
+        SettingsField::TelegramChatId => h.telegram_chat_id,
+        SettingsField::DiscordChannelId => h.discord_channel_id,
+        SettingsField::DiscordUserId => h.discord_admin_user_id,
+        SettingsField::LockScreenTimeout => h.lock_screen_timeout,
+        SettingsField::IdleTimeout => h.idle_timeout_minutes,
+        SettingsField::PauseBudget => h.pause_daily_budget,
+        SettingsField::PauseMax => h.pause_max_duration,
+        SettingsField::PauseCooldown => h.pause_cooldown,
+    }
+}
+
+/// The i18n key of the message for a refused Save.
+fn settings_error_key(error: &SettingsError) -> &'static str {
+    match (error.kind, error.field) {
+        (SettingsErrorKind::BelowOneMinute, SettingsField::PauseMax) => "settings.error.pause_max_min",
+        (SettingsErrorKind::BelowOneMinute, _) => "settings.error.shutdown_min",
+        (SettingsErrorKind::Minutes { .. }, _) => "settings.error.minutes_range",
+        (SettingsErrorKind::EmptyMessage, _) => "settings.error.message_empty",
+        (SettingsErrorKind::BadId, SettingsField::TelegramChatId) => "settings.error.telegram_chat_id",
+        (SettingsErrorKind::BadId, SettingsField::DiscordUserId) => "settings.error.discord_user_id",
+        (SettingsErrorKind::BadId, _) => "settings.error.discord_channel_id",
+    }
+}
+
+/// The message for a refused Save, in the current language.
+fn settings_error_text(error: &SettingsError) -> String {
+    let text = i18n::t(settings_error_key(error));
+    match error.kind {
+        SettingsErrorKind::Minutes { min, max } => {
+            text.replace("{min}", &min.to_string()).replace("{max}", &max.to_string())
+        }
+        _ => text.to_string(),
+    }
 }
 
 /// Refuse a Settings save: show `message` and put the cursor in `edit`
@@ -4733,17 +4987,226 @@ mod tests {
     }
 
     #[test]
-    fn minutes_fields_take_whole_numbers_in_range_or_nothing() {
-        assert!(minutes_field_ok("", 1, 1440));
-        assert!(minutes_field_ok("  ", 1, 1440));
-        assert!(minutes_field_ok("1", 1, 1440));
-        assert!(minutes_field_ok("1440", 1, 1440));
-        assert!(!minutes_field_ok("1441", 1, 1440));
-        assert!(!minutes_field_ok("0", 1, 1440));
-        assert!(!minutes_field_ok("40000000", 1, 1440), "'never' as a huge number");
-        assert!(!minutes_field_ok("99999999999999999999", 0, 9999));
-        assert!(!minutes_field_ok("-5", 0, 9999));
-        assert!(!minutes_field_ok("ten", 0, 9999));
+    fn minutes_fields_take_whole_numbers_in_range() {
+        assert_eq!(parse_minutes("1", 1, 1440), Some(1));
+        assert_eq!(parse_minutes(" 1440 ", 1, 1440), Some(1440));
+        assert_eq!(parse_minutes("0", 0, 9999), Some(0), "0 is a real limit: no time that day");
+        assert_eq!(parse_minutes("", 0, 9999), None, "empty used to be stored and read back as 120");
+        assert_eq!(parse_minutes("  ", 1, 1440), None);
+        assert_eq!(parse_minutes("1441", 1, 1440), None);
+        assert_eq!(parse_minutes("0", 1, 1440), None);
+        assert_eq!(parse_minutes("40000000", 1, 1440), None, "'never' as a huge number");
+        assert_eq!(parse_minutes("99999999999999999999", 0, 9999), None);
+        assert_eq!(parse_minutes("-5", 0, 9999), None);
+        assert_eq!(parse_minutes("ten", 0, 9999), None);
+    }
+
+    /// The Settings fields as a fresh install shows them.
+    fn opened_settings() -> SettingsForm {
+        SettingsForm {
+            daily_limits: std::array::from_fn(|_| "120".to_string()),
+            warning1_minutes: "10".into(),
+            warning1_message: "10 minutes remaining!".into(),
+            warning2_minutes: "5".into(),
+            warning2_message: "5 minutes remaining!".into(),
+            blocking_message: "Your screen time limit has been reached.".into(),
+            lock_screen_timeout: "5".into(),
+            idle_timeout: "5".into(),
+            pause_budget: "30".into(),
+            pause_max: "15".into(),
+            pause_cooldown: "30".into(),
+            language: 0,
+            ..SettingsForm::default()
+        }
+    }
+
+    fn refused(field: SettingsField, kind: SettingsErrorKind) -> Result<SettingsChanges, SettingsError> {
+        Err(SettingsError { field, kind })
+    }
+
+    #[test]
+    fn saving_unchanged_settings_writes_nothing() {
+        // So a limit, message or PIN setting a bot command changed while
+        // Settings was open is kept.
+        let loaded = opened_settings();
+        assert_eq!(plan_settings_save(&loaded, &loaded.clone(), 1), Ok(SettingsChanges::default()));
+    }
+
+    #[test]
+    fn only_changed_fields_are_written() {
+        let loaded = opened_settings();
+        let mut now = loaded.clone();
+        now.daily_limits[6] = "0".into();
+        now.warning2_message = "Almost done".into();
+        now.rotating_pin = true;
+        now.language = 1;
+        let changes = plan_settings_save(&loaded, &now, 1).unwrap();
+        let mut limits = [None; 7];
+        limits[6] = Some(0);
+        assert_eq!(
+            changes,
+            SettingsChanges {
+                daily_limits: limits,
+                warning2_message: Some("Almost done".into()),
+                rotating_pin: Some(true),
+                language: Some(1),
+                ..SettingsChanges::default()
+            }
+        );
+
+        // Numbers are stored as numbers, the lock screen in seconds, an idle
+        // time of 0 as 1 minute (as before).
+        let mut now = loaded.clone();
+        now.daily_limits[0] = " 90".into();
+        now.lock_screen_timeout = "10".into();
+        now.idle_timeout = "0".into();
+        now.pause_budget = "0".into();
+        let changes = plan_settings_save(&loaded, &now, 1).unwrap();
+        assert_eq!(changes.daily_limits[0], Some(90));
+        assert_eq!(changes.lock_screen_timeout_secs, Some(600));
+        assert_eq!(changes.idle_timeout, Some(1));
+        assert_eq!(changes.pause_budget, Some(0));
+    }
+
+    #[test]
+    fn emptied_fields_are_refused_not_saved_empty() {
+        let loaded = opened_settings();
+        let emptied = |set: fn(&mut SettingsForm)| {
+            let mut now = loaded.clone();
+            set(&mut now);
+            plan_settings_save(&loaded, &now, 1)
+        };
+        let range = |min, max| SettingsErrorKind::Minutes { min, max };
+        assert_eq!(emptied(|f| f.daily_limits[6].clear()), refused(SettingsField::DailyLimit(6), range(0, 9999)));
+        assert_eq!(emptied(|f| f.warning2_minutes.clear()), refused(SettingsField::Warning2Minutes, range(0, 9999)));
+        assert_eq!(emptied(|f| f.lock_screen_timeout.clear()), refused(SettingsField::LockScreenTimeout, range(1, 1440)));
+        assert_eq!(emptied(|f| f.idle_timeout.clear()), refused(SettingsField::IdleTimeout, range(0, 999)));
+        assert_eq!(emptied(|f| f.pause_budget.clear()), refused(SettingsField::PauseBudget, range(0, 999)));
+        assert_eq!(emptied(|f| f.pause_max.clear()), refused(SettingsField::PauseMax, range(1, 999)));
+        assert_eq!(emptied(|f| f.pause_cooldown.clear()), refused(SettingsField::PauseCooldown, range(0, 999)));
+        let empty = SettingsErrorKind::EmptyMessage;
+        assert_eq!(emptied(|f| f.warning1_message.clear()), refused(SettingsField::Warning1Message, empty));
+        assert_eq!(emptied(|f| f.warning2_message = "   ".into()), refused(SettingsField::Warning2Message, empty));
+        assert_eq!(emptied(|f| f.blocking_message.clear()), refused(SettingsField::BlockingMessage, empty));
+
+        // A field that was already empty when Settings opened (stored that
+        // way by an older version) isn't held against an unrelated save.
+        let mut old = opened_settings();
+        old.blocking_message.clear();
+        let mut now = old.clone();
+        now.daily_limits[0] = "60".into();
+        assert!(plan_settings_save(&old, &now, 1).is_ok());
+
+        // The first bad field top to bottom is the one reported, after the
+        // two that must be at least a minute (checked first, as before).
+        let mut now = loaded.clone();
+        now.blocking_message.clear();
+        now.daily_limits[3] = "ten".into();
+        now.pause_max = "0".into();
+        assert_eq!(plan_settings_save(&loaded, &now, 1), refused(SettingsField::PauseMax, SettingsErrorKind::BelowOneMinute));
+        now.pause_max = "15".into();
+        assert_eq!(plan_settings_save(&loaded, &now, 1), refused(SettingsField::DailyLimit(3), range(0, 9999)));
+    }
+
+    #[test]
+    fn bot_fields_are_trimmed_and_ids_checked_as_they_are_read() {
+        let loaded = opened_settings();
+        let mut now = loaded.clone();
+        now.telegram_token = "  123:abc\r\n".into();
+        now.telegram_chat_id = " -1001234567890 ".into();
+        now.discord_token = "\ttoken.part.three ".into();
+        now.discord_channel_id = " 42".into();
+        now.discord_admin_user_id = "+0007 ".into();
+        now.discord_enabled = true;
+        let changes = plan_settings_save(&loaded, &now, 1).unwrap();
+        assert_eq!(
+            changes.telegram,
+            TelegramChanges { token: Some("123:abc".into()), chat_id: Some("-1001234567890".into()), enabled: None }
+        );
+        assert_eq!(
+            changes.discord,
+            DiscordChanges {
+                token: Some("token.part.three".into()),
+                channel_id: Some("42".into()),
+                admin_user_id: Some("7".into()),
+                enabled: Some(true),
+            }
+        );
+
+        let bad = |set: fn(&mut SettingsForm)| {
+            let mut now = loaded.clone();
+            set(&mut now);
+            plan_settings_save(&loaded, &now, 1)
+        };
+        let id = SettingsErrorKind::BadId;
+        assert_eq!(bad(|f| f.telegram_chat_id = "0".into()), refused(SettingsField::TelegramChatId, id));
+        assert_eq!(bad(|f| f.telegram_chat_id = "12a".into()), refused(SettingsField::TelegramChatId, id));
+        assert_eq!(bad(|f| f.telegram_chat_id = "--5".into()), refused(SettingsField::TelegramChatId, id));
+        assert_eq!(bad(|f| f.discord_channel_id = "0".into()), refused(SettingsField::DiscordChannelId, id));
+        assert_eq!(bad(|f| f.discord_admin_user_id = "-7".into()), refused(SettingsField::DiscordUserId, id));
+        // Emptying a bot field clears that setting, as before.
+        let cleared = bad(|f| f.telegram_chat_id = " ".into()).unwrap();
+        assert_eq!(cleared.telegram.chat_id, Some(String::new()));
+    }
+
+    #[test]
+    fn telegram_chat_ids_may_be_negative() {
+        assert_eq!(parse_telegram_chat_id("123456789"), Some(123_456_789));
+        assert_eq!(parse_telegram_chat_id(" -1001234567890 "), Some(-1_001_234_567_890));
+        assert_eq!(parse_telegram_chat_id("0"), None);
+        assert_eq!(parse_telegram_chat_id(""), None);
+        assert_eq!(parse_telegram_chat_id("- 5"), None);
+        assert_eq!(parse_telegram_chat_id("99999999999999999999"), None, "beyond i64");
+    }
+
+    #[test]
+    fn unchanged_bot_settings_keep_their_stored_values() {
+        use crate::database::{DiscordConfig, TelegramConfig};
+        let telegram = TelegramConfig { bot_token: Some("123:abc".into()), admin_chat_id: Some(-100), enabled: true };
+        assert_eq!(merged_telegram(&TelegramChanges::default(), &telegram), None);
+        assert_eq!(
+            merged_telegram(&TelegramChanges { enabled: Some(false), ..Default::default() }, &telegram),
+            Some(("123:abc".to_string(), "-100".to_string(), false))
+        );
+        let discord = DiscordConfig { bot_token: None, channel_id: Some(5), admin_user_id: None, enabled: false };
+        assert_eq!(merged_discord(&DiscordChanges::default(), &discord), None);
+        assert_eq!(
+            merged_discord(&DiscordChanges { token: Some("t.o.k".into()), ..Default::default() }, &discord),
+            Some(("t.o.k".to_string(), "5".to_string(), String::new(), false))
+        );
+    }
+
+    #[test]
+    fn a_new_passcode_is_four_digits() {
+        assert!(is_valid_new_passcode("0420"));
+        assert!(!is_valid_new_passcode("12a4"), "letters can't be typed into the passcode prompt");
+        assert!(!is_valid_new_passcode("abcd"));
+        assert!(!is_valid_new_passcode("123"));
+        assert!(!is_valid_new_passcode("12345"));
+        assert!(!is_valid_new_passcode("١٢٣٤"), "non-ASCII digits");
+        assert!(!is_valid_new_passcode(" 123"));
+    }
+
+    #[test]
+    fn every_refusal_has_a_message() {
+        use SettingsErrorKind::*;
+        use SettingsField::*;
+        for (field, kind) in [
+            (LockScreenTimeout, BelowOneMinute),
+            (PauseMax, BelowOneMinute),
+            (DailyLimit(0), Minutes { min: 0, max: 9999 }),
+            (BlockingMessage, EmptyMessage),
+            (TelegramChatId, BadId),
+            (DiscordChannelId, BadId),
+            (DiscordUserId, BadId),
+        ] {
+            let error = SettingsError { field, kind };
+            assert!(!settings_error_text(&error).is_empty(), "{error:?}");
+        }
+        assert_eq!(
+            settings_error_text(&SettingsError { field: PauseBudget, kind: Minutes { min: 0, max: 999 } }),
+            "Please enter a whole number of minutes from 0 to 999."
+        );
     }
 
     #[test]

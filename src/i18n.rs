@@ -640,6 +640,10 @@ fn en(key: &str) -> &'static str {
         "wizard.connect.error.network" => "Can't reach Telegram - please check the internet connection. Still trying...",
         "wizard.connect.error.other" => "Telegram reported a problem. Still trying...",
 
+        // ----- Settings: emptied messages, group chat IDs -----
+        "settings.error.message_empty" => "A message can't be empty. Type the text to show, or press Cancel to keep the one you had.",
+        "settings.error.telegram_chat_id" => "The Telegram chat ID must be a whole number other than 0 (a group's ID starts with a minus sign). The setup wizard can find it for you.",
+
         // Fallback - return empty string for unknown keys (should not happen in practice)
         _ => "",
     }
@@ -1181,6 +1185,10 @@ fn de(key: &str) -> &'static str {
         "wizard.connect.error.conflict" => "Etwas anderes liest bereits die Nachrichten dieses Bots - dieser Bot auf einem anderen PC oder Konto, oder ein Webhook. Beenden Sie es dort oder erstellen Sie einen neuen Bot. Neuer Versuch läuft...",
         "wizard.connect.error.network" => "Telegram ist nicht erreichbar - bitte die Internetverbindung prüfen. Neuer Versuch läuft...",
         "wizard.connect.error.other" => "Telegram hat ein Problem gemeldet. Neuer Versuch läuft...",
+
+        // ----- Einstellungen: geleerte Nachrichten, Gruppen-Chat-IDs -----
+        "settings.error.message_empty" => "Eine Nachricht darf nicht leer sein. Geben Sie den anzuzeigenden Text ein, oder klicken Sie auf Abbrechen, um die bisherige zu behalten.",
+        "settings.error.telegram_chat_id" => "Die Telegram-Chat-ID muss eine ganze Zahl außer 0 sein (die ID einer Gruppe beginnt mit einem Minuszeichen). Der Einrichtungsassistent kann sie für Sie ermitteln.",
 
         // Fallback to English
         _ => en(key),
