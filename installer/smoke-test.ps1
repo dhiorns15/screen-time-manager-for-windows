@@ -1,12 +1,15 @@
 # Installs Screen Time Manager with the built setup and checks the install: the exe, the three
 # scheduled tasks (and that standard accounts may run the main and update tasks but not change
 # them), the shared config folder's permissions and the update marker. Then it reinstalls as SYSTEM
-# over a running copy (which must replace a 1.0.1-style descriptor on the main task), checks the
+# over a running copy (which must replace a 1.0.1-style descriptor on the main task), interrupts a
+# setup after it turned the tasks off and checks its recovery task turns them back on, checks the
 # update task can be started by an administrator, and the update and main tasks by a standard
-# account (which must not be able to disable or delete any task), updates through the app's own
+# account (which must not be able to disable or delete any task, or delete the shared config
+# folder, but must be able to create, change and delete files in it), updates through the app's own
 # updater from a fake release served on localhost, checks the installed watchdog brings the app
-# back after that update and after a kill (when the runner has a signed-in session for it to run
-# in), and uninstalls.
+# back - one copy - after that update and after a kill (when the runner has a signed-in session for
+# it to run in), uninstalls, and checks a junction in place of the shared config folder doesn't
+# redirect a new install.
 #
 #   installer\build.ps1 -Bin ..\target\debug
 #   installer\smoke-test.ps1 [-Bin ..\target\debug]
@@ -37,6 +40,7 @@ $uninstallKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{1D3C
 $mainTask = 'ScreenTimeManager'
 $watchdogTask = 'ScreenTimeManagerWatchdog'
 $updateTask = 'ScreenTimeManagerUpdate'
+$recoveryTask = 'ScreenTimeManagerSetupRecovery'
 $tasks = $mainTask, $watchdogTask, $updateTask
 $usersSid = 'S-1-5-32-545'
 $systemSid = 'S-1-5-18'
@@ -123,7 +127,49 @@ function CheckWatchdogRelaunch([int]$Session, [datetime]$Since, [string]$LogPatt
     if (!$lines.Count) { ShowFile "$userDataDir\watchdog.log" }
     Check ($lines.Count -gt 0) "$What`: watchdog.log has no line matching '$LogPattern' since $Since"
     "$What`: the watchdog relaunched the app (pid $($app.ProcessId), session $Session, parent $($parent.Name)); it logged: $($lines[-1])" | Out-Host
+    # Which request Task Scheduler accepted, and whether the watchdog ran non-elevated: only then
+    # does this show that a standard user's watchdog may make it (MS-TSCH refuses a non-admin caller
+    # a session-targeted run unless it is the user signed in there).
+    if ($lines[-1] -match 'as a non-elevated caller with RunEx\(AS_SELF\|USE_SESSION_ID') {
+        "$What`: a non-elevated watchdog started the task with RunEx(AS_SELF|USE_SESSION_ID) in its own session" | Out-Host
+    } elseif ($lines[-1] -match 'as (an elevated|a non-elevated) caller with \S+') {
+        "::warning::$What`: the watchdog started the task $($Matches[0]), so this runner did not exercise the request a non-elevated watchdog (a child's account, or an administrator with UAC on) makes: RunEx(AS_SELF|USE_SESSION_ID)" | Out-Host
+    }
+    # Exactly one copy: a second start (two watchdog runs, the logon trigger) must leave quietly, not
+    # stay up showing "already running".
+    Start-Sleep 5
+    $copies = @(AppInSession $Session)
+    if ($copies.Count -ne 1) { ShowFile "$userDataDir\watchdog.log" }
+    Check ($copies.Count -eq 1) "$What`: $($copies.Count) copies of the app run in session $Session ($(AppProcessSummary))"
     $true
+}
+
+# The shared config folder as setup leaves it: a real folder owned by Administrators, not
+# inheriting from ProgramData; standard accounts may create files in it and change and delete the
+# files, but not delete, rename or re-permission the folder or add subfolders.
+function CheckSharedFolder {
+    $item = Get-Item -LiteralPath $sharedDir -Force -ErrorAction SilentlyContinue
+    Check ($null -ne $item -and $item.PSIsContainer) "$sharedDir was not created"
+    Check (!($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) "$sharedDir is a link"
+    $acl = Get-Acl -LiteralPath $sharedDir
+    $owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    Check ($owner -eq 'S-1-5-32-544') "$sharedDir is owned by $owner, not Administrators: $($acl.Sddl)"
+    Check ($acl.AreAccessRulesProtected) "$sharedDir inherits from ProgramData: $($acl.Sddl)"
+    $standard = 'S-1-1-0', 'S-1-5-11', 'S-1-5-4', $usersSid, 'S-1-3-0', 'S-1-3-4'
+    $itself = 0
+    $files = 0
+    foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+        if ([string]$rule.AccessControlType -ne 'Allow' -or $standard -notcontains $rule.IdentityReference.Value) { continue }
+        $rights = [int]$rule.FileSystemRights
+        if (!([int]$rule.PropagationFlags -band 2)) { $itself = $itself -bor $rights }
+        if ([int]$rule.InheritanceFlags -band 2) { $files = $files -bor $rights }
+    }
+    # Add subfolder, delete child, delete, change permissions, take ownership, generic all/write.
+    $forbidden = 0x4 -bor 0x40 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
+    Check (($itself -band $forbidden) -eq 0) "Standard accounts may delete, rename or re-permission $sharedDir itself (0x$('{0:X}' -f $itself)): $($acl.Sddl)"
+    Check (($itself -band 0x2) -eq 0x2) "Standard accounts can't create files in $sharedDir`: $($acl.Sddl)"
+    $modify = [int][Security.AccessControl.FileSystemRights]::Modify
+    Check (($files -band $modify) -eq $modify) "Standard accounts can't change and delete the files in $sharedDir`: $($acl.Sddl)"
 }
 
 function ShowFile([string]$Path) {
@@ -146,6 +192,23 @@ function Install([string]$Setup) {
     $null = $p.Handle # keeps the exit code readable
     if (!$p.WaitForExit(300000)) { ShowFile $log; throw 'Setup was still running after 5 minutes' }
     if ($p.ExitCode) { ShowFile $log; throw "Setup exited with code $($p.ExitCode)" }
+}
+
+# Uninstalls silently and checks the app, its tasks and its install folder are gone.
+function Uninstall {
+    $uninstaller = (Get-ItemProperty $uninstallKey).UninstallString.Trim('"')
+    $log = NewLog
+    Start-Process $uninstaller -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=`"$log`"" -Wait
+    # The uninstaller reruns itself from a temp copy and may return early, so wait for it.
+    for ($i = 0; $i -lt 120 -and ((Test-Path $exe) -or (Test-Path $uninstallKey)); $i++) { Start-Sleep 1 }
+    Start-Sleep 2
+    if ((Test-Path $exe) -or (Test-Path $uninstallKey)) { ShowFile $log; throw 'Uninstall did not remove the app' }
+    foreach ($t in $tasks + $recoveryTask) {
+        Check ($null -eq (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue)) "Uninstall left task $t"
+    }
+    Check (!(Test-Path $marker)) 'Uninstall left updating.marker'
+    Check (!(Test-Path "$dir\updates")) 'Uninstall left the updates folder'
+    Check ((AppProcesses).Count -eq 0) 'Uninstall left the app running'
 }
 
 # Waits for a run of a task that started at or after $Since to finish, and returns its info.
@@ -248,7 +311,7 @@ function CheckInstall([string]$Version, [datetime]$Since) {
     Check (Test-Path $marker) 'updating.marker was not written'
     Check ((Get-Item $marker).LastWriteTime -ge $Since.AddSeconds(-2)) 'updating.marker was not rewritten'
 
-    $t = CheckTask $mainTask '' $usersSid 'Limited' 'Parallel' 'PT0S'
+    $t = CheckTask $mainTask '--quiet-if-running' $usersSid 'Limited' 'Parallel' 'PT0S'
     Check (@(TriggersOf $t).Count -eq 1) "Task $mainTask should only have a logon trigger"
     $logon = @(TriggersOf $t 'MSFT_TaskLogonTrigger')
     Check ($logon.Count -eq 1 -and !$logon[0].UserId) "Task $mainTask should start at the sign-in of any user"
@@ -267,14 +330,18 @@ function CheckInstall([string]$Version, [datetime]$Since) {
     Check (@(TriggersOf $t).Count -eq 0) "Task $updateTask should only run on demand"
     CheckStandardAccountsMayOnlyRun $updateTask
 
-    Check (Test-Path $sharedDir) "$sharedDir was not created"
-    $rules = (Get-Acl $sharedDir).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
-    $modify = [Security.AccessControl.FileSystemRights]::Modify
-    $users = @($rules | Where-Object {
-            $_.IdentityReference.Value -eq $usersSid -and [string]$_.AccessControlType -eq 'Allow' -and
-            ($_.FileSystemRights -band $modify) -eq $modify -and ([int]$_.InheritanceFlags -band 3) -eq 3
-        })
-    Check ($users.Count -gt 0) "Standard accounts can't modify everything in $sharedDir"
+    Check ($null -eq (Get-ScheduledTask -TaskName $recoveryTask -ErrorAction SilentlyContinue)) "Setup left task $recoveryTask behind"
+    CheckSharedFolder
+    # Inherited from Program Files, and no standard account may change it (the update task runs
+    # its exe as SYSTEM).
+    foreach ($path in $dir, $exe) {
+        $acl = Get-Acl -LiteralPath $path
+        foreach ($rule in $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+            $sid = $rule.IdentityReference.Value
+            if ([string]$rule.AccessControlType -ne 'Allow' -or $sid -in 'S-1-5-18', 'S-1-5-32-544', 'S-1-3-0' -or $sid -like 'S-1-5-80-*') { continue }
+            Check (([int]$rule.FileSystemRights -band (0x2 -bor 0x4 -bor 0x40 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000)) -eq 0) "$sid may change $path`: $($acl.Sddl)"
+        }
+    }
 }
 
 # Runs a script as a new standard account: it starts the update task and the main task, then tries
@@ -292,30 +359,52 @@ function StandardAccountProbe {
         icacls $probeDir /grant "${user}:(OI)(CI)M" | Out-Null
         $out = "$probeDir\result.json"
         Set-Content "$probeDir\probe.ps1" -Encoding ASCII -Value @'
-param([string]$Out)
+param([string]$Out, [string]$Shared)
 $r = [ordered]@{}
 $id = [Security.Principal.WindowsIdentity]::GetCurrent()
 $r.user = $id.Name
 $r.admin = ([Security.Principal.WindowsPrincipal]$id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+function HResult($e) { $e = $e.Exception; while ($e.InnerException) { $e = $e.InnerException }; '0x{0:X8}' -f $e.HResult }
 cmd /c "schtasks /Run /TN ScreenTimeManagerUpdate <nul >nul 2>&1"
 $r.run = $LASTEXITCODE
-# As the watchdog does when the app isn't running (1.0.1: "Access is denied.").
+# As the watchdog's last resort when the app isn't running (1.0.1: "Access is denied.").
 $r.runMainOutput = (cmd /c "schtasks /Run /TN ScreenTimeManager <nul 2>&1" | Out-String).Trim()
 $r.runMain = $LASTEXITCODE
 $service = New-Object -ComObject Schedule.Service
 $service.Connect()
 $folder = $service.GetFolder('\')
+# The watchdog's own requests (src/watchdog.rs, run_requests). This account isn't the one signed in
+# to this session (the runner's is), so MS-TSCH says both are refused with E_INVALIDARG - but only
+# after the access check, so they must not be refused with E_ACCESSDENIED.
+$session = (Get-Process -Id $PID).SessionId
+$main = $folder.GetTask('ScreenTimeManager')
+try { $null = $main.RunEx($null, 5, $session, $null); $r.runExSelfSession = 'accepted' } catch { $r.runExSelfSession = HResult $_ }
+try { $null = $main.RunEx($null, 12, $session, $id.User.Value); $r.runExSidSession = 'accepted' } catch { $r.runExSidSession = HResult $_ }
 foreach ($t in 'ScreenTimeManager', 'ScreenTimeManagerWatchdog', 'ScreenTimeManagerUpdate') {
     cmd /c "schtasks /Delete /TN $t /F <nul >nul 2>&1"
     $r["delete $t"] = $LASTEXITCODE
     try { $folder.GetTask($t).Enabled = $false; $r["disable $t"] = 'allowed' } catch { $r["disable $t"] = 'denied' }
+}
+# The shared config folder: files in it yes, the folder itself no.
+$file = Join-Path $Shared "probe-$PID.txt"
+try { Set-Content -LiteralPath $file 'one'; Add-Content -LiteralPath $file 'two'; $r.sharedWrite = 'allowed' } catch { $r.sharedWrite = "denied: $_" }
+try { Remove-Item -LiteralPath $file -ErrorAction Stop; $r.sharedDeleteFile = 'allowed' } catch { $r.sharedDeleteFile = "denied: $_" }
+try { New-Item -ItemType Directory (Join-Path $Shared "probe-$PID") -ErrorAction Stop | Out-Null; $r.sharedSubfolder = 'allowed' } catch { $r.sharedSubfolder = 'denied' }
+# Opening the folder itself for delete (= delete or rename it), change permissions, take ownership;
+# sharing everything, so only the permissions can refuse it.
+Add-Type -Namespace Probe -Name Native -MemberDefinition '[DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);'
+foreach ($right in @(@('sharedDelete', 0x10000), @('sharedAcl', 0x40000), @('sharedOwner', 0x80000))) {
+    # OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS (to open a folder) | FILE_FLAG_OPEN_REPARSE_POINT.
+    $h = [Probe.Native]::CreateFile($Shared, [uint32]$right[1], 7, [IntPtr]::Zero, 3, 0x02200000, [IntPtr]::Zero)
+    $r[$right[0]] = if ($h.IsInvalid) { 'denied' } else { 'allowed' }
+    $h.Dispose()
 }
 $r | ConvertTo-Json | Set-Content $Out
 '@
         $credential = New-Object Management.Automation.PSCredential ".\$user", (ConvertTo-SecureString $password -AsPlainText -Force)
         try {
             $p = Start-Process powershell.exe -Credential $credential -LoadUserProfile -WorkingDirectory $probeDir -PassThru `
-                -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$probeDir\probe.ps1`"", "`"$out`""
+                -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$probeDir\probe.ps1`"", "`"$out`"", "`"$sharedDir`""
         } catch {
             "::warning::Could not start a process as a standard account here ($($_.Exception.Message)); skipped checking what one can do with the tasks" | Out-Host
             return $null
@@ -325,6 +414,10 @@ $r | ConvertTo-Json | Set-Content $Out
         Check (Test-Path $out) "The standard account probe exited with $($p.ExitCode) and no result"
         Get-Content $out -Raw | ConvertFrom-Json
     } finally {
+        # Whatever Task Scheduler started for the probe account (it has no session of its own).
+        Get-CimInstance Win32_Process -Filter "Name = 'screen-time-manager.exe'" | Where-Object {
+            (Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction SilentlyContinue).User -eq $user
+        } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
         net user $user /delete | Out-Null
         Get-CimInstance Win32_UserProfile | Where-Object { $_.LocalPath -like "*\$user" } | Remove-CimInstance -ErrorAction SilentlyContinue
     }
@@ -371,6 +464,61 @@ try {
     "Reinstalled as SYSTEM over the running app, which setup closed" | Out-Host
     if ($upgradeChecked) { "Setup replaced $mainTask's 1.0.1-style descriptor: $((StandardAccountAccess $mainTask).Sddl)" | Out-Host }
 
+    # ---- Setup interrupted with the tasks turned off: the recovery task turns them back on ----
+    # 1.0.2 left them off for good after a power cut or a forced restart in that window. Setup is
+    # killed as soon as it has turned both off (it registers the recovery task first); the recovery
+    # task is then run on demand, standing in for the next boot.
+    if (!(AppProcesses)) {
+        Start-Process $exe | Out-Null
+        Start-Sleep 3
+    }
+    $folder = TaskFolder
+    $log = NewLog
+    $since = Get-Date
+    $p = Start-Process $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=`"$log`"" -PassThru
+    $null = $p.Handle # keeps the exit code readable
+    $caught = $false
+    while (!$p.HasExited -and ((Get-Date) - $since).TotalSeconds -lt 300) {
+        $off = $false
+        try { $off = !$folder.GetTask($watchdogTask).Enabled -and !$folder.GetTask($mainTask).Enabled -and $folder.GetTask($recoveryTask) } catch {}
+        if ($off) {
+            # setup.exe runs the wizard as a child (is-*.tmp\setup.tmp): end both, as a power cut would.
+            Get-CimInstance Win32_Process -Filter "ParentProcessId = $($p.Id)" | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            $caught = $true
+            break
+        }
+        Start-Sleep -Milliseconds 20
+    }
+    if ($caught) {
+        Start-Sleep 2
+        Check (!$folder.GetTask($watchdogTask).Enabled) "Task $watchdogTask was enabled again although setup was killed"
+        $recovery = Get-ScheduledTask -TaskName $recoveryTask -ErrorAction SilentlyContinue
+        Check ($null -ne $recovery) "Setup was killed with the tasks turned off and no $recoveryTask task to turn them back on"
+        Check ((Sid $recovery.Principal.UserId) -eq $systemSid) "Task $recoveryTask runs as $($recovery.Principal.UserId), not SYSTEM"
+        Check (@(TriggersOf $recovery 'MSFT_TaskBootTrigger').Count -eq 1) "Task $recoveryTask doesn't run at boot"
+        Check (@(TriggersOf $recovery 'MSFT_TaskRegistrationTrigger' | Where-Object { $_.Delay -eq 'PT15M' }).Count -eq 1) "Task $recoveryTask doesn't run 15 minutes after setup registered it"
+        $access = StandardAccountAccess $recoveryTask
+        Check (($access.Granted -band ($taskWrites -bor 0x20)) -eq 0) "Standard accounts may run, change or delete $recoveryTask`: $($access.Sddl)"
+        $since = Get-Date
+        Start-ScheduledTask -TaskName $recoveryTask
+        for ($i = 0; $i -lt 120 -and (Get-ScheduledTask -TaskName $recoveryTask -ErrorAction SilentlyContinue); $i++) { Start-Sleep 1 }
+        Check ($null -eq (Get-ScheduledTask -TaskName $recoveryTask -ErrorAction SilentlyContinue)) "Task $recoveryTask did not remove itself"
+        Check ($folder.GetTask($mainTask).Enabled -and $folder.GetTask($watchdogTask).Enabled) "Task $recoveryTask did not turn $mainTask and $watchdogTask back on"
+        Check ((Get-Item $marker).LastWriteTime -ge $since.AddSeconds(-2)) "Task $recoveryTask did not touch updating.marker"
+        "Setup killed with the tasks off; its recovery task turned them back on and removed itself" | Out-Host
+        # Back to a complete install for what follows.
+        $since = Get-Date
+        Install $setup
+        CheckInstall $version $since
+    } else {
+        $p.WaitForExit()
+        "::warning::Setup finished before it could be killed with the tasks off (exit $($p.ExitCode)); the recovery task's run wasn't checked" | Out-Host
+        if ($p.ExitCode) { ShowFile $log }
+        Check ($p.ExitCode -eq 0) "Setup exited with $($p.ExitCode)"
+        CheckInstall $version $since
+    }
+
     # ---- The update task, started by an administrator ----
     # It checks the real latest release, which is expected to be no newer than this build.
     $since = Get-Date
@@ -392,6 +540,15 @@ try {
             Check ($probe."delete $t" -ne 0) "A standard account deleted task $t"
             Check ($probe."disable $t" -eq 'denied') "A standard account disabled task $t"
         }
+        foreach ($request in 'runExSelfSession', 'runExSidSession') {
+            Check ($probe.$request -ne '0x80070005') "A standard account was denied access to $mainTask for the watchdog's $request request"
+        }
+        Check ($probe.sharedWrite -eq 'allowed') "A standard account could not create and change a file in $sharedDir ($($probe.sharedWrite))"
+        Check ($probe.sharedDeleteFile -eq 'allowed') "A standard account could not delete its file in $sharedDir ($($probe.sharedDeleteFile))"
+        foreach ($what in 'sharedSubfolder', 'sharedDelete', 'sharedAcl', 'sharedOwner') {
+            Check ($probe.$what -eq 'denied') "A standard account could do $what on $sharedDir"
+        }
+        CheckSharedFolder
         # Where Task Scheduler started the main task for an account that has no session of its own
         # (the probe runs in this runner's session) isn't asserted: it's not a case the app meets.
         "After the probe started ${mainTask}: $(AppProcessSummary)" | Out-Host
@@ -528,23 +685,35 @@ try {
     New-Item -ItemType Directory -Force $userDataDir | Out-Null
     Set-Content "$sharedDir\smoke-test.txt" 'kept by uninstall'
     Set-Content "$userDataDir\smoke-test.txt" 'kept by uninstall'
-    $uninstaller = (Get-ItemProperty $uninstallKey).UninstallString.Trim('"')
-    $log = NewLog
-    Start-Process $uninstaller -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/LOG=`"$log`"" -Wait
-    # The uninstaller reruns itself from a temp copy and may return early, so wait for it.
-    for ($i = 0; $i -lt 120 -and ((Test-Path $exe) -or (Test-Path $uninstallKey)); $i++) { Start-Sleep 1 }
-    Start-Sleep 2
-    if ((Test-Path $exe) -or (Test-Path $uninstallKey)) { ShowFile $log; throw 'Uninstall did not remove the app' }
-    foreach ($t in $tasks) {
-        Check ($null -eq (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue)) "Uninstall left task $t"
-    }
-    Check (!(Test-Path $marker)) 'Uninstall left updating.marker'
-    Check (!(Test-Path "$dir\updates")) 'Uninstall left the updates folder'
-    Check ((AppProcesses).Count -eq 0) 'Uninstall left the app running'
+    Uninstall
     Check (Test-Path "$sharedDir\smoke-test.txt") "Uninstall removed $sharedDir"
     Check (Test-Path "$userDataDir\smoke-test.txt") "Uninstall removed $userDataDir"
     Remove-Item "$sharedDir\smoke-test.txt", "$userDataDir\smoke-test.txt"
-    'Install, reinstall as SYSTEM, task permissions, update, watchdog relaunch and uninstall OK'
+
+    # ---- A junction in place of the shared config folder doesn't redirect setup ----
+    # Up to 1.0.2 a standard account could delete the folder (Users had Modify on the folder
+    # itself), put a junction to the install folder in its place (ProgramData lets Users create
+    # folders), and the next setup - which updates run as SYSTEM - gave Users Modify on the
+    # junction's target. Here the target is a decoy: setup must remove the junction without
+    # following it, leave the decoy as it was, and make a real folder.
+    $decoy = "$tmp\decoy"
+    New-Item -ItemType Directory $decoy | Out-Null
+    Set-Content "$decoy\keep.txt" 'decoy'
+    $decoyAcl = (Get-Acl -LiteralPath $decoy).Sddl
+    $keepAcl = (Get-Acl -LiteralPath "$decoy\keep.txt").Sddl
+    Remove-Item -LiteralPath $sharedDir -Recurse -Force
+    cmd /c mklink /J "$sharedDir" "$decoy" | Out-Host
+    Check ([bool]((Get-Item -LiteralPath $sharedDir -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) "Could not put a junction in place of $sharedDir"
+    $since = Get-Date
+    Install $setup
+    CheckInstall $version $since
+    Check ((Get-Acl -LiteralPath $decoy).Sddl -eq $decoyAcl) "Setup changed the permissions of the junction's target $decoy`: $((Get-Acl -LiteralPath $decoy).Sddl)"
+    Check ((Get-Acl -LiteralPath "$decoy\keep.txt").Sddl -eq $keepAcl) "Setup changed the permissions of a file in the junction's target"
+    Check ((Get-Content "$decoy\keep.txt") -eq 'decoy') "Setup changed a file in the junction's target"
+    Check (!(Test-Path "$sharedDir\keep.txt")) "$sharedDir still leads to the junction's target"
+    "Setup replaced a junction in place of $sharedDir with a real folder and left its target alone" | Out-Host
+    Uninstall
+    'Install, reinstall as SYSTEM, interrupted setup, task and folder permissions, update, watchdog relaunch, uninstall and the shared folder junction OK'
 } finally {
     if ($server) { Stop-Job $server; Remove-Job $server -Force }
 }

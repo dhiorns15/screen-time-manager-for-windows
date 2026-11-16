@@ -75,6 +75,14 @@ fn main() {
     if std::env::args().any(|a| a == update::UPDATE_ARG) {
         std::process::exit(update::run_update_mode());
     }
+    // Run by setup, elevated (as SYSTEM for unattended updates), to set the
+    // shared config folder's and the install folder's permissions - before
+    // the panic hook for the same reason as --update. Writes nothing but its
+    // report on stdout.
+    if std::env::args().any(|a| a == update::folders::ARG) {
+        let args: Vec<String> = std::env::args().collect();
+        std::process::exit(update::folders::run(&args));
+    }
 
     install_panic_hook();
 

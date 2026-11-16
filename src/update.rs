@@ -21,6 +21,11 @@
 //! user profiles are writable by standard users, so writing there as SYSTEM
 //! would be a link-following privilege-escalation risk. That includes the
 //! shared SQLite database - `--update` never opens it.
+//!
+//! A third: `--secure-folders` (`folders` below), which setup runs elevated
+//! to set up the shared config folder and check the install folder - the
+//! only elevated code that touches `%ProgramData%\ScreenTimeManager`, and it
+//! never follows a link there.
 
 use std::fmt;
 use std::io::Read;
@@ -815,6 +820,792 @@ pub fn installing_text(target: Version) -> String {
         Version::current(),
         i18n::t("update.cmd.restart_note"),
     )
+}
+
+// ============================================================================
+// `--secure-folders` (run elevated by setup, as an administrator or SYSTEM)
+// ============================================================================
+
+/// The permissions of the folders setup creates or relies on, applied by
+/// setup through `screen-time-manager.exe --secure-folders --shared <dir>
+/// --install <dir>` (run from setup's own temporary folder, not from the
+/// install folder it checks).
+///
+/// The rule throughout: an elevated process acts only on an object it opened
+/// itself *without following links* and checked is what it expected - never
+/// on a path that a standard account could have pointed somewhere else. In
+/// 1.0.2 setup ran `icacls <ProgramData>\ScreenTimeManager /grant Users:M`:
+/// a standard account could delete that folder (Users had Modify on the
+/// folder itself), put a junction of the same name to the install folder in
+/// its place (ProgramData lets Users create folders), and the next setup -
+/// which also runs as SYSTEM for updates - followed it and gave Users Modify
+/// on the install folder, whose exe the SYSTEM update task runs.
+pub mod folders {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
+
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, BOOL, BOOLEAN, ERROR_NOT_ALL_ASSIGNED, HANDLE, LUID};
+    use windows::Win32::Security::{
+        AdjustTokenPrivileges, GetAce, GetAclInformation, GetKernelObjectSecurity, GetSecurityDescriptorDacl,
+        GetSecurityDescriptorOwner, InitializeAcl, LookupPrivilegeValueW, SetKernelObjectSecurity,
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AclSizeInformation,
+        DACL_SECURITY_INFORMATION, LUID_AND_ATTRIBUTES, OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES,
+        TOKEN_PRIVILEGES, TOKEN_QUERY,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        CreateDirectoryW, CreateFileW, FileAttributeTagInfo, FileDispositionInfo, GetFileInformationByHandleEx,
+        SetFileInformationByHandle, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_ATTRIBUTE_TAG_INFO, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, READ_CONTROL,
+        WRITE_DAC, WRITE_OWNER,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    pub const ARG: &str = "--secure-folders";
+
+    /// The shared config folder (`%ProgramData%\ScreenTimeManager`), owned by
+    /// Administrators, not inheriting from ProgramData (which lets Users
+    /// create folders and gives creators full control):
+    /// - SYSTEM and Administrators: full control, inherited by everything in it;
+    /// - Users, on the folder itself: list, traverse, read its attributes and
+    ///   permissions, and create files (0x1200AB) - not delete, rename or
+    ///   re-permission it, and not create subfolders (nothing in it needs one);
+    /// - Users, on the files in it (inherit only): Modify (0x1301BF), so the
+    ///   app in every account can create, write and delete `bot_config.db`
+    ///   and SQLite's journal files, whoever created them.
+    pub const SHARED_DIR_SDDL: &str =
+        "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x1200ab;;;BU)(A;OIIO;0x1301bf;;;BU)";
+
+    const SE_FILE_OBJECT: i32 = 1;
+    const SDDL_REVISION_1: u32 = 1;
+    const UNPROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x2000_0000;
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const INHERIT_ONLY_ACE: u8 = 0x08;
+    const INHERITED_ACE: u8 = 0x10;
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+    const ERROR_PATH_NOT_FOUND: u32 = 3;
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+
+    /// Rights that let whoever has them change an object, its contents or
+    /// its permissions: write/append data (= add file/subfolder on a
+    /// folder), write extended attributes and attributes, delete child,
+    /// delete, change permissions, take ownership, generic all/write.
+    const WRITE_RIGHTS: u32 = 0x2 | 0x4 | 0x10 | 0x40 | 0x100 | 0x1_0000 | 0x4_0000 | 0x8_0000 | 0x1000_0000 | 0x4000_0000;
+
+    const SYSTEM_SID: &str = "S-1-5-18";
+    const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
+    const TRUSTED_INSTALLER_SID: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+    const CREATOR_OWNER_SID: &str = "S-1-3-0";
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl: PCWSTR,
+            revision: u32,
+            sd: *mut *mut c_void,
+            size: *mut u32,
+        ) -> BOOL;
+        fn ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            sd: *const c_void,
+            revision: u32,
+            information: u32,
+            sddl: *mut *mut u16,
+            len: *mut u32,
+        ) -> BOOL;
+        fn ConvertSidToStringSidW(sid: *const c_void, string_sid: *mut *mut u16) -> BOOL;
+        fn SetNamedSecurityInfoW(
+            name: PCWSTR,
+            object_type: i32,
+            information: u32,
+            owner: *const c_void,
+            group: *const c_void,
+            dacl: *const c_void,
+            sacl: *const c_void,
+        ) -> u32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LocalFree(mem: *mut c_void) -> *mut c_void;
+    }
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    /// The Win32 error code inside a `windows` error (they are HRESULTs).
+    fn win32_code(e: &windows::core::Error) -> u32 {
+        let hr = e.code().0 as u32;
+        if hr & 0xFFFF_0000 == 0x8007_0000 { hr & 0xFFFF } else { hr }
+    }
+
+    /// Memory the security functions allocate with LocalAlloc.
+    struct LocalMem(*mut c_void);
+
+    impl Drop for LocalMem {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { LocalFree(self.0) };
+            }
+        }
+    }
+
+    fn sd_from_sddl(sddl: &str) -> Result<LocalMem, String> {
+        let text: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut sd = std::ptr::null_mut();
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(text.as_ptr()), SDDL_REVISION_1, &mut sd, std::ptr::null_mut())
+        };
+        if ok.as_bool() {
+            Ok(LocalMem(sd))
+        } else {
+            Err(format!("bad security descriptor {sddl}: {}", std::io::Error::last_os_error()))
+        }
+    }
+
+    /// The owner and DACL of a security descriptor, as SDDL.
+    fn sddl_of(sd: *const c_void) -> Option<String> {
+        let mut text = std::ptr::null_mut();
+        let mut len = 0u32;
+        let info = OWNER_SECURITY_INFORMATION.0 | DACL_SECURITY_INFORMATION.0;
+        let ok = unsafe { ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1, info, &mut text, &mut len) };
+        if !ok.as_bool() || text.is_null() {
+            return None;
+        }
+        let _free = LocalMem(text as *mut c_void);
+        let chars = unsafe { std::slice::from_raw_parts(text, len as usize) };
+        Some(String::from_utf16_lossy(chars).trim_end_matches('\0').to_string())
+    }
+
+    fn sid_to_string(sid: *const c_void) -> Option<String> {
+        if sid.is_null() {
+            return None;
+        }
+        let mut text = std::ptr::null_mut();
+        if !unsafe { ConvertSidToStringSidW(sid, &mut text) }.as_bool() || text.is_null() {
+            return None;
+        }
+        let _free = LocalMem(text as *mut c_void);
+        let len = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
+        Some(String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) }))
+    }
+
+    /// This process's user, as a SID string (S-1-5-21-...): the tests'
+    /// stand-in for the administrators.
+    #[cfg(test)]
+    fn own_user_sid() -> Option<String> {
+        use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_USER};
+        let mut token = HANDLE::default();
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.ok()?;
+        let token = Handle(token);
+        let mut len = 0u32;
+        let _ = unsafe { GetTokenInformation(token.0, TokenUser, None, 0, &mut len) };
+        // u64s, so the buffer is aligned for TOKEN_USER.
+        let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+        unsafe { GetTokenInformation(token.0, TokenUser, Some(buf.as_mut_ptr().cast()), len, &mut len) }.ok()?;
+        let user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
+        sid_to_string(user.User.Sid.0)
+    }
+
+    struct Handle(HANDLE);
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    /// Opens `path` itself - a link is opened as the link, never followed.
+    /// Every share mode is allowed, so the app's own open files don't get in
+    /// the way. With the backup and restore privileges enabled (see
+    /// `enable_privileges`), access is granted whatever the object's DACL says.
+    fn open_no_follow(path: &Path, access: u32) -> Result<Handle, windows::core::Error> {
+        let name = wide(path);
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(name.as_ptr()),
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                HANDLE::default(),
+            )
+        }?;
+        Ok(Handle(handle))
+    }
+
+    fn attributes(handle: &Handle) -> Result<FILE_ATTRIBUTE_TAG_INFO, String> {
+        let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+        unsafe {
+            GetFileInformationByHandleEx(
+                handle.0,
+                FileAttributeTagInfo,
+                &mut info as *mut _ as *mut c_void,
+                std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+            )
+        }
+        .map_err(|e| format!("could not read its attributes: {e}"))?;
+        Ok(info)
+    }
+
+    fn is_link(info: &FILE_ATTRIBUTE_TAG_INFO) -> bool {
+        info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+    }
+
+    fn is_dir(info: &FILE_ATTRIBUTE_TAG_INFO) -> bool {
+        info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0
+    }
+
+    /// Deletes the object `handle` was opened on (a link itself, not its
+    /// target) once the handle is closed.
+    fn delete_on_close(handle: &Handle) -> Result<(), String> {
+        let info = FILE_DISPOSITION_INFO { DeleteFile: BOOLEAN(1) };
+        unsafe {
+            SetFileInformationByHandle(
+                handle.0,
+                FileDispositionInfo,
+                &info as *const _ as *const c_void,
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        }
+        .map_err(|e| format!("could not delete it: {e}"))
+    }
+
+    /// Owner and DACL of the object `handle` was opened on (READ_CONTROL).
+    fn read_security(handle: &Handle) -> Result<Vec<u64>, String> {
+        let info = OWNER_SECURITY_INFORMATION.0 | DACL_SECURITY_INFORMATION.0;
+        let mut needed = 0u32;
+        let _ = unsafe { GetKernelObjectSecurity(handle.0, info, PSECURITY_DESCRIPTOR::default(), 0, &mut needed) };
+        if needed == 0 {
+            return Err(format!("could not read its permissions: {}", std::io::Error::last_os_error()));
+        }
+        let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
+        unsafe { GetKernelObjectSecurity(handle.0, info, PSECURITY_DESCRIPTOR(buf.as_mut_ptr().cast()), needed, &mut needed) }
+            .map_err(|e| format!("could not read its permissions: {e}"))?;
+        Ok(buf)
+    }
+
+    /// Enables backup, restore and take-ownership for this process, so an
+    /// object a standard account made (and may have locked administrators
+    /// out of) can still be opened and re-permissioned. Names the ones that
+    /// couldn't be enabled; elevated administrators and SYSTEM have them all.
+    fn enable_privileges() -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        let mut token = HANDLE::default();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token) }.is_err() {
+            return vec!["(token not adjustable)"];
+        }
+        let token = Handle(token);
+        for name in ["SeBackupPrivilege", "SeRestorePrivilege", "SeTakeOwnershipPrivilege"] {
+            let text: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut luid = LUID::default();
+            let enabled = unsafe { LookupPrivilegeValueW(PCWSTR::null(), PCWSTR(text.as_ptr()), &mut luid) }.is_ok() && {
+                let privileges = TOKEN_PRIVILEGES {
+                    PrivilegeCount: 1,
+                    Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
+                };
+                unsafe { AdjustTokenPrivileges(token.0, false, Some(&privileges), 0, None, None) }.is_ok()
+                    && unsafe { GetLastError() } != ERROR_NOT_ALL_ASSIGNED
+            };
+            if !enabled {
+                missing.push(name);
+            }
+        }
+        missing
+    }
+
+    /// Makes `path` a real folder with exactly the security in `sddl` (owner
+    /// too, if it has an `O:` part), whatever was there before:
+    /// - nothing: created, with that security from the start;
+    /// - a link (junction, symbolic link, any reparse point): the link itself
+    ///   is deleted - never followed - and a folder created in its place;
+    /// - a file: deleted, and a folder created;
+    /// - a folder: its owner and DACL are replaced through the handle it was
+    ///   checked on, without being passed on to what is inside (nothing in it
+    ///   is touched, so nothing in it can redirect this either).
+    ///
+    /// Returns what it did.
+    pub fn secure_dir(path: &Path, sddl: &str) -> Result<String, String> {
+        let sd = sd_from_sddl(sddl)?;
+        let with_owner = sddl.starts_with("O:");
+        let mut info = DACL_SECURITY_INFORMATION.0;
+        let mut access = READ_CONTROL.0 | WRITE_DAC.0 | FILE_READ_ATTRIBUTES.0;
+        if with_owner {
+            info |= OWNER_SECURITY_INFORMATION.0;
+            access |= WRITE_OWNER.0;
+        }
+        let mut done = Vec::new();
+        // A standard account may keep putting things back in the way; a few
+        // rounds are plenty for anything but that, which then fails safely.
+        for _ in 0..5 {
+            let handle = match open_no_follow(path, access) {
+                Ok(h) => h,
+                Err(e) if matches!(win32_code(&e), ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => {
+                    let attributes = SECURITY_ATTRIBUTES {
+                        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                        lpSecurityDescriptor: sd.0,
+                        bInheritHandle: BOOL(0),
+                    };
+                    let name = wide(path);
+                    match unsafe { CreateDirectoryW(PCWSTR(name.as_ptr()), Some(&attributes)) } {
+                        Ok(()) => done.push("created it".to_string()),
+                        Err(e) if win32_code(&e) == ERROR_ALREADY_EXISTS => {}
+                        Err(e) => return Err(format!("could not create {}: {e}", path.display())),
+                    }
+                    continue;
+                }
+                Err(e) => return Err(format!("could not open {}: {e}", path.display())),
+            };
+            let found = attributes(&handle)?;
+            if is_link(&found) || !is_dir(&found) {
+                drop(handle);
+                // Opened again for deleting, and checked again: it may have
+                // changed in between.
+                let doomed = open_no_follow(path, DELETE.0 | FILE_READ_ATTRIBUTES.0)
+                    .map_err(|e| format!("could not open {} to remove it: {e}", path.display()))?;
+                let again = attributes(&doomed)?;
+                if is_link(&again) || !is_dir(&again) {
+                    delete_on_close(&doomed).map_err(|e| format!("{}: {e}", path.display()))?;
+                    done.push(if is_link(&again) {
+                        format!("removed a link (reparse tag 0x{:08X}) that was in its place, without following it", again.ReparseTag)
+                    } else {
+                        "removed a file that was in its place".to_string()
+                    });
+                }
+                continue;
+            }
+            unsafe { SetKernelObjectSecurity(handle.0, OBJECT_SECURITY_INFORMATION(info), PSECURITY_DESCRIPTOR(sd.0)) }
+                .map_err(|e| format!("could not set the permissions of {}: {e}", path.display()))?;
+            done.push("set its owner and permissions".to_string());
+            return Ok(done.join(", "));
+        }
+        Err(format!("{} kept being replaced while it was being set up; nothing in its place was followed", path.display()))
+    }
+
+    /// Something in the install folder a standard account could use.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Problem {
+        /// A link; nothing in the install folder is supposed to be one.
+        Link,
+        /// Owned by someone other than SYSTEM, Administrators or
+        /// TrustedInstaller: created by a standard account.
+        ForeignOwner(String),
+        /// An allow entry giving `sid` rights to change it (`mask`).
+        ForeignWrite { sid: String, mask: u32 },
+        /// No DACL at all: everyone has full access.
+        NoDacl,
+        Unreadable(String),
+    }
+
+    /// The SIDs the install folder may belong to or grant write access to.
+    fn admin_sid(sid: &str) -> bool {
+        [SYSTEM_SID, ADMINISTRATORS_SID, TRUSTED_INSTALLER_SID].contains(&sid)
+    }
+
+    /// What's wrong with one object's owner and DACL (`sd`), given who may
+    /// own or change it.
+    fn problems_in(sd: &[u64], trusted: &dyn Fn(&str) -> bool) -> Vec<Problem> {
+        let sd = PSECURITY_DESCRIPTOR(sd.as_ptr() as *mut c_void);
+        let mut problems = Vec::new();
+        let mut owner = PSID::default();
+        let mut defaulted = BOOL(0);
+        if unsafe { GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted) }.is_ok() {
+            match sid_to_string(owner.0) {
+                Some(sid) if trusted(&sid) => {}
+                Some(sid) => problems.push(Problem::ForeignOwner(sid)),
+                None => problems.push(Problem::Unreadable("owner".into())),
+            }
+        }
+        let mut present = BOOL(0);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        if unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) }.is_err() {
+            problems.push(Problem::Unreadable("DACL".into()));
+            return problems;
+        }
+        if !present.as_bool() || dacl.is_null() {
+            problems.push(Problem::NoDacl);
+            return problems;
+        }
+        let mut size = ACL_SIZE_INFORMATION::default();
+        if unsafe {
+            GetAclInformation(dacl, &mut size as *mut _ as *mut c_void, std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32, AclSizeInformation)
+        }
+        .is_err()
+        {
+            problems.push(Problem::Unreadable("DACL size".into()));
+            return problems;
+        }
+        for index in 0..size.AceCount {
+            let mut ace: *mut c_void = std::ptr::null_mut();
+            if unsafe { GetAce(dacl, index, &mut ace) }.is_err() || ace.is_null() {
+                continue;
+            }
+            let header = unsafe { &*(ace as *const ACE_HEADER) };
+            if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+                continue;
+            }
+            let allowed = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
+            if allowed.Mask & WRITE_RIGHTS == 0 {
+                continue;
+            }
+            // Inherited entries come from a parent: inside the tree that
+            // parent is checked itself (and resetting it passes the result
+            // down); above it is Program Files, which isn't ours to judge.
+            if header.AceFlags & INHERITED_ACE != 0 {
+                continue;
+            }
+            let Some(sid) = sid_to_string(&allowed.SidStart as *const u32 as *const c_void) else { continue };
+            // An explicit "CREATOR OWNER: full control" for whatever an
+            // administrator creates inside, as Program Files has.
+            let creator_template = sid == CREATOR_OWNER_SID && header.AceFlags & INHERIT_ONLY_ACE != 0;
+            if !trusted(&sid) && !creator_template {
+                problems.push(Problem::ForeignWrite { sid, mask: allowed.Mask });
+            }
+        }
+        problems
+    }
+
+    /// Every problem in the folder `root` and everything below it, without
+    /// following links (a link is reported, not entered).
+    fn audit(root: &Path, trusted: &dyn Fn(&str) -> bool) -> Vec<(PathBuf, Problem)> {
+        let mut found = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(path) = pending.pop() {
+            let handle = match open_no_follow(&path, READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0) {
+                Ok(h) => h,
+                Err(e) => {
+                    found.push((path, Problem::Unreadable(e.to_string())));
+                    continue;
+                }
+            };
+            let info = match attributes(&handle) {
+                Ok(i) => i,
+                Err(e) => {
+                    found.push((path, Problem::Unreadable(e)));
+                    continue;
+                }
+            };
+            if is_link(&info) {
+                found.push((path, Problem::Link));
+                continue;
+            }
+            match read_security(&handle) {
+                Ok(sd) => found.extend(problems_in(&sd, trusted).into_iter().map(|p| (path.clone(), p))),
+                Err(e) => found.push((path.clone(), Problem::Unreadable(e))),
+            }
+            if is_dir(&info) {
+                match std::fs::read_dir(&path) {
+                    Ok(entries) => pending.extend(entries.flatten().map(|e| e.path())),
+                    Err(e) => found.push((path, Problem::Unreadable(e.to_string()))),
+                }
+            }
+        }
+        found
+    }
+
+    /// Deletes `path` itself: a link without following it, a folder with
+    /// everything in it (std's remove_dir_all doesn't follow links either).
+    fn remove_no_follow(path: &Path) -> Result<(), String> {
+        let meta = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            let handle = open_no_follow(path, DELETE.0 | FILE_READ_ATTRIBUTES.0).map_err(|e| e.to_string())?;
+            return delete_on_close(&handle);
+        }
+        if meta.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) }.map_err(|e| e.to_string())
+    }
+
+    /// Drops every entry of `path`'s DACL that isn't inherited, so it has
+    /// only what its parent passes on, and passes that on to everything
+    /// inside it (which `audit` has checked has no links left).
+    fn reset_to_inherited(path: &Path) -> Result<(), String> {
+        let mut empty = [0u32; 4];
+        unsafe { InitializeAcl(empty.as_mut_ptr().cast(), std::mem::size_of::<ACL>() as u32, ACL_REVISION) }
+            .map_err(|e| e.to_string())?;
+        let name = wide(path);
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                PCWSTR(name.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION.0 | UNPROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null(),
+                std::ptr::null(),
+                empty.as_ptr().cast(),
+                std::ptr::null(),
+            )
+        };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::from_raw_os_error(status as i32).to_string())
+        }
+    }
+
+    fn describe(problems: &[(PathBuf, Problem)]) -> String {
+        problems.iter().map(|(p, what)| format!("{}: {what:?}", p.display())).collect::<Vec<_>>().join("; ")
+    }
+
+    /// Checks that standard accounts can't change anything in the install
+    /// folder `root` - setup's install folder, whose exe the SYSTEM update
+    /// task runs - and puts it right if they can. Normally there is nothing
+    /// to do: setup creates it under Program Files and it inherits that
+    /// folder's permissions. A 1.0.x install whose shared config folder was
+    /// replaced by a link to it (see the module docs) has an entry giving
+    /// Users Modify, and maybe files and links a standard account put there.
+    /// Those are removed (anything inside owned by someone other than
+    /// SYSTEM, Administrators or TrustedInstaller was created by a standard
+    /// account, so it's deleted), then the folder is set to inherit only from
+    /// its parent, then each object that still has an entry of its own.
+    pub fn check_install_dir(root: &Path, trusted: &dyn Fn(&str) -> bool) -> Result<String, String> {
+        let found = audit(root, trusted);
+        if found.is_empty() {
+            return Ok("standard accounts can't change anything in it; nothing to do".into());
+        }
+        let first = describe(&found);
+        if found.iter().any(|(p, problem)| p == root && *problem == Problem::Link) {
+            return Err(format!("it is a link: {first}"));
+        }
+        for (path, problem) in &found {
+            let planted = matches!(problem, Problem::Link | Problem::ForeignOwner(_));
+            if path != root && planted && std::fs::symlink_metadata(path).is_ok() {
+                remove_no_follow(path).map_err(|e| format!("could not remove {}: {e}", path.display()))?;
+            }
+        }
+        if found.iter().any(|(p, problem)| p == root && matches!(problem, Problem::ForeignOwner(_))) {
+            secure_owner(root)?;
+        }
+        reset_to_inherited(root).map_err(|e| format!("could not reset the permissions of {}: {e}", root.display()))?;
+        for (path, _) in audit(root, trusted) {
+            if path != *root {
+                reset_to_inherited(&path).map_err(|e| format!("could not reset the permissions of {}: {e}", path.display()))?;
+            }
+        }
+        let left = audit(root, trusted);
+        if left.is_empty() {
+            Ok(format!("repaired - it had: {first}"))
+        } else {
+            Err(format!("still not safe after repairing ({first}): {}", describe(&left)))
+        }
+    }
+
+    /// Gives `path` (not a link - checked by the caller's audit) to Administrators.
+    fn secure_owner(path: &Path) -> Result<(), String> {
+        let handle = open_no_follow(path, WRITE_OWNER.0 | FILE_READ_ATTRIBUTES.0).map_err(|e| e.to_string())?;
+        if is_link(&attributes(&handle)?) {
+            return Err(format!("{} is a link", path.display()));
+        }
+        let sd = sd_from_sddl("O:BA")?;
+        unsafe { SetKernelObjectSecurity(handle.0, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR(sd.0)) }
+            .map_err(|e| format!("could not take ownership of {}: {e}", path.display()))
+    }
+
+    /// The owner and DACL of `path` (not following a link), as SDDL.
+    pub fn sddl_of_path(path: &Path) -> Result<String, String> {
+        let handle = open_no_follow(path, READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0).map_err(|e| e.to_string())?;
+        let sd = read_security(&handle)?;
+        sddl_of(sd.as_ptr().cast()).ok_or_else(|| "could not convert its permissions".into())
+    }
+
+    /// `--secure-folders --shared <dir> [--install <dir>]`. Prints what it
+    /// did, one line each, for setup's log. Exit code: 0 done; bit 1 set if
+    /// the shared folder couldn't be set up, bit 2 if the install folder
+    /// isn't safe (setup then doesn't register the SYSTEM update task); 64
+    /// for bad arguments.
+    pub fn run(args: &[String]) -> i32 {
+        // Not println!, which panics (= aborts, in release) if stdout is gone.
+        let say = |line: String| {
+            use std::io::Write;
+            let _ = writeln!(std::io::stdout(), "{line}");
+        };
+        let value = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).map(PathBuf::from);
+        let (Some(shared), install) = (value("--shared"), value("--install")) else {
+            say(format!("usage: {ARG} --shared <dir> [--install <dir>]"));
+            return 64;
+        };
+        let missing = enable_privileges();
+        if !missing.is_empty() {
+            say(format!("could not enable {} (not elevated?)", missing.join(", ")));
+        }
+        let now = |path: &Path| sddl_of_path(path).unwrap_or_else(|e| format!("unreadable: {e}"));
+        let mut code = 0;
+        match secure_dir(&shared, SHARED_DIR_SDDL) {
+            Ok(done) => say(format!("shared config folder {}: {done}; now {}", shared.display(), now(&shared))),
+            Err(e) => {
+                say(format!("ERROR: shared config folder {}: {e}", shared.display()));
+                code |= 1;
+            }
+        }
+        if let Some(install) = install {
+            match check_install_dir(&install, &admin_sid) {
+                Ok(done) => say(format!("install folder {}: {done}; now {}", install.display(), now(&install))),
+                Err(e) => {
+                    say(format!("ERROR: install folder {}: {e}", install.display()));
+                    code |= 2;
+                }
+            }
+        }
+        code
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn scratch(name: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!("stm-folders-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        fn junction(link: &Path, target: &Path) {
+            // Needs no privilege, unlike a symbolic link: what a standard account would use.
+            let out = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "mklink /J: {}", String::from_utf8_lossy(&out.stderr));
+        }
+
+        /// The shared folder's security without the owner, which only an
+        /// elevated process may set to Administrators.
+        fn test_sddl() -> String {
+            SHARED_DIR_SDDL.replacen("O:BA", "", 1)
+        }
+
+        fn dacl(path: &Path) -> String {
+            let sddl = sddl_of_path(path).unwrap();
+            sddl[sddl.find("D:").unwrap()..].to_string()
+        }
+
+        #[test]
+        fn refuses_to_run_without_a_shared_folder() {
+            let args: Vec<String> = ["screen-time-manager.exe", ARG, "--install", r"C:\x"].map(String::from).to_vec();
+            assert_eq!(run(&args), 64);
+        }
+
+        #[test]
+        fn shared_folder_sddl_parses_and_says_what_it_means() {
+            assert!(sd_from_sddl(SHARED_DIR_SDDL).is_ok());
+            // Users may create files but not delete, rename or re-permission
+            // the folder, or add subfolders.
+            let folder_itself = 0x1200ab;
+            assert_eq!(folder_itself & (0x4 | 0x40 | 0x1_0000 | 0x4_0000 | 0x8_0000), 0);
+            assert_eq!(folder_itself & 0x2, 0x2);
+            // ...and Modify, including delete, on the files in it.
+            assert_eq!(0x1301bf & 0x1_0000, 0x1_0000);
+        }
+
+        #[test]
+        fn creates_a_missing_folder_with_its_permissions() {
+            let base = scratch("missing");
+            let dir = base.join("ScreenTimeManager");
+            let done = secure_dir(&dir, &test_sddl()).unwrap();
+            assert!(done.starts_with("created it"), "{done}");
+            assert!(std::fs::symlink_metadata(&dir).unwrap().is_dir());
+            assert_eq!(dacl(&dir), "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x1200ab;;;BU)(A;OIIO;0x1301bf;;;BU)");
+            std::fs::remove_dir_all(&base).unwrap();
+        }
+
+        #[test]
+        fn replaces_a_junction_without_touching_its_target() {
+            let base = scratch("junction");
+            let target = base.join("Program Files ScreenTimeManager");
+            std::fs::create_dir(&target).unwrap();
+            std::fs::write(target.join("screen-time-manager.exe"), b"exe").unwrap();
+            let target_before = sddl_of_path(&target).unwrap();
+            let exe_before = sddl_of_path(&target.join("screen-time-manager.exe")).unwrap();
+
+            let dir = base.join("ScreenTimeManager");
+            junction(&dir, &target);
+            let done = secure_dir(&dir, &test_sddl()).unwrap();
+            assert!(done.contains("removed a link (reparse tag 0xA0000003)"), "{done}");
+
+            let meta = std::fs::symlink_metadata(&dir).unwrap();
+            assert!(meta.is_dir() && meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0, "a real folder now");
+            assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "a new, empty folder");
+            assert_eq!(sddl_of_path(&target).unwrap(), target_before, "the link's target is untouched");
+            assert_eq!(sddl_of_path(&target.join("screen-time-manager.exe")).unwrap(), exe_before);
+            assert_eq!(std::fs::read(target.join("screen-time-manager.exe")).unwrap(), b"exe");
+            std::fs::remove_dir_all(&base).unwrap();
+        }
+
+        #[test]
+        fn replaces_a_file_and_keeps_an_existing_folders_contents() {
+            let base = scratch("file");
+            let dir = base.join("ScreenTimeManager");
+            std::fs::write(&dir, b"in the way").unwrap();
+            let done = secure_dir(&dir, &test_sddl()).unwrap();
+            assert!(done.contains("removed a file"), "{done}");
+            assert!(dir.is_dir());
+
+            // An existing folder (an earlier version's, with the database in
+            // it): re-permissioned, contents left exactly as they were.
+            std::fs::write(dir.join("bot_config.db"), b"settings").unwrap();
+            let db_before = sddl_of_path(&dir.join("bot_config.db")).unwrap();
+            let done = secure_dir(&dir, &test_sddl()).unwrap();
+            assert_eq!(done, "set its owner and permissions");
+            assert_eq!(std::fs::read(dir.join("bot_config.db")).unwrap(), b"settings");
+            assert_eq!(sddl_of_path(&dir.join("bot_config.db")).unwrap(), db_before, "not passed on to what's inside");
+            assert!(dacl(&dir).starts_with("D:P("), "doesn't inherit from its parent: {}", dacl(&dir));
+            std::fs::remove_dir_all(&base).unwrap();
+        }
+
+        #[test]
+        fn install_folder_check_removes_links_and_foreign_write_access() {
+            let me = own_user_sid().expect("own SID");
+            assert!(me.starts_with("S-1-5-"), "{me}");
+            // Here the test account plays the administrators.
+            let trusted = |sid: &str| admin_sid(sid) || sid == me;
+
+            let base = scratch("install");
+            let app = base.join("ScreenTimeManager");
+            std::fs::create_dir(&app).unwrap();
+            std::fs::create_dir(app.join("updates")).unwrap();
+            std::fs::write(app.join("screen-time-manager.exe"), b"exe").unwrap();
+            assert_eq!(check_install_dir(&app, &trusted).unwrap(), "standard accounts can't change anything in it; nothing to do");
+
+            // What 1.0.2's icacls did through a junction, plus a link put inside.
+            let outside = base.join("elsewhere");
+            std::fs::create_dir(&outside).unwrap();
+            let outside_before = sddl_of_path(&outside).unwrap();
+            junction(&app.join("updates").join("link"), &outside);
+            let out = std::process::Command::new("icacls").arg(&app).args(["/grant", "*S-1-5-32-545:(OI)(CI)M"]).output().unwrap();
+            assert!(out.status.success());
+            let problems = audit(&app, &trusted);
+            assert!(problems.iter().any(|(p, what)| *p == app && matches!(what, Problem::ForeignWrite { sid, .. } if sid == "S-1-5-32-545")), "{problems:?}");
+            assert!(problems.iter().any(|(_, what)| *what == Problem::Link), "{problems:?}");
+
+            let done = check_install_dir(&app, &trusted).unwrap();
+            assert!(done.starts_with("repaired"), "{done}");
+            assert!(audit(&app, &trusted).is_empty());
+            assert!(!app.join("updates").join("link").exists() && std::fs::symlink_metadata(app.join("updates").join("link")).is_err());
+            assert_eq!(sddl_of_path(&outside).unwrap(), outside_before, "the link's target is untouched");
+            assert_eq!(std::fs::read(app.join("screen-time-manager.exe")).unwrap(), b"exe");
+            assert!(!sddl_of_path(&app.join("screen-time-manager.exe")).unwrap().contains(";;;BU)"), "Users' Modify is gone from the files too");
+            std::fs::remove_dir_all(&base).unwrap();
+        }
+
+        #[test]
+        fn install_folder_that_is_a_link_is_refused() {
+            let base = scratch("install-link");
+            let target = base.join("target");
+            std::fs::create_dir(&target).unwrap();
+            let app = base.join("ScreenTimeManager");
+            junction(&app, &target);
+            let me = own_user_sid().unwrap();
+            let err = check_install_dir(&app, &|sid: &str| admin_sid(sid) || sid == me).unwrap_err();
+            assert!(err.starts_with("it is a link"), "{err}");
+            assert!(std::fs::symlink_metadata(&app).is_ok(), "left alone for an administrator to look at");
+            std::fs::remove_dir_all(&base).unwrap();
+        }
+    }
 }
 
 #[cfg(test)]

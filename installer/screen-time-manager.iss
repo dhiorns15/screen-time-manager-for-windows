@@ -15,11 +15,20 @@
 ;   ScreenTimeManagerWatchdog  every minute, relaunches the app if it was killed and sends a tamper alert
 ;   ScreenTimeManagerUpdate    on demand, runs `screen-time-manager.exe --update` as SYSTEM; standard
 ;                              users may start it, but not change or delete it
+;   ScreenTimeManagerSetupRecovery
+;                              only while setup runs (see task-recovery.xml): if setup is interrupted
+;                              with the first two turned off, it turns them back on at the next boot
+;                              or 15 minutes later
 ;
 ; Setup closes every copy of the app in every session before replacing it, and the app's updater
 ; runs it silently as SYSTEM (`/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`), so nothing here may wait
 ; on the user. Afterwards it writes updating.marker, which tells the watchdog in each session to
-; bring the app back without a tamper alert.
+; bring the app back without a tamper alert - the installing user's session included: setup
+; doesn't start the app itself (see [Run]).
+;
+; Everything setup does as administrator or SYSTEM in a folder a standard account can write to
+; (the shared config folder in ProgramData) goes through `screen-time-manager.exe --secure-folders`
+; (src/update.rs, `folders`), which never follows a link there; see SecureFolders.
 
 #ifndef Bin
   #define Bin "..\target\release"
@@ -47,6 +56,9 @@
 #define MainTask "ScreenTimeManager"
 #define WatchdogTask "ScreenTimeManagerWatchdog"
 #define UpdateTask "ScreenTimeManagerUpdate"
+#define RecoveryTask "ScreenTimeManagerSetupRecovery"
+; src/update.rs, folders::ARG.
+#define SecureFoldersArg "--secure-folders"
 ; Must match the SecurityDescriptor in task-main.xml and task-update.xml; see there.
 #define MainTaskSddl "D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FRFX;;;BU)"
 #define UpdateTaskSddl "D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;FRFX;;;BU)"
@@ -96,6 +108,7 @@ Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreve
 Source: "task-main.xml"; Flags: dontcopy
 Source: "task-watchdog.xml"; Flags: dontcopy
 Source: "task-update.xml"; Flags: dontcopy
+Source: "task-recovery.xml"; Flags: dontcopy
 
 [Icons]
 Name: "{autoprograms}\Screen Time Manager"; Filename: "{app}\{#AppExe}"
@@ -106,11 +119,13 @@ Name: "{autoprograms}\Screen Time Manager"; Filename: "{app}\{#AppExe}"
 Type: files; Name: "{app}\updating.marker"
 Type: filesandordirs; Name: "{app}\updates"
 
-[Run]
-; As the account that started setup, not the administrator it elevated to: when a parent approves
-; the UAC prompt over a child's shoulder, the app is for the child's session. Other sessions get the
-; app back from their watchdog (see WriteUpdateMarker).
-Filename: "{app}\{#AppExe}"; Description: "Start Screen Time Manager now"; Flags: nowait postinstall skipifsilent runasoriginaluser
+; No [Run] entry ("Start Screen Time Manager now"): the watchdog starts the app in every signed-in
+; session - the installing user's too, which is the child's when a parent approves the UAC prompt
+; over their shoulder - within a minute of setup registering its task again (StartWhenAvailable
+; catches up on the missed per-minute run, and updating.marker tells it to start the app without a
+; tamper alert). It starts it through the ScreenTimeManager task, whose copies leave quietly if
+; they find one running. A Finish-page start raced that (the loser said "already running"), and
+; unticking it didn't stop the app starting anyway.
 
 [Code]
 const
@@ -124,15 +139,24 @@ const
   FILE_SHARE_ALL = 7;
   OPEN_EXISTING = 3;
 
-  // Setup's exit code when the files were installed but the scheduled tasks or the shared config
-  // folder could not be set up (see the setup log).
+  // Setup's exit code when the files were installed but the scheduled tasks or the folder
+  // permissions could not be set up (see the setup log).
   SetupIncompleteExitCode = 10;
+
+  // `--secure-folders` exit code bits (src/update.rs, folders::run).
+  SharedFolderFailed = 1;
+  InstallFolderUnsafe = 2;
 
 var
   // The main and watchdog tasks were disabled by PrepareToInstall and not yet registered again;
-  // DeinitializeSetup turns them back on if setup stops before that.
+  // DeinitializeSetup turns them back on if setup stops before that, and the recovery task if
+  // setup itself never gets there.
   TasksPaused: Boolean;
+  // The recovery task (task-recovery.xml) is registered; removed once the tasks are on again.
+  RecoveryRegistered: Boolean;
   SetupIncomplete: Boolean;
+  // What went wrong in CurStepChanged, for the message and the log.
+  Problems: String;
 
 function CreateFile(FileName: String; DesiredAccess, ShareMode, SecurityAttributes,
   CreationDisposition, FlagsAndAttributes: Cardinal; TemplateFile: THandle): THandle;
@@ -141,6 +165,9 @@ function CloseHandle(Handle: THandle): BOOL;
   external 'CloseHandle@kernel32.dll stdcall';
 function GetCurrentProcessId: Cardinal;
   external 'GetCurrentProcessId@kernel32.dll stdcall';
+// The PC's awake time in 100 ns units (it stops while asleep, and no clock change moves it).
+function QueryUnbiasedInterruptTime(var UnbiasedTime: Int64): BOOL;
+  external 'QueryUnbiasedInterruptTime@kernel32.dll stdcall';
 
 function InstalledExe: String;
 begin
@@ -186,15 +213,18 @@ begin
   end;
 end;
 
-procedure EnableTask(Folder: Variant; const Name: String);
+// Returns False only if the task exists and could not be enabled.
+function EnableTask(Folder: Variant; const Name: String): Boolean;
 var
   Task: Variant;
 begin
+  Result := True;
   if FindTask(Folder, Name, Task) then
   try
     Task.Enabled := True;
     Log('Enabled task ' + Name);
   except
+    Result := False;
     Log('Could not enable task ' + Name + ': ' + GetExceptionMessage);
   end;
 end;
@@ -218,9 +248,9 @@ begin
   StringChangeEx(Result, '>', '&gt;', True);
 end;
 
-// One of the task-*.xml templates, pointing at the install folder. It's passed to Task Scheduler as
-// a string, so there is no file encoding for it to get wrong.
-function TaskXml(const Template: String): String;
+// One of the task-*.xml templates with @INSTALL_DIR@ replaced by InstallDir (XML-escaped here). It's
+// passed to Task Scheduler as a string, so there is no file encoding for it to get wrong.
+function TaskXmlWith(const Template, InstallDir: String): String;
 var
   Raw: AnsiString;
 begin
@@ -229,8 +259,24 @@ begin
     RaiseException('Could not read ' + Template);
   // The templates are ASCII; the install folder is substituted after conversion, so it may not be.
   Result := String(Raw);
-  if StringChangeEx(Result, '@INSTALL_DIR@', XmlEscape(ExpandConstant('{app}')), True) = 0 then
+  if StringChangeEx(Result, '@INSTALL_DIR@', XmlEscape(InstallDir), True) = 0 then
     RaiseException(Template + ' has no @INSTALL_DIR@');
+end;
+
+// One of the task-*.xml templates, pointing at the install folder.
+function TaskXml(const Template: String): String;
+begin
+  Result := TaskXmlWith(Template, ExpandConstant('{app}'));
+end;
+
+// task-recovery.xml: the install folder goes into a PowerShell single-quoted string there.
+function RecoveryXml: String;
+var
+  Quoted: String;
+begin
+  Quoted := ExpandConstant('{app}');
+  StringChangeEx(Quoted, '''', '''''', True);
+  Result := TaskXmlWith('task-recovery.xml', Quoted);
 end;
 
 // The text of the first <Element> in Xml, or '' if there is none.
@@ -301,14 +347,27 @@ begin
   end;
 end;
 
-procedure RegisterTasks;
+// Registers the app's tasks. WithUpdateTask is False when the install folder could not be made
+// safe from standard accounts: the update task runs its exe as SYSTEM, so it's removed instead.
+procedure RegisterTasks(WithUpdateTask: Boolean);
 var
-  Folder: Variant;
+  Folder, Task: Variant;
   UpdateXml: String;
 begin
   Folder := TaskFolder;
   RegisterTaskXml(Folder, '{#MainTask}', TaskXml('task-main.xml'), TASK_LOGON_GROUP, '{#MainTaskSddl}');
   RegisterTaskXml(Folder, '{#WatchdogTask}', TaskXml('task-watchdog.xml'), TASK_LOGON_GROUP, '');
+  if not WithUpdateTask then
+  begin
+    // Turned off, not ended or deleted: this setup may be running inside it (see below). The next
+    // setup that finds the folder safe registers it again.
+    if FindTask(Folder, '{#UpdateTask}', Task) then
+    begin
+      Task.Enabled := False;
+      Log('Disabled task {#UpdateTask}: the install folder is not safe for SYSTEM to run from');
+    end;
+    Exit;
+  end;
   // Never ended or deleted during install: when the app's updater started this setup, setup may be
   // running inside this task's job, and ending the task would end setup with it. It's replaced in
   // place, and while it's running only if its definition changed.
@@ -317,6 +376,31 @@ begin
     Log('Task {#UpdateTask} is running and up to date; left as it is')
   else
     RegisterTaskXml(Folder, '{#UpdateTask}', UpdateXml, TASK_LOGON_SERVICE_ACCOUNT, '{#UpdateTaskSddl}');
+end;
+
+// Registers the recovery task (task-recovery.xml). Raises if it can't be.
+procedure RegisterRecoveryTask(Folder: Variant);
+begin
+  RegisterTaskXml(Folder, '{#RecoveryTask}', RecoveryXml, TASK_LOGON_SERVICE_ACCOUNT, '');
+  RecoveryRegistered := True;
+end;
+
+// Removes the recovery task once the tasks it would turn back on are on. If that fails it's
+// harmless: it turns on tasks that are already on, writes the marker and removes itself.
+procedure DeleteRecoveryTask;
+var
+  Folder: Variant;
+begin
+  if not RecoveryRegistered then
+    Exit;
+  try
+    Folder := TaskFolder;
+    Folder.DeleteTask('{#RecoveryTask}', 0);
+    RecoveryRegistered := False;
+    Log('Deleted task {#RecoveryTask}');
+  except
+    Log('Could not delete task {#RecoveryTask} (harmless; it removes itself when it runs): ' + GetExceptionMessage);
+  end;
 end;
 
 // ---- Closing the app ----
@@ -423,93 +507,180 @@ end;
 
 // ---- Install ----
 
-// Shared config folder (the Telegram/Discord bot settings, the same whichever account runs the
-// app). %ProgramData% isn't writable by standard accounts by default, so BUILTIN\Users get Modify,
-// inherited by everything in it. Never removed by uninstall.
-procedure CreateSharedConfigFolder;
+// The shared config folder (the Telegram/Discord bot settings, the same whichever account runs the
+// app), never removed by uninstall, and the install folder, checked as setup leaves it. Done by the
+// new exe's `--secure-folders` (src/update.rs, `folders`), run from setup's own temporary folder,
+// not from the install folder it checks:
+// - the shared folder, %ProgramData%\ScreenTimeManager: whatever a standard account put in its place
+//   (ProgramData lets them create folders) - a junction, a link, a file - is removed without being
+//   followed, and the folder is created or re-permissioned through a handle opened on the folder
+//   itself: owned by Administrators, not inheriting from ProgramData, Users may create files in it
+//   and change and delete the files in it, but not delete, rename or re-permission the folder.
+//   Until 1.0.2 setup ran `icacls <it> /grant Users:(OI)(CI)M` here, which a junction redirected
+//   onto any folder, Program Files included.
+// - the install folder: standard accounts must not be able to change anything in it (the update
+//   task runs its exe as SYSTEM). Normally it inherits Program Files' permissions and there is
+//   nothing to do; anything a standard account could use (an entry granting it write access, a link,
+//   a file it created) is removed. Returns False if that couldn't be done.
+// Raises if the shared folder couldn't be set up (the app then keeps its bot settings per account).
+function SecureFolders: Boolean;
 var
-  Dir: String;
-  Code: Integer;
+  Helper, Params: String;
+  Code, I: Integer;
+  Output: TExecOutput;
 begin
-  Dir := ExpandConstant('{commonappdata}\ScreenTimeManager');
-  if not ForceDirectories(Dir) then
-    RaiseException('Could not create ' + Dir);
-  if not Exec(ExpandConstant('{sys}\icacls.exe'), '"' + Dir + '" /grant *S-1-5-32-545:(OI)(CI)M',
-    '', SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then
-    RaiseException('Could not let standard accounts write to ' + Dir + ' (icacls: ' + IntToStr(Code) + ')');
-  Log('Shared config folder ready: ' + Dir);
+  ExtractTemporaryFile('{#AppExe}');
+  Helper := ExpandConstant('{tmp}\{#AppExe}');
+  Params := '{#SecureFoldersArg} --shared "' + ExpandConstant('{commonappdata}\ScreenTimeManager')
+    + '" --install "' + ExpandConstant('{app}') + '"';
+  if not ExecAndCaptureOutput(Helper, Params, ExpandConstant('{tmp}'), SW_HIDE, ewWaitUntilTerminated, Code, Output) then
+    RaiseException('Could not run ' + Helper + ': ' + SysErrorMessage(Code));
+  for I := 0 to GetArrayLength(Output.StdOut) - 1 do
+    Log('Folders: ' + Output.StdOut[I]);
+  for I := 0 to GetArrayLength(Output.StdErr) - 1 do
+    Log('Folders (stderr): ' + Output.StdErr[I]);
+  Log('{#SecureFoldersArg} exited with ' + IntToStr(Code));
+  if (Code and not (SharedFolderFailed or InstallFolderUnsafe)) <> 0 then
+    RaiseException('Could not check the folders (' + IntToStr(Code) + '); see the setup log');
+  Result := (Code and InstallFolderUnsafe) = 0;
+  if (Code and SharedFolderFailed) <> 0 then
+    RaiseException('Could not set up ' + ExpandConstant('{commonappdata}\ScreenTimeManager') + ' for every account; see the setup log');
 end;
 
-// Tells the watchdog in every session that the app was just updated: for 5 minutes after this
-// file is modified it relaunches the app without a tamper alert. That is how sessions get the app
-// back after setup closed it, so setup doesn't start it in other sessions itself. Written after the
-// files and before the tasks are enabled again; the content doesn't matter.
+// Tells the watchdog in every session that the app was just updated: for 5 minutes after this it
+// relaunches the app without a tamper alert. That is how sessions get the app back after setup
+// closed it, so setup doesn't start it itself. Written after the files and before the tasks are
+// enabled again. After a readable date it records the boot (Windows' BootId) and the PC's awake
+// time, by which the watchdog measures those 5 minutes: the wall clock being set right after an
+// install (time sync, a parent fixing it) doesn't turn the marker stale and the update into a
+// tamper alert. Without them (they couldn't be read) the watchdog goes by the file's time.
 procedure WriteUpdateMarker;
+var
+  Text: String;
+  BootId: Cardinal;
+  Unbiased: Int64;
 begin
-  if SaveStringToFile(ExpandConstant('{app}\updating.marker'),
-    GetDateTimeString('yyyy/mm/dd hh:nn:ss', '-', ':') + #13#10, False) then
-    Log('Wrote updating.marker')
+  Text := GetDateTimeString('yyyy/mm/dd hh:nn:ss', '-', ':');
+  if RegQueryDWordValue(HKLM, 'SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters', 'BootId', BootId) then
+    if QueryUnbiasedInterruptTime(Unbiased) then
+      Text := Text + ' boot=' + IntToStr(BootId) + ' unbiased=' + IntToStr(Unbiased);
+  if SaveStringToFile(ExpandConstant('{app}\updating.marker'), Text + #13#10, False) then
+    Log('Wrote updating.marker: ' + Text)
   else
     Log('Could not write updating.marker');
 end;
 
 // Before any file is replaced: stop anything from starting the app, then close it everywhere. The
 // update task is left alone, as it may be running this setup.
+//
+// The main and watchdog tasks are turned off for this (setting Enabled, which Task Scheduler keeps
+// across restarts): a watchdog run or a sign-in would otherwise start the app again in the middle
+// of replacing its exe - and until the exe is replaced it's the old version's watchdog, which
+// can't be told to wait. So that no interruption can leave them off, the recovery task
+// (task-recovery.xml) is registered first: if setup doesn't get to turn them back on itself (in
+// CurStepChanged, or DeinitializeSetup when it fails or is cancelled), the recovery task does at
+// the next boot, or 15 minutes after this if Windows keeps running. If it can't be registered,
+// nothing is turned off and setup stops here.
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
-  Folder: Variant;
+  Folder, Task: Variant;
+  HaveTasks: Boolean;
 begin
   Result := '';
+  HaveTasks := False;
   try
     Folder := TaskFolder;
+    HaveTasks := FindTask(Folder, '{#WatchdogTask}', Task) or FindTask(Folder, '{#MainTask}', Task);
+  except
+    Log('Could not reach the Task Scheduler: ' + GetExceptionMessage);
+  end;
+  if HaveTasks then
+  begin
+    try
+      RegisterRecoveryTask(Folder);
+    except
+      Log('Could not register task {#RecoveryTask}: ' + GetExceptionMessage);
+      Result := 'Setup could not prepare the Task Scheduler for the update (' + GetExceptionMessage
+        + '). Nothing was changed. Restart Windows and run setup again.';
+      Exit;
+    end;
     // The watchdog first, so it can't relaunch the app in between.
     if PauseTask(Folder, '{#WatchdogTask}') then
       TasksPaused := True;
     if PauseTask(Folder, '{#MainTask}') then
       TasksPaused := True;
-  except
-    Log('Could not reach the Task Scheduler: ' + GetExceptionMessage);
   end;
   if not StopApp then
     Result := 'Screen Time Manager is still running and could not be closed. Restart Windows and run setup again.';
 end;
 
+procedure AddProblem(const What: String);
+begin
+  SetupIncomplete := True;
+  Log('Setup is incomplete: ' + What);
+  if Problems <> '' then
+    Problems := Problems + #13#10#13#10;
+  Problems := Problems + What;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  InstallFolderSafe: Boolean;
 begin
   if CurStep <> ssPostInstall then
     Exit;
+  Problems := '';
+  // Assume the worst until checked: the update task runs the installed exe as SYSTEM.
+  InstallFolderSafe := False;
   try
-    CreateSharedConfigFolder;
-    WriteUpdateMarker;
-    RegisterTasks;
-    TasksPaused := False;
+    InstallFolderSafe := SecureFolders;
+    if not InstallFolderSafe then
+      AddProblem('Standard accounts may still be able to change files in ' + ExpandConstant('{app}')
+        + ', so the update task (which runs as SYSTEM) was turned off.');
   except
-    SetupIncomplete := True;
-    Log('Setup is incomplete: ' + GetExceptionMessage);
-    SuppressibleMsgBox('Screen Time Manager was installed, but setting it up to start for every account failed:'
-      + #13#10#13#10 + GetExceptionMessage + #13#10#13#10 + 'Run setup again to retry.',
-      mbCriticalError, MB_OK, IDOK);
+    AddProblem(GetExceptionMessage);
   end;
+  // The tasks are registered whatever happened above: the app must keep starting.
+  try
+    WriteUpdateMarker;
+    RegisterTasks(InstallFolderSafe);
+    TasksPaused := False;
+    DeleteRecoveryTask;
+  except
+    AddProblem('Setting it up to start for every account failed: ' + GetExceptionMessage);
+  end;
+  if Problems <> '' then
+    SuppressibleMsgBox('Screen Time Manager was installed, but not everything could be set up:'
+      + #13#10#13#10 + Problems + #13#10#13#10 + 'The setup log has the details. Run setup again to retry.',
+      mbCriticalError, MB_OK, IDOK);
 end;
 
 // Setup stopped after closing the app (it failed or was cancelled) and before registering the tasks
-// again: turn the existing ones back on, so the previous install keeps working.
+// again: turn the existing ones back on, so the previous install keeps working. Then the recovery
+// task isn't needed any more.
 procedure DeinitializeSetup;
 var
   Folder: Variant;
 begin
-  if not TasksPaused then
-    Exit;
-  Log('Re-enabling the tasks setup disabled');
-  try
-    if FileExists(InstalledExe) then
-      WriteUpdateMarker;
-    Folder := TaskFolder;
-    EnableTask(Folder, '{#MainTask}');
-    EnableTask(Folder, '{#WatchdogTask}');
-  except
-    Log('Could not re-enable the tasks: ' + GetExceptionMessage);
+  if TasksPaused then
+  begin
+    Log('Re-enabling the tasks setup disabled');
+    try
+      if FileExists(InstalledExe) then
+        WriteUpdateMarker;
+      Folder := TaskFolder;
+      // Both tried, whatever the first one does.
+      if EnableTask(Folder, '{#MainTask}') then
+        TasksPaused := not EnableTask(Folder, '{#WatchdogTask}')
+      else
+        EnableTask(Folder, '{#WatchdogTask}');
+    except
+      Log('Could not re-enable the tasks: ' + GetExceptionMessage);
+    end;
   end;
+  // Left in place if the tasks couldn't be turned back on: then it's the one that does.
+  if not TasksPaused then
+    DeleteRecoveryTask;
 end;
 
 function GetCustomSetupExitCode: Integer;
@@ -536,6 +707,8 @@ begin
           DeleteTask(Folder, '{#WatchdogTask}');
           DeleteTask(Folder, '{#MainTask}');
           DeleteTask(Folder, '{#UpdateTask}');
+          // Only there if an earlier setup was interrupted.
+          DeleteTask(Folder, '{#RecoveryTask}');
         except
           Log('Could not reach the Task Scheduler: ' + GetExceptionMessage);
         end;

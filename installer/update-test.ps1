@@ -70,7 +70,17 @@ for ($i = 0; $i -lt 300; $i++) {
         }
         # FILE_READ_DATA and FILE_EXECUTE.
         if (($granted -band 0x21) -ne 0x21) { throw "Updated to $current, but standard accounts still can't run the ScreenTimeManager task: $sddl" }
-        "Updated $previous to $current through the update task; ScreenTimeManager task security: $sddl"
+        # The new setup's safety net while the tasks are off must be gone once it has finished.
+        if (Get-ScheduledTask -TaskName 'ScreenTimeManagerSetupRecovery' -ErrorAction SilentlyContinue) {
+            throw "Updated to $current, but setup left its ScreenTimeManagerSetupRecovery task behind"
+        }
+        # Up to 1.0.2 the shared config folder gave Users Modify on the folder itself, which let a
+        # standard account replace it with a junction that setup then followed.
+        $shared = Get-Acl -LiteralPath "$env:ProgramData\ScreenTimeManager"
+        if (!$shared.AreAccessRulesProtected -or $shared.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne 'S-1-5-32-544') {
+            throw "Updated to $current, but $env:ProgramData\ScreenTimeManager wasn't re-permissioned: $($shared.Sddl)"
+        }
+        "Updated $previous to $current through the update task; ScreenTimeManager task security: $sddl; shared folder: $($shared.Sddl)"
         exit 0
     }
 }

@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!--
+  The ScreenTimeManagerSetupRecovery scheduled task: setup's safety net while it has the app's
+  tasks turned off. Setup registers it before it disables the ScreenTimeManager and
+  ScreenTimeManagerWatchdog tasks (so nothing restarts the app while its files are replaced) and
+  deletes it once it has registered them again, or turned them back on after failing or being
+  cancelled. It only ever runs if setup didn't get that far: the PC lost power or was restarted
+  during setup, setup was killed, or it hung. Then, at the next boot or 15 minutes after setup
+  registered it (whichever comes first), it:
+    1. touches updating.marker, so each signed-in session's watchdog brings the app back without a
+       tamper alert (as setup does after an install);
+    2. turns both tasks back on;
+    3. deletes itself.
+  It uses the same Task Scheduler calls setup does (Schedule.Service, Enabled = true), from
+  Windows PowerShell, which every supported Windows has; not the app's exe, which an interrupted
+  setup may have left half-written. Setup substitutes @INSTALL_DIR@ (quoted for PowerShell, then
+  XML-escaped).
+
+  SYSTEM, with the default security descriptor: standard accounts can read it, not change, run or
+  delete it.
+-->
+<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Screen Time Manager - turns the app's tasks back on if setup was interrupted (setup removes this task when it finishes)</Description>
+    <URI>\ScreenTimeManagerSetupRecovery</URI>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="LocalSystem">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Triggers>
+    <BootTrigger>
+      <Enabled>true</Enabled>
+    </BootTrigger>
+    <!-- Setup hung or was killed without a restart. Re-registering (a new setup) restarts the delay. -->
+    <RegistrationTrigger>
+      <Enabled>true</Enabled>
+      <Delay>PT15M</Delay>
+    </RegistrationTrigger>
+  </Triggers>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="LocalSystem">
+    <Exec>
+      <Command>%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe</Command>
+      <Arguments>-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "try { [IO.File]::WriteAllText('@INSTALL_DIR@\updating.marker', (Get-Date -Format 'yyyy/MM/dd HH:mm:ss') + ' setup recovery') } catch {}; $s = New-Object -ComObject Schedule.Service; $s.Connect(); $f = $s.GetFolder('\'); foreach ($n in 'ScreenTimeManagerWatchdog', 'ScreenTimeManager') { try { $f.GetTask($n).Enabled = $true } catch {} }; $f.DeleteTask('ScreenTimeManagerSetupRecovery', 0)"</Arguments>
+    </Exec>
+  </Actions>
+</Task>
