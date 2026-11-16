@@ -41,6 +41,8 @@ That's it. Setup does everything the app needs, for every Windows account on the
 - **Sets up the watchdog**, which relaunches the app if it's stopped and alerts you (see [Automatic Restart & Tamper Alerts](#automatic-restart--tamper-alerts)).
 - **Creates the shared settings folder** (`C:\ProgramData\ScreenTimeManager`) that every account can use, so the passcode and the Telegram/Discord settings are set up once for the whole PC.
 
+When setup finishes, the app starts by itself and its tray icon appears within about a minute: setup doesn't start it directly, a scheduled task does.
+
 **Upgrading from an older version that you installed with `install.ps1`?** Just run the new setup. It takes over the scheduled tasks the old script made and keeps your settings; afterwards you can delete the folder you unzipped the old version into.
 
 ---
